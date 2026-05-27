@@ -823,7 +823,8 @@ pub(crate) async fn run_batch_build_chain(
                         };
                         match paths_by_label.get(&bazel.target) {
                             Some(rel_path) => {
-                                let abs_path = item.working_dir.join(rel_path);
+                                let abs_path =
+                                    resolve_bazel_binary_abs_path(&item.working_dir, rel_path);
                                 let path_str = abs_path.to_string_lossy().to_string();
                                 emitter.service_debug_event(
                                     &item.name,
@@ -876,11 +877,57 @@ pub(crate) async fn run_batch_build_chain(
     outcome
 }
 
+/// Resolve a bazel-reported executable path to an absolute path.
+///
+/// `bazel cquery` reports `target.files_to_run.executable.path` relative to the
+/// **workspace root** (e.g. `bazel-out/.../bin/...`), not relative to the
+/// service's working_dir. When a `don.toml` lives in a subdirectory of the
+/// workspace, the working_dir is below the root, so joining the path with the
+/// working_dir points at a non-existent `…/<subdir>/bazel-out/…`. Resolve
+/// against the workspace root instead; fall back to the working_dir if no
+/// workspace marker is found above it (no worse than the previous behaviour).
+fn resolve_bazel_binary_abs_path(working_dir: &Path, rel_path: &str) -> PathBuf {
+    let root = crate::build_tool::bazel::find_workspace_root(working_dir)
+        .unwrap_or_else(|| working_dir.to_path_buf());
+    root.join(rel_path)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::config::{BazelConfig, LogConfig, TurboConfig};
+
+    #[test]
+    fn resolve_bazel_binary_abs_path_uses_workspace_root_not_working_dir() {
+        // workspace_root/ has the WORKSPACE marker; the service's working_dir
+        // is a subdirectory (as for a `sandbox/don.toml`).
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path();
+        std::fs::write(workspace_root.join("WORKSPACE.bazel"), "").unwrap();
+        let working_dir = workspace_root.join("sandbox");
+        std::fs::create_dir(&working_dir).unwrap();
+
+        let rel = "bazel-out/k8-fastbuild/bin/sandbox/data_session";
+        let resolved = resolve_bazel_binary_abs_path(&working_dir, rel);
+
+        // Must resolve against the workspace root, not the subdir working_dir.
+        assert_eq!(resolved, workspace_root.join(rel));
+        assert_ne!(resolved, working_dir.join(rel));
+    }
+
+    #[test]
+    fn resolve_bazel_binary_abs_path_falls_back_to_working_dir_without_marker() {
+        // No workspace marker anywhere above: fall back to working_dir.join,
+        // which is no worse than the previous behaviour.
+        let tmp = tempfile::tempdir().unwrap();
+        let working_dir = tmp.path().join("no-marker-here");
+        std::fs::create_dir(&working_dir).unwrap();
+
+        let rel = "bazel-out/k8-fastbuild/bin/x";
+        let resolved = resolve_bazel_binary_abs_path(&working_dir, rel);
+        assert_eq!(resolved, working_dir.join(rel));
+    }
 
     fn bazel_item(name: &str, watch_enabled: bool) -> BatchBuildItem {
         BatchBuildItem {
