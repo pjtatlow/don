@@ -579,6 +579,24 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+/// Whether every service in `items` has reached an available state — `Ready`
+/// (passed its ready check) or `Lazy` (proxy bound, will spawn on first
+/// connection). Tasks are ignored: they are one-shot and do not gate stack
+/// readiness. An item set with no services is considered ready.
+///
+/// This is the bool surfaced by `don status --json`, so scripts and agents can
+/// poll "is the whole stack up?" without parsing the human-readable table.
+/// Status only ever reports the active set (the started profile's subset), so
+/// services excluded by a profile do not drag this to `false`.
+pub fn all_services_ready(items: &[ItemStatus]) -> bool {
+    items.iter().all(|item| match item {
+        ItemStatus::Service { state, .. } => {
+            matches!(state, ServiceState::Ready | ServiceState::Lazy)
+        }
+        ItemStatus::Task { .. } => true,
+    })
+}
+
 /// An event broadcast from the runner for external consumers.
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
@@ -1585,6 +1603,76 @@ impl Runner {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn all_services_ready_table() {
+        fn svc(state: ServiceState) -> ItemStatus {
+            ItemStatus::Service {
+                name: "s".to_string(),
+                state,
+                verbose: None,
+            }
+        }
+        fn task(state: TaskItemState) -> ItemStatus {
+            ItemStatus::Task {
+                name: "t".to_string(),
+                state,
+                last_run: None,
+                verbose: None,
+            }
+        }
+
+        struct Case {
+            name: &'static str,
+            items: Vec<ItemStatus>,
+            want: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "empty is ready",
+                items: vec![],
+                want: true,
+            },
+            Case {
+                name: "all ready",
+                items: vec![svc(ServiceState::Ready), svc(ServiceState::Ready)],
+                want: true,
+            },
+            Case {
+                name: "lazy counts as available",
+                items: vec![svc(ServiceState::Lazy), svc(ServiceState::Ready)],
+                want: true,
+            },
+            Case {
+                name: "running is not yet ready",
+                items: vec![svc(ServiceState::Ready), svc(ServiceState::Running)],
+                want: false,
+            },
+            Case {
+                name: "failed is not ready",
+                items: vec![svc(ServiceState::Failed)],
+                want: false,
+            },
+            Case {
+                name: "stopped is not ready",
+                items: vec![svc(ServiceState::Stopped)],
+                want: false,
+            },
+            Case {
+                name: "tasks do not gate readiness",
+                items: vec![svc(ServiceState::Ready), task(TaskItemState::Failed)],
+                want: true,
+            },
+            Case {
+                name: "task-only set is ready",
+                items: vec![task(TaskItemState::Completed)],
+                want: true,
+            },
+        ];
+        for c in cases {
+            assert_eq!(all_services_ready(&c.items), c.want, "case: {}", c.name);
+        }
+    }
 
     #[test]
     fn unhealthy_restart_backoff_table() {

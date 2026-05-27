@@ -86,6 +86,12 @@ enum Commands {
         /// Show detailed info: watch paths, ports, build tool targets, commands
         #[arg(short, long)]
         verbose: bool,
+        /// Emit machine-readable JSON instead of the table: an object with a
+        /// top-level `ready` bool (true when every service is Ready or Lazy)
+        /// and an `items` array. Useful for scripts and agents polling for
+        /// stack readiness.
+        #[arg(long)]
+        json: bool,
     },
     /// View logs for a service or task
     Logs {
@@ -231,7 +237,7 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Restart { name } => {
             run_client(&config_path, |c| async move { c.restart(&name).await }).await
         }
-        Commands::Status { verbose } => run_status(&config_path, verbose).await,
+        Commands::Status { verbose, json } => run_status(&config_path, verbose, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
@@ -563,7 +569,7 @@ async fn wait_for_daemon_socket_gone(
     }
 }
 
-async fn run_status(config_path: &Path, verbose: bool) -> i32 {
+async fn run_status(config_path: &Path, verbose: bool, json: bool) -> i32 {
     let client = client_for(config_path);
     match client.status(verbose).await {
         Ok(mut items) => {
@@ -572,6 +578,27 @@ async fn run_status(config_path: &Path, verbose: bool) -> i32 {
                     .cmp(&status_sort_bucket(b))
                     .then_with(|| item_name(a).cmp(item_name(b)))
             });
+            if json {
+                #[derive(serde::Serialize)]
+                struct StatusJson<'a> {
+                    ready: bool,
+                    items: &'a [ItemStatus],
+                }
+                let payload = StatusJson {
+                    ready: don::runner::all_services_ready(&items),
+                    items: &items,
+                };
+                return match serde_json::to_string_pretty(&payload) {
+                    Ok(s) => {
+                        println!("{s}");
+                        0
+                    }
+                    Err(e) => {
+                        errln(format!("failed to serialize status as JSON: {e}"));
+                        1
+                    }
+                };
+            }
             print_status_table(&items, verbose);
             0
         }

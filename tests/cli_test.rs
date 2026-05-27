@@ -128,6 +128,45 @@ fn cli_status_against_running_daemon() {
 }
 
 #[test]
+fn cli_status_json_against_running_daemon() {
+    run_with_timeout(Duration::from_secs(10), async {
+        let dir = TempDir::new("cli-status-json");
+        let toml = keeper_config();
+        let config_path = dir.path().join("don.toml");
+        std::fs::write(&config_path, &toml).unwrap();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+        // Give the service time to pass its ready check (ready_exec "true").
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let (code, stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&config_path, &["status", "--json"]))
+                .await
+                .unwrap();
+        assert_eq!(code, 0, "stderr: {stderr}");
+
+        // Output must be valid JSON (no human table noise).
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("bad json {e}: {stdout}"));
+
+        // The keeper service has a passing ready check, so the stack is ready.
+        assert_eq!(parsed["ready"], serde_json::json!(true), "stdout: {stdout}");
+
+        let items = parsed["items"].as_array().expect("items array");
+        let keeper = items
+            .iter()
+            .find(|i| i["name"] == serde_json::json!("keeper"))
+            .expect("keeper item present");
+        assert_eq!(keeper["kind"], serde_json::json!("service"));
+        assert_eq!(keeper["state"], serde_json::json!("ready"));
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
 fn cli_stop_daemon_not_running_gives_clear_error() {
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("cli-stop-no-daemon");
