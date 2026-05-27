@@ -2581,6 +2581,53 @@ mod tests {
                     );
                 },
             },
+            ConfigTestCase {
+                name: "tty defaults to true",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let resolved = config.services["api"].resolve(TEST_PLATFORM);
+                    assert!(resolved.tty);
+                },
+            },
+            ConfigTestCase {
+                name: "tty = false spawns without a controlling PTY",
+                input: r#"
+                    [services.data]
+                    run.cmd = "data"
+                    tty = false
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let resolved = config.services["data"].resolve(TEST_PLATFORM);
+                    assert!(!resolved.tty);
+                },
+            },
+            ConfigTestCase {
+                name: "tty platform override",
+                input: r#"
+                    [services.api]
+                    run.cmd = "api"
+                    tty = false
+
+                    [services.api.platform.linux-x86_64]
+                    tty = true
+                "#,
+                expect_err: false,
+                check: |config| {
+                    let resolved = config.services["api"].resolve(Platform::LinuxX86_64);
+                    assert!(resolved.tty, "platform override should set tty = true");
+
+                    let resolved_mac = config.services["api"].resolve(Platform::MacosAarch64);
+                    assert!(
+                        !resolved_mac.tty,
+                        "non-matching platform should keep tty = false"
+                    );
+                },
+            },
         ];
 
         for case in &cases {

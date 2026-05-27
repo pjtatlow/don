@@ -75,6 +75,13 @@ pub struct Service {
     /// Defaults to `true`. Set to `false` for services that handle their own
     /// hot-reloading internally (e.g. vite, webpack dev server).
     pub reload: bool,
+    /// Whether to give the service a controlling PTY. Defaults to `true`.
+    /// Set to `false` to spawn with plain pipes and no controlling terminal —
+    /// required for processes that launch background-process-group children
+    /// which touch the tty (e.g. installers/JVMs doing `tcsetattr`), which
+    /// would otherwise be `SIGTTOU`/`SIGTTIN`-suspended under a PTY. Disables
+    /// interactive `don attach` for this service.
+    pub tty: bool,
     /// What to do when this service fails — either marked `Unhealthy` by the
     /// health monitor or exits with a non-zero status. Defaults to `Notify`.
     /// `Restart` reuses the same backoff machinery for both kinds of failure.
@@ -125,6 +132,8 @@ struct RawService {
     log_filter: LogFilterConfig,
     #[serde(default = "default_true")]
     reload: bool,
+    #[serde(default = "default_true")]
+    tty: bool,
     #[serde(default)]
     on_failure: OnFailure,
     #[serde(default)]
@@ -213,6 +222,7 @@ impl TryFrom<RawService> for Service {
             log: raw.log,
             log_filter: raw.log_filter,
             reload: raw.reload,
+            tty: raw.tty,
             on_failure: raw.on_failure,
             platform: raw.platform,
             hidden: raw.hidden,
@@ -252,6 +262,7 @@ pub struct ServiceOverride {
     pub log: Option<LogConfig>,
     pub log_filter: Option<LogFilterConfig>,
     pub reload: Option<bool>,
+    pub tty: Option<bool>,
     pub on_failure: Option<OnFailure>,
     pub auto_filter_on_failure: Option<bool>,
 
@@ -279,6 +290,7 @@ struct RawServiceOverride {
     log: Option<LogConfig>,
     log_filter: Option<LogFilterConfig>,
     reload: Option<bool>,
+    tty: Option<bool>,
     on_failure: Option<OnFailure>,
     auto_filter_on_failure: Option<bool>,
 
@@ -315,6 +327,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             log: raw.log,
             log_filter: raw.log_filter,
             reload: raw.reload,
+            tty: raw.tty,
             on_failure: raw.on_failure,
             auto_filter_on_failure: raw.auto_filter_on_failure,
             kind,
@@ -351,6 +364,9 @@ pub struct ResolvedService {
     pub log_filter: LogFilterConfig,
     /// Whether don should watch files and rebuild/restart this service on changes.
     pub reload: bool,
+    /// Whether to give the service a controlling PTY (vs plain pipes). `false`
+    /// spawns without a controlling terminal — see [`Service::tty`].
+    pub tty: bool,
     /// What to do when this service fails (Unhealthy or non-zero crash).
     pub on_failure: OnFailure,
     /// Optional per-service override for automatic log-filter selection on
@@ -489,6 +505,7 @@ impl Service {
                 log: self.log.clone(),
                 log_filter: self.log_filter.clone(),
                 reload: self.reload,
+                tty: self.tty,
                 on_failure: self.on_failure,
                 auto_filter_on_failure: self.auto_filter_on_failure,
                 kind: self.kind.clone(),
@@ -527,6 +544,7 @@ impl Service {
                         .clone()
                         .unwrap_or_else(|| self.log_filter.clone()),
                     reload: ov.reload.unwrap_or(self.reload),
+                    tty: ov.tty.unwrap_or(self.tty),
                     on_failure: ov.on_failure.unwrap_or(self.on_failure),
                     auto_filter_on_failure: ov
                         .auto_filter_on_failure

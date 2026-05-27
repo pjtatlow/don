@@ -248,7 +248,10 @@ pub(crate) async fn start_service(
         dir: Some(service_dir),
         env,
         pgid_file_path: Some(pgid_file_path),
-        force_pipe: false,
+        // `tty = false` spawns with plain pipes and no controlling terminal, so
+        // background-process-group children that touch the tty aren't
+        // SIGTTOU/SIGTTIN-suspended.
+        force_pipe: !resolved.tty,
         listen_fds: listen_fds.to_vec(),
     })
     .await?;
