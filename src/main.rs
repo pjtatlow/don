@@ -860,88 +860,132 @@ fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: boo
         println!("(no services or tasks)");
         return;
     }
-    // Compute column widths.
-    let kind_w = "KIND".len().max(
-        items
-            .iter()
-            .map(|i| match i {
-                ItemStatus::Service { .. } => "service".len(),
-                ItemStatus::Task { .. } => "task".len(),
-            })
-            .max()
-            .unwrap_or(0),
+    // Two-section layout: services rarely have anything in LAST RUN / RESULT
+    // / DURATION, so grouping by kind lets each section show only the columns
+    // that actually matter for it.
+    let services: Vec<&ItemStatus> = items
+        .iter()
+        .filter(|i| matches!(i, ItemStatus::Service { .. }))
+        .collect();
+    let tasks: Vec<&ItemStatus> = items
+        .iter()
+        .filter(|i| matches!(i, ItemStatus::Task { .. }))
+        .collect();
+
+    if !services.is_empty() {
+        print_services_section(&services, verbose, show_watch_paths);
+    }
+    if !services.is_empty() && !tasks.is_empty() {
+        println!();
+    }
+    if !tasks.is_empty() {
+        print_tasks_section(&tasks, verbose, show_watch_paths);
+    }
+}
+
+fn print_services_section(services: &[&ItemStatus], verbose: bool, show_watch_paths: bool) {
+    println!(
+        "{}-- services --{}",
+        SetAttribute(Attribute::Bold),
+        SetAttribute(Attribute::Reset)
     );
     let name_w = "NAME".len().max(
-        items
+        services
             .iter()
-            .map(|i| match i {
-                ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name.len(),
+            .filter_map(|i| match i {
+                ItemStatus::Service { name, .. } => Some(name.len()),
+                _ => None,
             })
             .max()
             .unwrap_or(0),
     );
-
     let state_w = "STATE".len().max(
-        items
+        services
             .iter()
-            .map(|i| match i {
-                ItemStatus::Service { state, .. } => service_state_label(*state).len(),
-                ItemStatus::Task { state, .. } => task_state_label(*state).len(),
+            .filter_map(|i| match i {
+                ItemStatus::Service { state, .. } => Some(service_state_label(*state).len()),
+                _ => None,
             })
             .max()
             .unwrap_or(0),
     );
+    println!("{:<name_w$}  {:<state_w$}", "NAME", "STATE");
+    for item in services {
+        if let ItemStatus::Service {
+            name,
+            state,
+            verbose: vinfo,
+        } = item
+        {
+            let label = service_state_label(*state);
+            let color = service_state_color(*state);
+            println!(
+                "{:<name_w$}  {}{:<state_w$}{}",
+                name,
+                SetForegroundColor(color),
+                label,
+                ResetColor,
+            );
+            if verbose && let Some(info) = vinfo {
+                print_verbose_info(info, show_watch_paths);
+            }
+        }
+    }
+}
 
+fn print_tasks_section(tasks: &[&ItemStatus], verbose: bool, show_watch_paths: bool) {
     println!(
-        "{:<kind_w$}  {:<name_w$}  {:<state_w$}  LAST RUN  RESULT  DURATION",
-        "KIND", "NAME", "STATE"
+        "{}-- tasks --{}",
+        SetAttribute(Attribute::Bold),
+        SetAttribute(Attribute::Reset)
     );
-    for item in items {
-        let (kind, name, state_str, color, last_run, result, duration, verbose_info) = match item {
-            ItemStatus::Service {
+    let name_w = "NAME".len().max(
+        tasks
+            .iter()
+            .filter_map(|i| match i {
+                ItemStatus::Task { name, .. } => Some(name.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0),
+    );
+    let state_w = "STATE".len().max(
+        tasks
+            .iter()
+            .filter_map(|i| match i {
+                ItemStatus::Task { state, .. } => Some(task_state_label(*state).len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0),
+    );
+    println!(
+        "{:<name_w$}  {:<state_w$}  LAST RUN  RESULT  DURATION",
+        "NAME", "STATE",
+    );
+    for item in tasks {
+        if let ItemStatus::Task {
+            name,
+            state,
+            last_run,
+            verbose: vinfo,
+        } = item
+        {
+            let label = task_state_label(*state);
+            let color = task_state_color(*state);
+            println!(
+                "{:<name_w$}  {}{:<state_w$}{}  {:<8}  {:<6}  {}",
                 name,
-                state,
-                verbose,
-            } => (
-                "service",
-                name.as_str(),
-                service_state_label(*state),
-                service_state_color(*state),
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-                verbose.as_ref(),
-            ),
-            ItemStatus::Task {
-                name,
-                state,
-                last_run,
-                verbose,
-            } => (
-                "task",
-                name.as_str(),
-                task_state_label(*state),
-                task_state_color(*state),
+                SetForegroundColor(color),
+                label,
+                ResetColor,
                 format_last_run_time(last_run.as_ref()),
                 format_last_run_result(last_run.as_ref()),
                 format_last_run_duration(last_run.as_ref()),
-                verbose.as_ref(),
-            ),
-        };
-        println!(
-            "{:<kind_w$}  {:<name_w$}  {}{:<state_w$}{}  {:<8}  {:<6}  {}",
-            kind,
-            name,
-            SetForegroundColor(color),
-            state_str,
-            ResetColor,
-            last_run,
-            result,
-            duration,
-        );
-
-        if verbose && let Some(info) = verbose_info {
-            print_verbose_info(info, show_watch_paths);
+            );
+            if verbose && let Some(info) = vinfo {
+                print_verbose_info(info, show_watch_paths);
+            }
         }
     }
 }

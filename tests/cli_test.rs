@@ -118,9 +118,8 @@ fn cli_status_against_running_daemon() {
                 .await
                 .unwrap();
         assert_eq!(code, 0, "stderr: {stderr}");
-        assert!(stdout.contains("KIND"), "stdout: {stdout}");
+        assert!(stdout.contains("-- services --"), "stdout: {stdout}");
         assert!(stdout.contains("keeper"), "stdout: {stdout}");
-        assert!(stdout.contains("service"), "stdout: {stdout}");
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();
