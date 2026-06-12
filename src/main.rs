@@ -106,13 +106,14 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// View logs for a service or task
+    /// View logs for a service or task. With no name, covers every
+    /// non-hidden service and task; `don logs all` includes hidden ones too.
     Logs {
-        /// Name of the service or task
-        name: String,
-        /// Show last N lines
-        #[arg(short, long, default_value_t = 100)]
-        last: usize,
+        /// Name of the service or task, or `all` for every item
+        name: Option<String>,
+        /// Show last N lines (default 100; in multi-item follow mode, 0)
+        #[arg(short, long)]
+        last: Option<usize>,
         /// Follow the log output
         #[arg(short, long)]
         follow: bool,
@@ -256,7 +257,9 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
             json,
         } => run_status(&config_path, name.as_deref(), verbose, json).await,
         Commands::Watch { json } => run_watch(&config_path, json).await,
-        Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
+        Commands::Logs { name, last, follow } => {
+            run_logs_command(&config_path, name, last, follow).await
+        }
         Commands::Attach { name } => run_attach(&config_path, &name).await,
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
         Commands::Run {
@@ -794,6 +797,135 @@ fn status_sort_bucket(item: &ItemStatus) -> u8 {
 fn item_name(item: &ItemStatus) -> &str {
     match item {
         ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name.as_str(),
+    }
+}
+
+/// Dispatch `don logs`: a real item name streams that item; no name covers
+/// every non-hidden item; the `all` keyword covers every item (an actual
+/// service/task named `all` wins over the keyword).
+async fn run_logs_command(
+    config_path: &Path,
+    name: Option<String>,
+    last: Option<usize>,
+    follow: bool,
+) -> i32 {
+    match name.as_deref() {
+        Some("all") => {
+            let is_real_item = don::config::Config::from_file(config_path)
+                .map(|c| c.services.contains_key("all") || c.tasks.contains_key("all"))
+                .unwrap_or(false);
+            if is_real_item {
+                run_logs(config_path, "all", last.unwrap_or(100), follow).await
+            } else {
+                run_logs_multi(config_path, true, last, follow).await
+            }
+        }
+        Some(name) => run_logs(config_path, name, last.unwrap_or(100), follow).await,
+        None => run_logs_multi(config_path, false, last, follow).await,
+    }
+}
+
+/// `don logs` across many items: one section per item for history, or a
+/// merged name-prefixed stream for `--follow`. `all_items` includes items
+/// configured `hidden = true` (the default set mirrors what the TUI shows).
+async fn run_logs_multi(
+    config_path: &Path,
+    all_items: bool,
+    last: Option<usize>,
+    follow: bool,
+) -> i32 {
+    let config = match don::config::Config::from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            errln(format!("failed to load config: {e}"));
+            return 1;
+        }
+    };
+
+    let mut names: Vec<String> = config
+        .services
+        .iter()
+        .filter(|(_, s)| all_items || !s.hidden)
+        .map(|(n, _)| n.clone())
+        .chain(
+            config
+                .tasks
+                .iter()
+                .filter(|(_, t)| all_items || !t.hidden)
+                .map(|(n, _)| n.clone()),
+        )
+        .collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        println!("(no services or tasks)");
+        return 0;
+    }
+
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let colors = don::output::assign_colors(&name_refs);
+    let name_w = names.iter().map(String::len).max().unwrap_or(0);
+
+    if follow {
+        // Live merge: preloading history per stream would interleave
+        // meaninglessly across items, so default to live-only.
+        let last = last.unwrap_or(0);
+        let mut handles = Vec::new();
+        for name in names {
+            let client = client_for(config_path);
+            let color = colors.get(&name).copied().unwrap_or(Color::White);
+            handles.push(tokio::spawn(async move {
+                let prefix = format!(
+                    "{}{:<name_w$}{} | ",
+                    SetForegroundColor(color),
+                    name,
+                    ResetColor,
+                );
+                let _ = client
+                    .logs_follow(&name, last, |line| {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                            && let Some(s) = v.get("line").and_then(|x| x.as_str())
+                        {
+                            println!("{prefix}{s}");
+                        }
+                        Ok(())
+                    })
+                    .await;
+            }));
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        0
+    } else {
+        let last = last.unwrap_or(100);
+        let client = client_for(config_path);
+        let mut code = 0;
+        for name in names {
+            match client.logs(&name, last).await {
+                Ok(lines) if lines.iter().any(|l| !l.is_empty()) => {
+                    let color = colors.get(&name).copied().unwrap_or(Color::White);
+                    let prefix = format!(
+                        "{}{:<name_w$}{} | ",
+                        SetForegroundColor(color),
+                        name,
+                        ResetColor,
+                    );
+                    for line in lines {
+                        println!("{prefix}{line}");
+                    }
+                }
+                Ok(_) => {}
+                Err(ClientError::NotRunning { path }) => {
+                    errln(ClientError::NotRunning { path });
+                    return 1;
+                }
+                Err(e) => {
+                    errln(format!("{name}: {e}"));
+                    code = 1;
+                }
+            }
+        }
+        code
     }
 }
 

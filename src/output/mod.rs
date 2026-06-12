@@ -575,7 +575,10 @@ fn reserved_color(name: &str) -> Option<Color> {
 }
 
 /// Assigns a deterministic color to each service/task/build-tool name.
-pub(crate) fn assign_colors(names: &[&str]) -> HashMap<String, Color> {
+/// Sorted-name order maps onto the palette, so any caller passing the same
+/// name set gets the same colors — the CLI uses this to prefix multi-item
+/// `don logs` output consistently with the daemon's own prefixes.
+pub fn assign_colors(names: &[&str]) -> HashMap<String, Color> {
     let mut sorted: Vec<&str> = names.to_vec();
     sorted.sort_unstable();
 
