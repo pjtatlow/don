@@ -143,6 +143,7 @@ mod tests {
             params: vec![],
             hidden: false,
             auto_filter_on_failure: None,
+            notify: Default::default(),
         }
     }
 

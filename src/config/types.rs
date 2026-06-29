@@ -268,6 +268,56 @@ pub enum OnFailure {
     Restart,
 }
 
+/// Desktop-notification policy for a service or task.
+///
+/// Each event field is tri-state: `None` falls through to the global `[notify]`
+/// table, then to a built-in default. `enabled` (default on) is the master
+/// switch — set `notify.enabled = false` in a `don.local.toml` to silence
+/// notifications on one machine without touching the shared config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct NotifyConfig {
+    pub enabled: Option<bool>,
+    pub on_ready: Option<bool>,
+    pub on_failed: Option<bool>,
+    pub on_building: Option<bool>,
+    pub on_stopped: Option<bool>,
+    pub on_completed: Option<bool>,
+}
+
+impl NotifyConfig {
+    /// Layer a per-item config over a base (the global `[notify]`): take each
+    /// field where set, else fall back to the base.
+    pub fn merged_over(&self, base: &NotifyConfig) -> NotifyConfig {
+        NotifyConfig {
+            enabled: self.enabled.or(base.enabled),
+            on_ready: self.on_ready.or(base.on_ready),
+            on_failed: self.on_failed.or(base.on_failed),
+            on_building: self.on_building.or(base.on_building),
+            on_stopped: self.on_stopped.or(base.on_stopped),
+            on_completed: self.on_completed.or(base.on_completed),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+    pub fn on_ready(&self) -> bool {
+        self.on_ready.unwrap_or(true)
+    }
+    pub fn on_failed(&self) -> bool {
+        self.on_failed.unwrap_or(true)
+    }
+    pub fn on_building(&self) -> bool {
+        self.on_building.unwrap_or(false)
+    }
+    pub fn on_stopped(&self) -> bool {
+        self.on_stopped.unwrap_or(false)
+    }
+    pub fn on_completed(&self) -> bool {
+        self.on_completed.unwrap_or(false)
+    }
+}
+
 /// Shutdown behavior for services.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownConfig {

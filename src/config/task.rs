@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use super::download::DownloadConfig;
 use super::param::TaskParam;
 use super::platform::Platform;
-use super::types::{BazelConfig, LogConfig, TurboConfig};
+use super::types::{BazelConfig, LogConfig, NotifyConfig, TurboConfig};
 
 /// Automatic run policy for a task.
 ///
@@ -224,6 +224,9 @@ pub struct Task {
     /// When enabled, a task failure adds this task to the TUI log filter.
     #[serde(default)]
     pub auto_filter_on_failure: Option<bool>,
+    /// Per-task desktop-notification policy, layered over the global `[notify]`.
+    #[serde(default)]
+    pub notify: NotifyConfig,
 }
 
 impl Task {

@@ -314,6 +314,25 @@ on_failure = "restart"            # "notify" (default) or "restart"
 
 `on_failure` also fires when the process exits with a non-zero status (or terminating signal) — clean exits still transition to `stopped`. Restarts use escalating backoff (1, 2, 4, 8, 16, 32, capped at 60s) and reset when the service recovers to Ready.
 
+### Desktop Notifications
+
+Get a system notification on lifecycle transitions — useful when running headless (`don start -d`) and not watching the dashboard. Configure a global `[notify]` default and/or per-service/task `notify` tables; per-item fields are layered over the global, then over built-in defaults.
+
+```toml
+[notify]
+enabled      = true   # master switch (default: true)
+on_ready     = true   # service became Ready (default: true)
+on_failed    = true   # service/task failed (default: true)
+on_building  = false  # batch build started (default: false)
+on_stopped   = false  # service stopped (default: false)
+on_completed = false  # task completed (default: false)
+
+[services.api]
+notify = { on_stopped = true }   # also ping me when api stops
+```
+
+To silence notifications on one machine without touching the shared config, set `notify.enabled = false` in a `don.local.toml` (it deep-merges over `don.toml`).
+
 ### File Watching
 
 Services with `watch` patterns automatically rebuild and restart on changes. `watch` is always a list of glob strings, not a boolean:
@@ -590,6 +609,13 @@ See [`examples/`](examples/) for complete working configs.
 | `ready.monitor_interval` | string | Poll interval while monitoring (default: "10s") |
 | `ready.unhealthy_after` | u32 | Consecutive monitor failures → Unhealthy (default: 3) |
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
+| `notify` | table | Desktop notifications on lifecycle transitions; global `[notify]` and/or per service/task |
+| `notify.enabled` | bool | Master switch (default: true); set `false` in `don.local.toml` to silence one machine |
+| `notify.on_ready` | bool | Notify when a service becomes Ready (default: true) |
+| `notify.on_failed` | bool | Notify when a service/task fails (default: true) |
+| `notify.on_building` | bool | Notify on batch build start (default: false) |
+| `notify.on_stopped` | bool | Notify when a service stops (default: false) |
+| `notify.on_completed` | bool | Notify when a task completes (default: false) |
 | `reload` | bool | Service-level master switch for Don-managed watches, rebuilds, and restarts (default: true) |
 | `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
 | `terminal` | string or table | (tasks) `"muxed"` default, or `"foreground"` for exclusive stdin/stdout/stderr ownership |

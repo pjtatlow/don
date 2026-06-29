@@ -9,8 +9,8 @@ fn default_true() -> bool {
 }
 use super::platform::Platform;
 use super::types::{
-    BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ReadyCheck,
-    ShutdownConfig, TurboConfig, deserialize_proxy, deserialize_proxy_option,
+    BazelConfig, Command, LogConfig, LogFilterConfig, NotifyConfig, OnFailure, ProxyEntry,
+    ReadyCheck, ShutdownConfig, TurboConfig, deserialize_proxy, deserialize_proxy_option,
 };
 
 /// The kind of service — exactly one of these must be set.
@@ -97,6 +97,9 @@ pub struct Service {
     /// service. When enabled, a service failure adds this service to the TUI
     /// log filter.
     pub auto_filter_on_failure: Option<bool>,
+    /// Per-service desktop-notification policy, layered over the global
+    /// `[notify]` table. Not platform-overridable.
+    pub notify: NotifyConfig,
 
     /// The service kind. `None` when the base service has no preset
     /// and relies on a platform override to supply one.
@@ -142,6 +145,8 @@ struct RawService {
     hidden: bool,
     #[serde(default)]
     auto_filter_on_failure: Option<bool>,
+    #[serde(default)]
+    notify: NotifyConfig,
 
     bazel: Option<BazelConfig>,
     turbo: Option<TurboConfig>,
@@ -227,6 +232,7 @@ impl TryFrom<RawService> for Service {
             platform: raw.platform,
             hidden: raw.hidden,
             auto_filter_on_failure: raw.auto_filter_on_failure,
+            notify: raw.notify,
             kind,
         })
     }
@@ -372,6 +378,9 @@ pub struct ResolvedService {
     /// Optional per-service override for automatic log-filter selection on
     /// failure.
     pub auto_filter_on_failure: Option<bool>,
+    /// Desktop-notification policy (global `[notify]` is layered in at the
+    /// transition site, not here).
+    pub notify: NotifyConfig,
 
     /// The resolved service kind. `None` only if validation hasn't caught
     /// a missing preset (shouldn't happen after validation).
@@ -508,6 +517,7 @@ impl Service {
                 tty: self.tty,
                 on_failure: self.on_failure,
                 auto_filter_on_failure: self.auto_filter_on_failure,
+                notify: self.notify,
                 kind: self.kind.clone(),
                 resolved_binary_path: None,
             },
@@ -549,6 +559,7 @@ impl Service {
                     auto_filter_on_failure: ov
                         .auto_filter_on_failure
                         .or(self.auto_filter_on_failure),
+                    notify: self.notify,
                     kind,
                     resolved_binary_path: None,
                 }

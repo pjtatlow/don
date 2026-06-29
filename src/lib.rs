@@ -7,6 +7,7 @@ pub mod download;
 pub mod duration;
 pub mod exec;
 pub mod init;
+pub(crate) mod notifications;
 pub mod output;
 pub mod process;
 pub(crate) mod proxy;

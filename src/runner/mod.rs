@@ -929,6 +929,10 @@ impl Runner {
                 state,
                 pid,
             });
+            if let Some(rs) = self.services.get(name) {
+                let notify = rs.resolved.notify.merged_over(&self.config.notify);
+                crate::notifications::notify_service(&notify, name, state);
+            }
         }
     }
 
@@ -945,6 +949,10 @@ impl Runner {
                 state,
                 last_run,
             });
+            if let Some(rt) = self.tasks.get(name) {
+                let notify = rt.config.notify.merged_over(&self.config.notify);
+                crate::notifications::notify_task(&notify, name, state);
+            }
         }
     }
 
@@ -1945,6 +1953,7 @@ mod tests {
                     platform: HashMap::new(),
                     hidden: false,
                     auto_filter_on_failure: None,
+                    notify: Default::default(),
                     kind: Some(ServiceKind::Bazel(BazelConfig {
                         target: "//api:api".to_string(),
                         watch: true,
@@ -1961,6 +1970,7 @@ mod tests {
             shutdown: crate::config::ShutdownConfig::default(),
             log_filter: LogFilterConfig::default(),
             auto_filter_on_failure: true,
+            notify: Default::default(),
         };
         let output_manager = crate::output::OutputManager::new_verbose(
             &[("api", &LogConfig::Stdout)],
@@ -2038,6 +2048,7 @@ mod tests {
                     platform: HashMap::new(),
                     hidden: false,
                     auto_filter_on_failure: None,
+                    notify: Default::default(),
                     kind: Some(ServiceKind::Bazel(BazelConfig {
                         target: "//api:api".to_string(),
                         watch: true,
@@ -2054,6 +2065,7 @@ mod tests {
             shutdown: crate::config::ShutdownConfig::default(),
             log_filter: LogFilterConfig::default(),
             auto_filter_on_failure: true,
+            notify: Default::default(),
         };
         let output_manager = crate::output::OutputManager::new_verbose(
             &[("api", &LogConfig::Stdout)],
@@ -2562,6 +2574,7 @@ mod tests {
                 tty: true,
                 on_failure: crate::config::OnFailure::Notify,
                 auto_filter_on_failure: None,
+                notify: Default::default(),
                 kind: None,
                 resolved_binary_path: None,
             },
@@ -2604,6 +2617,7 @@ mod tests {
                 params: Vec::new(),
                 hidden: false,
                 auto_filter_on_failure: None,
+                notify: Default::default(),
             },
             TaskItemState::Pending,
             false,
@@ -2685,6 +2699,7 @@ mod tests {
                     tty: true,
                     on_failure: crate::config::OnFailure::Notify,
                     auto_filter_on_failure: None,
+                    notify: Default::default(),
                     kind: None,
                     resolved_binary_path: None,
                 },

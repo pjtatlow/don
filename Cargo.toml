@@ -28,6 +28,7 @@ tower = "0.5"
 tower-service = "0.3"
 nix = { version = "0.31", features = ["signal", "process", "fs"] }
 notify = "8"
+notify-rust = "4"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 regex = "1"
 pty-process = { version = "0.5", features = ["async"] }

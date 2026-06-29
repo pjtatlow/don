@@ -23,8 +23,8 @@ pub use self::service::{
 };
 pub use self::task::{Task, TaskAutoRun, TaskTerminal, TaskTerminalMode, TaskTerminalScreen};
 pub use self::types::{
-    BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
-    ShutdownConfig, TurboConfig,
+    BazelConfig, Command, LogConfig, LogFilterConfig, NotifyConfig, OnFailure, ProxyEntry,
+    ProxyMode, ReadyCheck, ShutdownConfig, TurboConfig,
 };
 
 pub use self::service::{GoConfig, ServiceOverride};
@@ -76,6 +76,10 @@ pub struct Config {
     /// own `auto_filter_on_failure` setting. Defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_filter_on_failure: bool,
+    /// Global desktop-notification defaults. Per-service/task `notify` tables
+    /// are layered on top.
+    #[serde(default)]
+    pub notify: NotifyConfig,
 }
 
 impl std::str::FromStr for Config {
