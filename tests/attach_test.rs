@@ -418,3 +418,128 @@ fn integration_resize_propagates_to_subprocess_pty() {
         handle.await.unwrap();
     });
 }
+
+/// Poll the status endpoint until the named task reaches `state`, or fail.
+async fn wait_for_task_state(
+    socket_path: &Path,
+    name: &str,
+    state: don::runner::TaskItemState,
+    timeout: Duration,
+) -> bool {
+    let client = don::client::Client::with_socket_path(socket_path.to_path_buf());
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(items) = client.status(false, Some(name)).await
+            && let [don::runner::ItemStatus::Task { state: s, .. }] = items.as_slice()
+            && *s == state
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[test]
+fn integration_foreground_task_without_terminal_runs_on_pty() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("fg-headless");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["300"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task("setup", "sh", &["-c", "echo setup done"])
+            .auto_run_mode("once")
+            .terminal_mode("foreground")
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        assert!(
+            wait_for_task_state(
+                &socket,
+                "setup",
+                don::runner::TaskItemState::Completed,
+                Duration::from_secs(5),
+            )
+            .await,
+            "foreground task should fall back to a PTY spawn and complete \
+             when the runner has no terminal"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_foreground_task_bridges_input_and_closes_on_exit() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("fg-bridge");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["300"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task("interactive", "sh", &["-c", "read x; echo got: $x"])
+            .auto_run(false)
+            .terminal_mode("foreground")
+            .done()
+            .build();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        // Attach first (registers a waiter), then trigger the run — the
+        // ordering `don run` uses so a fast task can't slip past the bridge.
+        let socket_clone = socket.clone();
+        let attach = tokio::spawn(async move { raw_attach(&socket_clone, "interactive", 4242).await });
+
+        let client = don::client::Client::with_socket_path(socket.clone());
+        client
+            .run_task_with_options(
+                "interactive",
+                std::collections::HashMap::new(),
+                don::client::RunTaskOptions {
+                    wait: false,
+                    wait_timeout: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (mut stream, _leftover) = attach.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stream.write_all(b"abc\n").await.unwrap();
+
+        // The task echoes the input and exits; the server must then close
+        // the attach stream rather than leaving the client hanging.
+        let output = collect_bytes(&mut stream, Duration::from_secs(5)).await;
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("got: abc"), "expected task output; got: {text:?}");
+
+        let mut probe = [0u8; 16];
+        let closed = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut probe)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "attach stream should close when the task exits"
+        );
+
+        assert!(
+            wait_for_task_state(
+                &socket,
+                "interactive",
+                don::runner::TaskItemState::Completed,
+                Duration::from_secs(3),
+            )
+            .await,
+            "task should be recorded as completed"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}

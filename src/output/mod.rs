@@ -16,17 +16,32 @@ pub(crate) mod sanitize;
 use bytes::{Bytes, BytesMut};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use ring_buffer::RingBuffer;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 /// Default ring buffer capacity per service (lines).
 const DEFAULT_RING_BUFFER_CAPACITY: usize = 10_000;
 const MAX_FILTER_PENDING: usize = 16 * 1024;
+
+/// Capacity of the broadcast channel that fans formatted log lines out to
+/// attached `don tui` frontends. Sized generously so a momentarily slow
+/// client doesn't drop lines under normal load; a client that lags past this
+/// many buffered lines sees a gap (broadcast drops oldest), which is the right
+/// trade for a remote viewer — better a bounded gap than unbounded daemon
+/// memory growth. The local stdout/file write and ring buffers are never
+/// affected by tap lag.
+const LOG_TAP_CAPACITY: usize = 16_384;
+
+/// How many recent formatted lines to retain for backfill on a new frontend
+/// connection. Sized so `don tui` against an hour-old daemon shows the recent
+/// flow rather than starting empty; cost is roughly RECENT × avg_line_bytes
+/// (~1MB at 200 bytes/line × 5000 lines).
+const RECENT_BUFFER_CAPACITY: usize = 5_000;
 
 /// Name stamped on `[don]` lifecycle events so the TUI filter can treat them
 /// like any other service/task: gated when a filter is active, selectable
@@ -207,6 +222,13 @@ impl SinkHandle {
 /// (preserving native scrollback) and stamp the `name` for filter matching.
 /// The bytes already include any verbose-mode timestamp and the color-coded
 /// service prefix; the consumer just renders them as-is.
+///
+/// `Clone` so the daemon can fan the same line out to multiple consumers
+/// (the local stdout pipeline and any number of attached `don tui` log
+/// taps). The wire form for remote frontends is a length-prefixed binary
+/// frame (see `server::logstream`), not serde — the bytes are already
+/// formatted, so framing them avoids per-line JSON cost on the hot path.
+#[derive(Clone)]
 pub struct FormattedLogLine {
     /// Owning service/task name. `[don]` lifecycle events carry
     /// [`LIFECYCLE_EVENT_NAME`] so the filter treats them as a selectable
@@ -645,6 +667,69 @@ fn format_prefix(name: &str, color: Color, max_name_len: usize) -> Bytes {
     ))
 }
 
+/// The fan-out point for formatted log lines headed to attached `don tui`
+/// frontends: a live broadcast plus a bounded ring of the most recent lines.
+///
+/// The ring exists so a frontend connecting *now* still sees recent history —
+/// without it, attaching `don tui` to an hour-old daemon starts empty. The two
+/// halves are bundled in one struct so `emit_line` and the `/logstream`
+/// handler share a single mutex (snapshot-on-subscribe is race-free this way:
+/// see [`Self::snapshot_and_subscribe`]).
+pub struct LogTaps {
+    /// Live stream — broadcasts each new line. Drops oldest for lagging
+    /// receivers (bounded daemon memory; remote viewer sees a gap if it can't
+    /// keep up).
+    broadcast: broadcast::Sender<FormattedLogLine>,
+    /// Recent history — the last [`RECENT_BUFFER_CAPACITY`] lines, used to
+    /// backfill a connecting frontend. Same mutex protects atomic
+    /// snapshot+subscribe.
+    recent: std::sync::Mutex<VecDeque<FormattedLogLine>>,
+}
+
+impl LogTaps {
+    fn new() -> Self {
+        let (broadcast, _) = broadcast::channel(LOG_TAP_CAPACITY);
+        Self {
+            broadcast,
+            recent: std::sync::Mutex::new(VecDeque::with_capacity(RECENT_BUFFER_CAPACITY)),
+        }
+    }
+
+    /// Push a freshly-formatted line into both the recent ring and the live
+    /// broadcast — atomically against [`Self::snapshot_and_subscribe`], so
+    /// every line is delivered to a connecting frontend exactly once (either
+    /// in the snapshot or via the live receiver, never both and never
+    /// neither).
+    fn push(&self, line: FormattedLogLine) {
+        // `unwrap_or_else(into_inner)` recovers from poisoning instead of
+        // panicking — don manages real child processes; a poisoned mutex must
+        // not be the thing that wedges the runner.
+        let mut buf = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        if self.broadcast.receiver_count() > 0 {
+            let _ = self.broadcast.send(line.clone());
+        }
+        if buf.len() >= RECENT_BUFFER_CAPACITY {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+    }
+
+    /// Atomically take a snapshot of the recent ring and subscribe to the live
+    /// broadcast. The single mutex hold ensures no line is both in the
+    /// snapshot and delivered live (no dup) and none falls between the two
+    /// (no gap) — `push` takes the same mutex around its own broadcast send.
+    pub(crate) fn snapshot_and_subscribe(
+        &self,
+    ) -> (Vec<FormattedLogLine>, broadcast::Receiver<FormattedLogLine>) {
+        let buf = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot: Vec<FormattedLogLine> = buf.iter().cloned().collect();
+        let receiver = self.broadcast.subscribe();
+        // `buf` (mutex guard) drops at end of scope.
+        drop(buf);
+        (snapshot, receiver)
+    }
+}
+
 /// Manages output for all services — creates sinks, spawns writer tasks,
 /// and provides lifecycle event formatting.
 pub struct OutputManager {
@@ -674,6 +759,12 @@ pub struct OutputManager {
     bazel_prefix: Option<Bytes>,
     /// Same as `bazel_prefix` for the synthetic "turbo" stream.
     turbo_prefix: Option<Bytes>,
+    /// Live + recent fan-out for attached `don tui` frontends. The stdout
+    /// sink task holds a clone and pushes each formatted line through both
+    /// halves; the API server hands out atomic snapshot+live subscriptions
+    /// via [`LogTaps::snapshot_and_subscribe`] for the `GET /logstream`
+    /// backfill-then-live behavior.
+    log_taps: Arc<LogTaps>,
 }
 
 /// Errors from output handling.
@@ -792,6 +883,10 @@ impl OutputManager {
         let stdout_pause = StdoutPauseControl::new();
         let log_filter = LogFilterControl::default();
 
+        // Fan-out for attached `don tui` frontends: live broadcast + recent
+        // ring (shared mutex makes snapshot-on-subscribe race-free).
+        let log_taps = Arc::new(LogTaps::new());
+
         // Spawn stdout sink task.
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
         let stdout_handle = tokio::spawn(stdout_sink_task(
@@ -800,6 +895,7 @@ impl OutputManager {
             verbosity.clone(),
             stdout_pause.clone(),
             log_filter.clone(),
+            log_taps.clone(),
         ));
         let stdout_sink = SinkHandle::Unbounded(stdout_tx);
 
@@ -873,7 +969,15 @@ impl OutputManager {
             log_filter,
             bazel_prefix: None,
             turbo_prefix: None,
+            log_taps,
         })
+    }
+
+    /// Clone the shared fan-out handle so the API server can hand out atomic
+    /// snapshot+live subscriptions to each `GET /logstream` connection. See
+    /// [`LogTaps::snapshot_and_subscribe`].
+    pub fn log_taps(&self) -> Arc<LogTaps> {
+        self.log_taps.clone()
     }
 
     /// Register a synthetic "tool" service (`bazel` or `turbo`) so build
@@ -1406,6 +1510,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     verbosity: VerbosityControl,
     pause: StdoutPauseControl,
     filter: LogFilterControl,
+    log_taps: Arc<LogTaps>,
 ) {
     use bytes::BytesMut;
 
@@ -1464,6 +1569,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_lifecycle,
                         &verbosity,
                         start,
+                        &log_taps,
                     )
                     .await;
                 }
@@ -1487,6 +1593,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_lifecycle,
                         &verbosity,
                         start,
+                        &log_taps,
                     )
                     .await;
                 }
@@ -1510,6 +1617,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_lifecycle,
                         &verbosity,
                         start,
+                        &log_taps,
                     )
                     .await;
                     acc.clear();
@@ -1542,6 +1650,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 false,
                 &verbosity,
                 start,
+                &log_taps,
             )
             .await;
         }
@@ -1569,6 +1678,7 @@ fn build_formatted_bytes(
 
 /// Emit a complete formatted line to the target — either write to the pipe
 /// writer with a trailing `\n`, or ship it to the TUI as a [`FormattedLogLine`].
+#[allow(clippy::too_many_arguments)]
 async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     target: &mut StdoutTarget<W>,
     name: &str,
@@ -1577,8 +1687,20 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     is_lifecycle: bool,
     verbosity: &VerbosityControl,
     start: std::time::Instant,
+    log_taps: &LogTaps,
 ) {
     let bytes = build_formatted_bytes(prefix, line, verbosity, start);
+
+    // Push to the recent ring + live broadcast atomically. The ring populates
+    // unconditionally so a frontend connecting *now* still gets backfill — the
+    // bytes.clone() here is the cost of that. Cheap relative to formatting +
+    // sanitization that already ran upstream.
+    log_taps.push(FormattedLogLine {
+        name: name.to_string(),
+        is_lifecycle,
+        bytes: bytes.clone(),
+    });
+
     match target {
         StdoutTarget::Writer(writer) => {
             use tokio::io::AsyncWriteExt;

@@ -31,17 +31,41 @@ pub enum TerminalRequest {
 #[derive(Clone)]
 pub struct TerminalCoordinator {
     tx: Option<mpsc::Sender<TerminalRequest>>,
+    terminal: bool,
 }
 
 impl TerminalCoordinator {
-    /// No-op coordinator for non-TUI runs (pipe mode, `--no-tui`, non-tty).
+    /// No-op coordinator for runs without an interactive terminal (detached
+    /// daemon, tests, piped stdout). Foreground tasks fall back to a normal
+    /// PTY spawn and clients bridge in via attach.
     pub fn detached() -> Self {
-        Self { tx: None }
+        Self {
+            tx: None,
+            terminal: false,
+        }
+    }
+
+    /// No-op coordinator for pipe-mode runs that still own a real terminal
+    /// (`don start --no-tui` in an interactive shell). Foreground tasks take
+    /// over the terminal directly; there is just no TUI to pause.
+    pub fn detached_with_terminal() -> Self {
+        Self {
+            tx: None,
+            terminal: true,
+        }
     }
 
     /// Coordinator that drives a [`TerminalRequest`] consumer (the TUI).
     pub fn with_channel(tx: mpsc::Sender<TerminalRequest>) -> Self {
-        Self { tx: Some(tx) }
+        Self {
+            tx: Some(tx),
+            terminal: true,
+        }
+    }
+
+    /// Whether this run can hand a foreground task the real terminal.
+    pub fn terminal_available(&self) -> bool {
+        self.terminal
     }
 
     /// Pause the TUI and wait for it to confirm it has released the
@@ -60,4 +84,11 @@ impl TerminalCoordinator {
         let Some(tx) = &self.tx else { return };
         let _ = tx.send(TerminalRequest::Release).await;
     }
+}
+
+/// Whether this process's stdin is an interactive terminal — the same check
+/// [`crate::process`]'s foreground spawn performs before taking the terminal.
+pub(crate) fn has_interactive_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }

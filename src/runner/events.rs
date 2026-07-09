@@ -174,7 +174,7 @@ impl Runner {
         }
     }
 
-    pub(in crate::runner) fn handle_task_exit(&mut self, exit: TaskExit) {
+    pub(in crate::runner) async fn handle_task_exit(&mut self, exit: TaskExit) {
         let TaskExit {
             name,
             pgid,
@@ -197,9 +197,18 @@ impl Runner {
             self.output_manager.resume_visible_output();
         }
 
+        // Release any active attach session: restore the stdout sink, then
+        // close the transient follow sinks so a bridged client (attach or a
+        // foreground `don run`) sees the stream end instead of hanging on an
+        // exited task.
+        if self.remove_attach_lock(name) {
+            self.output_manager.resume_stdout_sink(name).await;
+        }
+        if let Some(writer) = self.output_manager.service_writer(name) {
+            writer.close_follow_sinks().await;
+        }
         if let Some(rt) = self.tasks.get_mut(name) {
             rt.pgid = None;
-            rt.attach_lock = None;
         }
 
         let timing = elapsed.map(format_duration).unwrap_or_default();

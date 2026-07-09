@@ -36,7 +36,7 @@ impl Runner {
         let task_cfg_for_worker = task_cfg.clone();
         let global_watch_ignore = self.config.watch_ignore.clone();
         let terminal_coordinator = self.terminal_coordinator.clone();
-        if task_cfg.terminal.is_foreground() {
+        if task_cfg.terminal.is_foreground() && self.terminal_coordinator.terminal_available() {
             self.output_manager.pause_visible_output();
         }
         let worker = tokio::spawn(async move {
@@ -682,7 +682,10 @@ impl Runner {
         start_message: &str,
         wait_reply: Option<(oneshot::Sender<CommandResult>, Option<String>)>,
     ) {
-        if task_cfg.terminal.is_foreground() && self.is_another_foreground_task_running(name) {
+        if task_cfg.terminal.is_foreground()
+            && self.terminal_coordinator.terminal_available()
+            && self.is_another_foreground_task_running(name)
+        {
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.last_params = params.clone();
                 rt.set_needs_run_now(true);

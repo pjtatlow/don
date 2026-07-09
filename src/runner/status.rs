@@ -1,7 +1,74 @@
-use super::{ItemStatus, Runner, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
+use super::{
+    ItemStatus, Runner, TuiSnapshot, VerboseInfo, WatchDir, WatchReport, WatchReportItem,
+};
 use tokio::sync::oneshot;
 
 impl Runner {
+    /// Build the seed snapshot for a remote `don tui` frontend: the active
+    /// item set (already filtered to this daemon's profile), daemon-wide flags,
+    /// and current per-item state. The client merges this with task param
+    /// schemas it loads from the local `don.toml`.
+    pub(in crate::runner) async fn build_snapshot(&self) -> TuiSnapshot {
+        let service_names: Vec<String> = self.services.keys().cloned().collect();
+        let task_names: Vec<String> = self.tasks.keys().cloned().collect();
+
+        let uses_bazel = self
+            .services
+            .values()
+            .any(|rs| matches!(rs.resolved.kind, Some(crate::config::ServiceKind::Bazel(_))))
+            || self.tasks.values().any(|rt| rt.config.bazel.is_some());
+        let uses_turbo = self
+            .services
+            .values()
+            .any(|rs| matches!(rs.resolved.kind, Some(crate::config::ServiceKind::Turbo(_))))
+            || self.tasks.values().any(|rt| rt.config.turbo.is_some());
+        let build_tool_names: Vec<String> = [
+            uses_bazel.then(|| "bazel".to_string()),
+            uses_turbo.then(|| "turbo".to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let mut hidden_names = Vec::new();
+        let mut auto_filter_on_failure_names = Vec::new();
+        let default_auto_filter = self.config.auto_filter_on_failure;
+        for (name, rs) in &self.services {
+            if self.config.services.get(name).is_some_and(|s| s.hidden) {
+                hidden_names.push(name.clone());
+            }
+            if rs
+                .resolved
+                .auto_filter_on_failure
+                .unwrap_or(default_auto_filter)
+            {
+                auto_filter_on_failure_names.push(name.clone());
+            }
+        }
+        for (name, rt) in &self.tasks {
+            if rt.config.hidden {
+                hidden_names.push(name.clone());
+            }
+            if rt
+                .config
+                .auto_filter_on_failure
+                .unwrap_or(default_auto_filter)
+            {
+                auto_filter_on_failure_names.push(name.clone());
+            }
+        }
+
+        TuiSnapshot {
+            verbose: self.output_manager.verbosity_control().is_enabled(),
+            service_names,
+            task_names,
+            build_tool_names,
+            hidden_names,
+            auto_filter_on_failure_names,
+            statuses: self.collect_status(false, None).await,
+        }
+    }
+
     pub(in crate::runner) async fn fetch_watch_snapshot(
         &self,
     ) -> Option<crate::watch::WatchSnapshot> {

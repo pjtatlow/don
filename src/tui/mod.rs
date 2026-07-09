@@ -66,7 +66,8 @@ use backend::FixedBottomBackend;
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter, VerbosityControl};
 use crate::runner::{CommandResult, RunnerCommand, RunnerEvent, ServiceState, TerminalRequest};
-use app::{App, AppInit, ViewMode, line_matches_log_popup};
+use app::{App, AppInit, ForegroundRun, ViewMode, line_matches_log_popup};
+use std::path::{Path, PathBuf};
 use events::AppEvent;
 use log_store::{DEFAULT_CAPACITY, LogStore};
 use status_table::StatusTableKeyOutcome;
@@ -192,6 +193,17 @@ impl ActiveTerm {
     }
 }
 
+/// What Ctrl+C does in the TUI, set by the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QuitMode {
+    /// In-process `don start`: Ctrl+C shuts the whole stack down (SIGINT +
+    /// a direct `Shutdown` command, preserving the two-press force escalation).
+    ShutdownDaemon,
+    /// `don tui` frontend: Ctrl+C detaches the viewer and leaves the daemon
+    /// running. No shutdown is sent.
+    DetachFrontend,
+}
+
 /// Run the interactive TUI until the runner shuts down or the user quits.
 ///
 /// Ctrl+C raises SIGINT to our own process so the installed signal handler
@@ -213,6 +225,8 @@ pub async fn run_tui(
     auto_filter_on_failure_names: std::collections::HashSet<String>,
     cli_log_filter: Option<std::collections::HashSet<String>>,
     mut terminal_request_rx: mpsc::Receiver<TerminalRequest>,
+    quit_mode: QuitMode,
+    foreground_attach: Option<PathBuf>,
 ) -> Result<(), TuiError> {
     let controls = TuiControls {
         verbosity,
@@ -392,7 +406,28 @@ pub async fn run_tui(
                                 &command_tx,
                                 &controls,
                                 &mut act.modal,
+                                quit_mode,
                             )?;
+                        }
+                        if app.should_detach {
+                            break;
+                        }
+                        if let Some(run) = app.pending_foreground_run.take()
+                            && let Some(socket) = foreground_attach.clone()
+                        {
+                            // Hand the terminal to the foreground task: tear the
+                            // dashboard down, bridge stdin/stdout to the daemon
+                            // PTY (same as `don run <task>`), then rebuild.
+                            if let Some(act) = active.take() {
+                                paused_checkpoint = Some(store.next_id());
+                                act.tear_down().await?;
+                            }
+                            run_foreground_attached(&socket, &command_tx, run).await;
+                            let since = paused_checkpoint.take().unwrap_or(0);
+                            let (act, width) =
+                                rebuild_active_after_pause(&input_tx, &app, &store, since)?;
+                            cached_width = width;
+                            active = Some(act);
                         }
                     }
                     None => {
@@ -415,33 +450,11 @@ pub async fn run_tui(
                         let _ = ack.send(());
                     }
                     Some(TerminalRequest::Release) if active.is_none() => {
-                        {
-                            // Don't clear the screen — the foreground task's
-                            // output stays in scrollback. Build a fresh
-                            // inline terminal anchored at the current cursor
-                            // row (the row right after the task's output)
-                            // via the DSR FixedBottomBackend issues during
-                            // construction.
-                            let mut act = ActiveTerm::enter(&input_tx)?;
-                            act.terminal.draw(|f| render::draw_bar(f, &app))?;
-                            cached_width = act.terminal.size()?.width.max(1);
-                            // Replay only lines that arrived during the
-                            // pause via `insert_before`. They land in
-                            // scrollback right after the foreground task's
-                            // output — the bar drifts down accordingly.
-                            let since = paused_checkpoint.take().unwrap_or(0);
-                            let mut replayed_any = false;
-                            for entry in store.iter_since(since) {
-                                if app.should_render_log(&entry.line.name, entry.line.is_lifecycle) {
-                                    insert_line(&mut act.terminal, &entry.line, cached_width)?;
-                                    replayed_any = true;
-                                }
-                            }
-                            if replayed_any {
-                                draw_inline_bar(&mut act.terminal, &app)?;
-                            }
-                            active = Some(act);
-                        }
+                        let since = paused_checkpoint.take().unwrap_or(0);
+                        let (act, width) =
+                            rebuild_active_after_pause(&input_tx, &app, &store, since)?;
+                        cached_width = width;
+                        active = Some(act);
                     }
                     Some(TerminalRequest::Release) => {
                         // Already active — nothing to do. Lets the runner
@@ -672,6 +685,7 @@ fn close_modal_and_replay_new_logs(
 }
 
 /// Dispatch an input or resize event.
+#[allow(clippy::too_many_arguments)]
 fn handle_app_event(
     event: AppEvent,
     app: &mut App,
@@ -680,6 +694,7 @@ fn handle_app_event(
     command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
+    quit_mode: QuitMode,
 ) -> Result<(), TuiError> {
     match event {
         AppEvent::Resize => {
@@ -707,7 +722,9 @@ fn handle_app_event(
             // own that cache. The autoresize path inside ratatui has already
             // adopted the new size by this point.
         }
-        AppEvent::Key(key) => handle_key(key, app, terminal, store, command_tx, controls, modal)?,
+        AppEvent::Key(key) => {
+            handle_key(key, app, terminal, store, command_tx, controls, modal, quit_mode)?
+        }
         AppEvent::CompletionsReady {
             param,
             request_id,
@@ -722,6 +739,7 @@ fn handle_app_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
@@ -730,6 +748,7 @@ fn handle_key(
     command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     controls: &TuiControls,
     modal: &mut Option<Modal>,
+    quit_mode: QuitMode,
 ) -> Result<(), TuiError> {
     // Ctrl+C: belt-and-suspenders shutdown. We both send a `Shutdown` command
     // directly down the runner channel AND raise SIGINT. The direct command
@@ -738,14 +757,20 @@ fn handle_key(
     // two-press force-kill escalation via the runner's signal counter.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('c') => {
-                let _ = command_tx.send(RunnerCommand::Shutdown);
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::this(),
-                    nix::sys::signal::Signal::SIGINT,
-                );
-                enter_shutdown_mode(app, terminal, modal)?;
-            }
+            KeyCode::Char('c') => match quit_mode {
+                QuitMode::DetachFrontend => {
+                    // Remote frontend: leave the daemon running, just return.
+                    app.should_detach = true;
+                }
+                QuitMode::ShutdownDaemon => {
+                    let _ = command_tx.send(RunnerCommand::Shutdown);
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::this(),
+                        nix::sys::signal::Signal::SIGINT,
+                    );
+                    enter_shutdown_mode(app, terminal, modal)?;
+                }
+            },
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 let enabled = controls.verbosity.toggle();
                 app.set_verbose_enabled(enabled);
@@ -768,11 +793,15 @@ fn handle_key(
     match app.view_mode {
         ViewMode::Normal => handle_normal_key(key, app, terminal, store, modal)?,
         ViewMode::Filter => handle_filter_key(key, app, terminal, store, modal)?,
-        ViewMode::Tasks => handle_tasks_key(key, app, terminal, store, command_tx, modal)?,
+        ViewMode::Tasks => {
+            handle_tasks_key(key, app, terminal, store, command_tx, modal, quit_mode)?
+        }
         ViewMode::Services => {
             handle_services_key(key, app, terminal, store, command_tx, controls, modal)?;
         }
-        ViewMode::Form => handle_form_key(key, app, terminal, store, command_tx, modal)?,
+        ViewMode::Form => {
+            handle_form_key(key, app, terminal, store, command_tx, modal, quit_mode)?
+        }
     }
     Ok(())
 }
@@ -942,6 +971,7 @@ fn handle_tasks_key(
     store: &mut LogStore,
     command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     modal: &mut Option<Modal>,
+    quit_mode: QuitMode,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
     if app.log_popup.is_some() {
@@ -974,6 +1004,10 @@ fn handle_tasks_key(
             redraw_modal(modal, app)?;
         } else {
             let task_name = item.name;
+            if wants_foreground_bridge(app, quit_mode, &task_name) {
+                begin_foreground_run(app, task_name, std::collections::HashMap::new());
+                return Ok(());
+            }
             dispatch_run_task(command_tx, task_name.clone());
             return_to_logs_after_task_run(&task_name, app, terminal, store, modal)?;
         }
@@ -1238,6 +1272,83 @@ fn return_to_logs_after_task_run(
     Ok(())
 }
 
+/// Defer a foreground task run to the event loop: close the active modal,
+/// return to the log view, and record the run so the loop can tear the
+/// dashboard down and bridge it interactively.
+fn begin_foreground_run(
+    app: &mut App,
+    name: String,
+    params: std::collections::HashMap<String, String>,
+) {
+    app.view_mode = ViewMode::Normal;
+    app.form = None;
+    app.log_popup = None;
+    app.pending_foreground_run = Some(ForegroundRun { name, params });
+}
+
+/// True when a foreground task launched here should be bridged interactively:
+/// only the `don tui` frontend (`DetachFrontend`) running a `foreground` task.
+fn wants_foreground_bridge(app: &App, quit_mode: QuitMode, name: &str) -> bool {
+    quit_mode == QuitMode::DetachFrontend
+        && app
+            .task_configs
+            .get(name)
+            .is_some_and(|t| t.terminal.is_foreground())
+}
+
+/// Rebuild the inline terminal after a foreground task released the screen.
+/// Anchors a fresh inline viewport at the current cursor row (right after the
+/// task's output) and replays only the lines that arrived during the pause via
+/// `insert_before`, so they land in scrollback above the bar instead of being
+/// lost. The screen is intentionally not cleared — the task's output stays.
+fn rebuild_active_after_pause(
+    input_tx: &mpsc::Sender<AppEvent>,
+    app: &App,
+    store: &LogStore,
+    since: u64,
+) -> Result<(ActiveTerm, u16), TuiError> {
+    let mut act = ActiveTerm::enter(input_tx)?;
+    act.terminal.draw(|f| render::draw_bar(f, app))?;
+    let cached_width = act.terminal.size()?.width.max(1);
+    let mut replayed_any = false;
+    for entry in store.iter_since(since) {
+        if app.should_render_log(&entry.line.name, entry.line.is_lifecycle) {
+            insert_line(&mut act.terminal, &entry.line, cached_width)?;
+            replayed_any = true;
+        }
+    }
+    if replayed_any {
+        draw_inline_bar(&mut act.terminal, app)?;
+    }
+    Ok((act, cached_width))
+}
+
+/// Run a foreground task against the headless daemon while the `don tui`
+/// frontend owns the terminal. Registers the attach session (stdin/stdout
+/// bridged to the daemon PTY) before triggering the run so a fast task can't
+/// exit before the bridge connects, then waits for the session to end with the
+/// task. Mirrors `run_foreground_bridged` in the CLI.
+async fn run_foreground_attached(
+    socket: &Path,
+    command_tx: &mpsc::UnboundedSender<RunnerCommand>,
+    run: ForegroundRun,
+) {
+    let socket_buf = socket.to_path_buf();
+    let attach_name = run.name.clone();
+    let attach = tokio::spawn(async move {
+        let _ = crate::client::attach::run_attach_session(&socket_buf, &attach_name).await;
+    });
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    let _ = command_tx.send(RunnerCommand::RunTask {
+        name: run.name,
+        params: run.params,
+        wait: false,
+        wait_timeout: None,
+        reply: reply_tx,
+    });
+    let _ = attach.await;
+}
+
 /// Fire a param-less [`RunnerCommand::RunTask`] without waiting for the reply.
 /// State updates come through the runner event broadcast.
 fn dispatch_run_task(command_tx: &mpsc::UnboundedSender<RunnerCommand>, name: String) {
@@ -1391,6 +1502,7 @@ fn app_input_tx() -> Option<&'static mpsc::Sender<AppEvent>> {
 
 /// Handle keys while the form modal is open. Navigation, per-kind input,
 /// candidate selection, and submit/cancel live here.
+#[allow(clippy::too_many_arguments)]
 fn handle_form_key(
     key: KeyEvent,
     app: &mut App,
@@ -1398,6 +1510,7 @@ fn handle_form_key(
     store: &mut LogStore,
     command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     modal: &mut Option<Modal>,
+    quit_mode: QuitMode,
 ) -> Result<(), TuiError> {
     // Grab these up front so later `app.form` borrows don't conflict.
     let task_name = match app.form.as_ref() {
@@ -1415,7 +1528,7 @@ fn handle_form_key(
         }
         KeyCode::Enter if ctrl => {
             // Submit regardless of focused field.
-            try_submit_form(app, command_tx, terminal, store, modal)?;
+            try_submit_form(app, command_tx, terminal, store, modal, quit_mode)?;
             return Ok(());
         }
         KeyCode::Enter => {
@@ -1430,7 +1543,7 @@ fn handle_form_key(
             if let Some(form) = app.form.as_ref()
                 && form.focus + 1 >= form.fields.len()
             {
-                try_submit_form(app, command_tx, terminal, store, modal)?;
+                try_submit_form(app, command_tx, terminal, store, modal, quit_mode)?;
                 return Ok(());
             }
             if let Some(form) = app.form.as_mut() {
@@ -1554,12 +1667,14 @@ fn handle_form_key(
 /// Attempt to submit the form. On success: dispatch `RunnerCommand::RunTask`,
 /// close the modal, return to Normal. On validation error: record it on the
 /// form so the renderer can show it, and stay open.
+#[allow(clippy::too_many_arguments)]
 fn try_submit_form(
     app: &mut App,
     command_tx: &mpsc::UnboundedSender<RunnerCommand>,
     terminal: &mut TuiTerminal,
     store: &mut LogStore,
     modal: &mut Option<Modal>,
+    quit_mode: QuitMode,
 ) -> Result<(), TuiError> {
     let (task_name, params) = {
         let Some(form) = app.form.as_mut() else {
@@ -1577,6 +1692,10 @@ fn try_submit_form(
             }
         }
     };
+    if wants_foreground_bridge(app, quit_mode, &task_name) {
+        begin_foreground_run(app, task_name, params);
+        return Ok(());
+    }
     dispatch_run_task_with_params(command_tx, task_name.clone(), params);
     app.form = None;
     return_to_logs_after_task_run(&task_name, app, terminal, store, modal)?;

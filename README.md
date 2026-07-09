@@ -76,6 +76,12 @@ When stdout is a TTY, `don start` runs a ratatui-driven interface: logs stream i
 | `Enter` | Insert a blank line separator into scrollback |
 | `q` or Ctrl+C | Graceful shutdown (second press force-kills) |
 
+`don tui` attaches the same interface to an already-running daemon — typically
+one started headless with `don start -d`. It connects over the unix socket and
+renders as a pure frontend: the runner stays in the daemon, so Ctrl+C just
+detaches the viewer and leaves the stack running (use `don stop` to stop it).
+Reconnect any time with `don tui` again; multiple viewers can attach at once.
+
 Pipe mode (non-TTY) writes prefixed lines directly to stdout unchanged.
 Configs with active foreground terminal tasks also use plain prefixed output
 instead of the TUI so those tasks can own stdin without competing with Don's
@@ -190,6 +196,12 @@ when you want the task's output to remain in normal scrollback:
 ```toml
 terminal = { mode = "foreground", screen = "main" }
 ```
+
+When Don itself has no terminal — a detached daemon (`don start -d`) — foreground
+tasks run on their own PTY instead: output is captured like any other task, and
+`don run <task>` from an interactive terminal bridges your stdin/stdout to the
+task's PTY for the life of the run (Ctrl+C passes through to the task). `don
+attach <task>` connects to an already-running one.
 
 Tasks can also declare parameters. Parametrized tasks are interactive: values are supplied at run time via `don run <task> --<name>=<value>` or the TUI form, then substituted into `cmd`, `args`, `env`, and `dir` via `{{name}}` placeholders.
 

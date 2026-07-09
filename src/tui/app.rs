@@ -195,6 +195,10 @@ pub(crate) struct App {
     pub(crate) counts: StatusCounts,
     pub(crate) view_mode: ViewMode,
     pub(crate) verbose_enabled: bool,
+    /// Set when the user presses Ctrl+C in detach mode (`don tui` frontend).
+    /// The event loop checks it after each key and breaks, returning from
+    /// `run_tui` without shutting the daemon down.
+    pub(crate) should_detach: bool,
     /// Graceful shutdown is in progress: the inline bar becomes
     /// non-interactive and `[don]`-prefixed lifecycle events bypass the
     /// committed filter (raw service stdout still respects it).
@@ -225,11 +229,23 @@ pub(crate) struct App {
     pub(crate) form: Option<FormState>,
     /// Active service/task log popup shown over the services/tasks table.
     pub(crate) log_popup: Option<LogPopup>,
+    /// Set by the task/form handlers when a foreground task is launched from
+    /// the `don tui` frontend. The event loop consumes it: tears the dashboard
+    /// down, bridges stdin/stdout to the daemon PTY, and rebuilds on exit.
+    pub(crate) pending_foreground_run: Option<ForegroundRun>,
     /// Terminal height the inline bar was last drawn at. The resize handler
     /// compares against this to decide whether a resize changed the height
     /// (and thus moved the bar, requiring a screen clear to erase the ghost)
     /// or only the width (where the reflowed logs can stay on screen).
     pub(crate) last_screen_height: u16,
+}
+
+/// A foreground task launch the `don tui` frontend defers to the event loop,
+/// which owns the terminal teardown/rebuild the interactive bridge needs.
+#[derive(Debug)]
+pub(crate) struct ForegroundRun {
+    pub(crate) name: String,
+    pub(crate) params: HashMap<String, String>,
 }
 
 pub(crate) struct AppInit {
@@ -287,6 +303,7 @@ impl App {
             counts,
             view_mode: ViewMode::Normal,
             verbose_enabled,
+            should_detach: false,
             shutdown_started: false,
             filter: FilterState::new(all_filter_names, &hidden_names, cli_log_filter.as_ref()),
             spinner_frame: 0,
@@ -301,6 +318,7 @@ impl App {
             auto_filter_on_failure_names,
             form: None,
             log_popup: None,
+            pending_foreground_run: None,
             last_screen_height: 0,
         }
     }

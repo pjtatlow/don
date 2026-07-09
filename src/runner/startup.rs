@@ -73,11 +73,13 @@ impl Runner {
         // Foreground terminal tasks are exclusive: once one is ready, it
         // owns the terminal and no other newly-ready item should start in
         // the same scheduler sweep. Already-running dependencies continue.
-        if let Some(foreground_name) = ready.iter().find(|name| {
-            self.tasks
-                .get(name.as_str())
-                .is_some_and(|rt| rt.config.terminal.is_foreground())
-        }) {
+        if self.terminal_coordinator.terminal_available()
+            && let Some(foreground_name) = ready.iter().find(|name| {
+                self.tasks
+                    .get(name.as_str())
+                    .is_some_and(|rt| rt.config.terminal.is_foreground())
+            })
+        {
             ready = vec![foreground_name.clone()];
         }
 

@@ -7,14 +7,16 @@
 
 pub(crate) mod attach;
 pub(crate) mod routes;
+pub(crate) mod stream;
 
-use crate::runner::RunnerCommand;
+use crate::output::LogTaps;
+use crate::runner::{RunnerCommand, RunnerEvent};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// Server errors.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +44,14 @@ type ResizeMap = std::collections::HashMap<String, mpsc::Sender<(u16, u16)>>;
 #[derive(Clone)]
 pub(crate) struct ApiState {
     pub cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
+    /// Runner event broadcast — `GET /events` subscribes per connection and
+    /// forwards each [`RunnerEvent`] to attached `don tui` frontends.
+    pub event_tx: broadcast::Sender<RunnerEvent>,
+    /// Formatted-log fan-out (live broadcast + recent ring). `GET /logstream`
+    /// asks this for an atomic snapshot+subscribe and writes the snapshot
+    /// frames first, then live frames — so a connecting frontend sees recent
+    /// history immediately rather than starting empty.
+    pub log_taps: Arc<LogTaps>,
     /// Resize channels for active attach sessions. The attach bridge task
     /// registers its receiver here; the resize HTTP handler sends through it.
     pub attach_resize_txs: std::sync::Arc<tokio::sync::Mutex<ResizeMap>>,
@@ -90,11 +100,15 @@ pub async fn serve_api(
     listener: UnixListener,
     socket_path: PathBuf,
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
+    event_tx: broadcast::Sender<RunnerEvent>,
+    log_taps: Arc<LogTaps>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let _guard = SocketGuard(socket_path);
     let state = Arc::new(ApiState {
         cmd_tx,
+        event_tx,
+        log_taps,
         attach_resize_txs: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

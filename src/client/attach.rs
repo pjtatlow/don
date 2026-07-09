@@ -58,6 +58,17 @@ pub async fn run_attach(socket_path: &Path, name: &str) -> Result<(), ClientErro
     }
 }
 
+/// Attach for a single session: returns when the server closes the stream
+/// (the process exited) or the user detaches. Used by `don run` to bridge a
+/// foreground task on a headless daemon — unlike [`run_attach`], a task
+/// exiting ends the session instead of waiting for the next spawn.
+pub async fn run_attach_session(socket_path: &Path, name: &str) -> Result<(), ClientError> {
+    match attach_once(socket_path, name).await {
+        DisconnectReason::UserDetach | DisconnectReason::ServerDisconnect => Ok(()),
+        DisconnectReason::Error(e) => Err(e),
+    }
+}
+
 /// Run a single attach session. Returns the reason for disconnection.
 async fn attach_once(socket_path: &Path, name: &str) -> DisconnectReason {
     let mut stream = match UnixStream::connect(socket_path).await {

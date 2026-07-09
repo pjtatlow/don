@@ -386,6 +386,13 @@ impl TaskBuilder {
         self
     }
 
+    /// Set the terminal mode (e.g. `"foreground"`).
+    pub fn terminal_mode(mut self, mode: &str) -> Self {
+        self.lines
+            .push(format!("terminal = {{ mode = \"{mode}\", screen = \"main\" }}"));
+        self
+    }
+
     /// Finalize this task and return to the config builder.
     pub fn done(mut self) -> ConfigBuilder {
         writeln!(self.builder.toml, "[tasks.{}]", self.name).unwrap();

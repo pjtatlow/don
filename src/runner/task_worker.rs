@@ -193,7 +193,7 @@ pub(in crate::runner) async fn run_task_worker(
     .await
     .map_err(|e| format!("download failed: {e}"))?;
 
-    if task_cfg.terminal.is_foreground() {
+    if task_cfg.terminal.is_foreground() && terminal_coordinator.terminal_available() {
         // Pause the TUI before spawn_foreground_task touches termios /
         // tcsetpgrp so the inline viewport, raw mode, and input task are
         // gone before the child takes over the terminal.
@@ -209,6 +209,12 @@ pub(in crate::runner) async fn run_task_worker(
             };
         Ok(TaskRunPrepared::ForegroundSpawned(Box::new(spawn)))
     } else {
+        if task_cfg.terminal.is_foreground() {
+            emitter.service_event(
+                name,
+                "no terminal (detached daemon) — running on a PTY; `don run` from a terminal bridges in",
+            );
+        }
         let spawn = task::spawn_task(task_cfg, name, &base_dir, platform, params)
             .await
             .map_err(|e| e.to_string())?;

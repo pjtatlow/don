@@ -6,8 +6,11 @@
 //! and closes. Follow-mode log streams use chunked transfer encoding.
 
 pub mod attach;
+pub mod bridge;
 
-use crate::runner::{CompletionError, ItemStatus};
+use crate::output::FormattedLogLine;
+use crate::runner::{CompletionError, ItemStatus, RunnerEvent, TuiSnapshot};
+use crate::wire::LogFrameDecoder;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io;
@@ -61,6 +64,14 @@ pub struct StatusResponse {
     pub items: Vec<ItemStatus>,
 }
 
+/// Deserialised body of `GET /info`.
+#[derive(serde::Deserialize)]
+pub struct DaemonInfo {
+    pub version: String,
+    #[serde(default)]
+    pub headless: bool,
+}
+
 /// Deserialised body of `GET /watch`.
 #[derive(Debug, Deserialize)]
 pub struct WatchResponse {
@@ -104,6 +115,14 @@ impl Client {
     /// Directly wrap an existing socket path (tests, non-standard layouts).
     pub fn with_socket_path(socket_path: PathBuf) -> Self {
         Self { socket_path }
+    }
+
+    /// `GET /info` — daemon version + headless flag. Errors against daemons
+    /// older than the endpoint; callers should treat that as "not headless".
+    pub async fn info(&self) -> Result<DaemonInfo, ClientError> {
+        let (status, body) = self.request("GET", "/info", false).await?;
+        ensure_ok(status, &body)?;
+        Ok(serde_json::from_slice(&body)?)
     }
 
     /// `GET /status`
@@ -156,6 +175,28 @@ impl Client {
     /// `POST /restart/:name`
     pub async fn restart(&self, name: &str) -> Result<(), ClientError> {
         self.control("/restart/", name).await
+    }
+
+    /// `POST /hard-restart/:name` — rebuild, then restart a service.
+    pub async fn hard_restart(&self, name: &str) -> Result<(), ClientError> {
+        self.control("/hard-restart/", name).await
+    }
+
+    /// `POST /verbose?enabled=…` — toggle the daemon's verbose output.
+    pub async fn set_verbose(&self, enabled: bool) -> Result<(), ClientError> {
+        let path = format!("/verbose?enabled={enabled}");
+        let (status, body) = self.request("POST", &path, false).await?;
+        if status == 204 {
+            return Ok(());
+        }
+        Err(classify_error(status, &body))
+    }
+
+    /// `GET /snapshot` — seed data for a remote `don tui` frontend.
+    pub async fn snapshot(&self) -> Result<TuiSnapshot, ClientError> {
+        let (status, body) = self.request("GET", "/snapshot", false).await?;
+        ensure_ok(status, &body)?;
+        Ok(serde_json::from_slice(&body)?)
     }
 
     /// `POST /shutdown` — gracefully stop the daemon and all running services.
@@ -317,6 +358,70 @@ impl Client {
                 }
                 let text = String::from_utf8_lossy(line_slice);
                 on_line(&text)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `GET /events` — stream runner events. Opens a chunked NDJSON
+    /// connection and invokes `on_event` for each [`RunnerEvent`]. Returns
+    /// when the daemon closes the stream (e.g. shutdown) or the socket drops.
+    pub async fn stream_events<F>(&self, mut on_event: F) -> Result<(), ClientError>
+    where
+        F: FnMut(RunnerEvent),
+    {
+        let mut stream = self.connect().await?;
+        write_request(&mut stream, "GET", "/events", false).await?;
+        let (status, headers, mut leftover) = read_head(&mut stream).await?;
+        if status != 200 {
+            let body = drain_body(&mut stream, &headers, leftover).await?;
+            return Err(classify_error(status, &body));
+        }
+
+        let mut pending = Vec::<u8>::new();
+        loop {
+            let Some(chunk) = read_one_chunk(&mut stream, &mut leftover).await? else {
+                break;
+            };
+            pending.extend_from_slice(&chunk);
+            while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=nl).collect();
+                let slice = &line[..line.len() - 1];
+                if slice.is_empty() {
+                    continue;
+                }
+                if let Ok(event) = serde_json::from_slice::<RunnerEvent>(slice) {
+                    on_event(event);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `GET /logstream` — stream every formatted log line. Opens a chunked
+    /// connection carrying length-prefixed binary frames (see [`crate::wire`])
+    /// and invokes `on_line` for each [`FormattedLogLine`]. Returns when the
+    /// daemon closes the stream or the socket drops.
+    pub async fn stream_logs<F>(&self, mut on_line: F) -> Result<(), ClientError>
+    where
+        F: FnMut(FormattedLogLine),
+    {
+        let mut stream = self.connect().await?;
+        write_request(&mut stream, "GET", "/logstream", false).await?;
+        let (status, headers, mut leftover) = read_head(&mut stream).await?;
+        if status != 200 {
+            let body = drain_body(&mut stream, &headers, leftover).await?;
+            return Err(classify_error(status, &body));
+        }
+
+        let mut decoder = LogFrameDecoder::default();
+        loop {
+            let Some(chunk) = read_one_chunk(&mut stream, &mut leftover).await? else {
+                break;
+            };
+            decoder.push(&chunk);
+            while let Some(frame) = decoder.next_frame() {
+                on_line(frame);
             }
         }
         Ok(())

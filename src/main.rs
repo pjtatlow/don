@@ -9,7 +9,7 @@ use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForeground
 use don::TaskRunInfo;
 use don::client::{Client, ClientError, RunTaskOptions};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -121,6 +121,15 @@ enum Commands {
     Attach {
         /// Name of the service to attach to
         name: String,
+    },
+    /// Attach an interactive TUI to a running daemon (e.g. one started with
+    /// `don start -d`). Renders the same dashboard as `don start`; Ctrl+C
+    /// detaches and leaves the daemon running.
+    Tui {
+        /// Restrict displayed log lines to the given comma-separated set of
+        /// service/task names (seeds the TUI filter, same as `don start`).
+        #[arg(long, value_delimiter = ',')]
+        log_filter: Vec<String>,
     },
     /// Clean up stale state from a previous run
     Cleanup {
@@ -258,6 +267,13 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
         Commands::Attach { name } => run_attach(&config_path, &name).await,
+        Commands::Tui { log_filter } => match run_tui_frontend(&config_path, log_filter).await {
+            Ok(()) => 0,
+            Err(e) => {
+                errln(e);
+                1
+            }
+        },
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
         Commands::Run {
             name,
@@ -393,6 +409,14 @@ async fn run_run_task(
     }
 
     let client = client_for(config_path);
+
+    if task.terminal.is_foreground()
+        && std::io::stdin().is_terminal()
+        && client.info().await.map(|i| i.headless).unwrap_or(false)
+    {
+        return run_foreground_bridged(config_path, &client, &name, parsed).await;
+    }
+
     let options = RunTaskOptions { wait, wait_timeout };
     match client.run_task_with_options(&name, parsed, options).await {
         Ok(()) => 0,
@@ -404,6 +428,54 @@ async fn run_run_task(
             errln(e);
             1
         }
+    }
+}
+
+/// Run a foreground task against a headless daemon: the task runs on a PTY
+/// in the daemon, and this terminal bridges to it via attach. The attach is
+/// registered *before* the run is triggered so a fast task can't exit before
+/// the bridge connects; the session ends when the task does.
+async fn run_foreground_bridged(
+    config_path: &Path,
+    client: &Client,
+    name: &str,
+    params: std::collections::HashMap<String, String>,
+) -> i32 {
+    let socket_path = base_dir(config_path).join(".don").join("don.sock");
+    let attach_name = name.to_string();
+    let attach = tokio::spawn(async move {
+        don::client::attach::run_attach_session(&socket_path, &attach_name).await
+    });
+
+    let options = RunTaskOptions {
+        wait: false,
+        wait_timeout: None,
+    };
+    if let Err(e) = client.run_task_with_options(name, params, options).await {
+        attach.abort();
+        errln(e);
+        return 1;
+    }
+
+    match attach.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            errln(e);
+            return 1;
+        }
+        Err(_) => return 1,
+    }
+
+    // The bridge streamed the task's output; report only the final verdict.
+    match client.status(false, Some(name)).await.as_deref() {
+        Ok([don::runner::ItemStatus::Task {
+            state: don::runner::TaskItemState::Failed,
+            ..
+        }]) => {
+            errln(format!("{name}: failed"));
+            1
+        }
+        _ => 0,
     }
 }
 
@@ -853,6 +925,123 @@ async fn run_attach(config_path: &Path, name: &str) -> i32 {
             1
         }
     }
+}
+
+/// Attach an interactive TUI to a running daemon as a pure frontend. The
+/// runner stays in the daemon; this renders the same `run_tui` loop, fed by a
+/// `TuiBridge` over the unix socket instead of in-process channels. Ctrl+C
+/// detaches (the daemon keeps running).
+async fn run_tui_frontend(config_path: &Path, log_filter: Vec<String>) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+
+    let base = base_dir(config_path);
+
+    // Retry briefly: `don start -d` already waits for the socket before
+    // returning, so this only covers the narrow race where the daemon is
+    // mid-bind. A daemon that genuinely isn't here fails in ~1s, not 10.
+    let bridge = {
+        let mut attempt = 0;
+        loop {
+            match don::client::bridge::TuiBridge::connect(&base).await {
+                Ok(bridge) => break bridge,
+                Err(ClientError::NotRunning { .. }) if attempt < 5 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(ClientError::NotRunning { .. }) => {
+                    return Err(
+                        "no don daemon running here — start one with `don start -d`, then `don tui`"
+                            .to_string(),
+                    );
+                }
+                Err(e) => return Err(format!("failed to connect to don daemon: {e}")),
+            }
+        }
+    };
+
+    let don::client::bridge::TuiBridge {
+        snapshot,
+        log_rx,
+        events_rx,
+        command_tx,
+        verbosity,
+        lifecycle_emitter,
+        terminal_request_rx,
+        guard,
+    } = bridge;
+
+    // Task param schemas come from the local config (kept off the wire).
+    // Filter to the daemon's active task set so the form/menu match.
+    let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
+    let task_name_set: HashSet<&str> = snapshot.task_names.iter().map(String::as_str).collect();
+    let task_configs: HashMap<String, don::config::Task> = config
+        .tasks
+        .iter()
+        .filter(|(name, _)| task_name_set.contains(name.as_str()))
+        .map(|(name, task)| (name.clone(), task.clone()))
+        .collect();
+
+    let mut task_last_runs: HashMap<String, don::TaskRunInfo> = HashMap::new();
+    for status in &snapshot.statuses {
+        if let ItemStatus::Task {
+            name,
+            last_run: Some(last_run),
+            ..
+        } = status
+        {
+            task_last_runs.insert(name.clone(), last_run.clone());
+        }
+    }
+
+    let hidden_names: HashSet<String> = snapshot.hidden_names.iter().cloned().collect();
+    let auto_filter_on_failure_names: HashSet<String> = snapshot
+        .auto_filter_on_failure_names
+        .iter()
+        .cloned()
+        .collect();
+    let cli_log_filter: Option<HashSet<String>> = if log_filter.is_empty() {
+        None
+    } else {
+        Some(log_filter.into_iter().collect())
+    };
+
+    let result = don::run_tui(
+        log_rx,
+        events_rx,
+        command_tx,
+        verbosity,
+        lifecycle_emitter,
+        snapshot.service_names.clone(),
+        snapshot.task_names.clone(),
+        snapshot.build_tool_names.clone(),
+        task_configs,
+        task_last_runs,
+        hidden_names,
+        auto_filter_on_failure_names,
+        cli_log_filter,
+        terminal_request_rx,
+        don::QuitMode::DetachFrontend,
+        Some(base.join(".don").join("don.sock")),
+    )
+    .await;
+
+    // Tear down bridge tasks now the TUI has returned (Ctrl-C or daemon exit).
+    drop(guard);
+
+    // Tell the user what was left behind: the daemon is independent of the
+    // viewer, so it usually keeps running.
+    let probe = Client::new(&base);
+    match probe.status(false, None).await {
+        Ok(_) => println!(
+            "don tui closed. Daemon still running — reconnect with `don tui`, or stop with `don stop`."
+        ),
+        Err(ClientError::NotRunning { .. }) => println!("don tui closed. Daemon has stopped."),
+        Err(_) => println!(
+            "don tui closed. Daemon may still be shutting down — use `don stop` if needed."
+        ),
+    }
+
+    result.map_err(|e| format!("TUI error: {e}"))
 }
 
 fn print_status_table(items: &[ItemStatus], verbose: bool, show_watch_paths: bool) {
@@ -1438,8 +1627,6 @@ async fn run_start(
     no_tui: bool,
     log_filter: Vec<String>,
 ) -> Result<(), String> {
-    use std::io::IsTerminal;
-
     let config = don::config::Config::from_file(config_path).map_err(|e| format!("Error: {e}"))?;
 
     let platform = don::config::Platform::current().ok_or_else(|| {
@@ -1740,6 +1927,8 @@ async fn run_start(
                 auto_filter_on_failure_names,
                 tui_log_filter,
                 terminal_request_rx,
+                don::QuitMode::ShutdownDaemon,
+                None,
             )
             .await;
             if result.is_err() {
@@ -1796,7 +1985,11 @@ async fn run_start(
                         base,
                         profile.as_deref(),
                         shutdown_rx,
-                        don::runner::TerminalCoordinator::detached(),
+                        if std::io::stdin().is_terminal() {
+                            don::runner::TerminalCoordinator::detached_with_terminal()
+                        } else {
+                            don::runner::TerminalCoordinator::detached()
+                        },
                     )
                     .await
                     .map_err(|e| format!("Error: {e}"))
