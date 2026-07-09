@@ -257,7 +257,7 @@ pub async fn ensure_artifact(
 
     if let Some(writer) = service_writer {
         writer
-            .write_line(&format!("downloading {}", &artifact.url))
+            .write_line(&format!("downloading {}", artifact.url))
             .await;
     }
 

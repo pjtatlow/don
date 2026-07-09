@@ -91,9 +91,10 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
         /// Emit machine-readable JSON instead of the table: an object with a
-        /// top-level `ready` bool (true when every service is Ready or Lazy)
-        /// and an `items` array. Useful for scripts and agents polling for
-        /// stack readiness.
+        /// top-level `ready` bool (true when every service is Ready or Lazy),
+        /// a `tasks_pending_run` count (tasks parked awaiting a manual run —
+        /// the headless equivalent of the TUI's `*` flag), and an `items`
+        /// array. Useful for scripts and agents polling for stack readiness.
         #[arg(long)]
         json: bool,
     },
@@ -617,10 +618,12 @@ async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json:
                 #[derive(serde::Serialize)]
                 struct StatusJson<'a> {
                     ready: bool,
+                    tasks_pending_run: usize,
                     items: &'a [ItemStatus],
                 }
                 let payload = StatusJson {
                     ready: don::runner::all_services_ready(&items),
+                    tasks_pending_run: count_tasks_pending_run(&items),
                     items: &items,
                 };
                 return match serde_json::to_string_pretty(&payload) {
@@ -795,6 +798,23 @@ fn item_name(item: &ItemStatus) -> &str {
     match item {
         ItemStatus::Service { name, .. } | ItemStatus::Task { name, .. } => name.as_str(),
     }
+}
+
+/// Count tasks parked in `PendingRun` — maintenance work awaiting a manual run.
+/// Mirrors the TUI's `*` flag so headless `--json` callers can detect it.
+fn count_tasks_pending_run(items: &[ItemStatus]) -> usize {
+    items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ItemStatus::Task {
+                    state: TaskItemState::PendingRun,
+                    ..
+                }
+            )
+        })
+        .count()
 }
 
 async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> i32 {
@@ -1886,6 +1906,26 @@ mod tests {
             last_run: None,
             verbose: None,
         }
+    }
+
+    #[test]
+    fn count_tasks_pending_run_counts_only_pending_tasks() {
+        let items = vec![
+            service("svc-ready", ServiceState::Ready),
+            task("task-pending-a", TaskItemState::PendingRun),
+            task("task-pending-b", TaskItemState::PendingRun),
+            task("task-completed", TaskItemState::Completed),
+            task("task-failed", TaskItemState::Failed),
+        ];
+        assert_eq!(super::count_tasks_pending_run(&items), 2);
+
+        let none = vec![
+            service("svc-ready", ServiceState::Ready),
+            task("task-completed", TaskItemState::Completed),
+        ];
+        assert_eq!(super::count_tasks_pending_run(&none), 0);
+
+        assert_eq!(super::count_tasks_pending_run(&[]), 0);
     }
 
     #[test]

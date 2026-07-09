@@ -119,7 +119,7 @@ impl Runner {
         self.drain_late_worker_results().await;
 
         // Shut down all proxy listeners first (stop accepting new connections).
-        for (_, rs) in self.services.iter_mut() {
+        for rs in self.services.values_mut() {
             if let Some(proxy) = rs.proxy.take() {
                 proxy.shutdown();
             }
@@ -320,7 +320,7 @@ impl Runner {
     pub(in crate::runner) async fn wait_for_shutdown(&mut self) {
         // All handles should already be stopped by initiate_shutdown.
         // Drop remaining handles, release sockets, clear attach state.
-        for (_, rs) in self.services.iter_mut() {
+        for rs in self.services.values_mut() {
             if let Some(worker) = rs.control_worker.take() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
             }
@@ -339,7 +339,7 @@ impl Runner {
             rs.control_reply = None;
             rs.stop_action = ServiceStopAction::None;
         }
-        for (_, rt) in self.tasks.iter_mut() {
+        for rt in self.tasks.values_mut() {
             if let Some(worker) = rt.run_worker.take() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
             }
