@@ -44,6 +44,12 @@ impl TerminalCoordinator {
         Self { tx: Some(tx) }
     }
 
+    /// True when no interactive terminal is attached (pipe mode, `--no-tui`,
+    /// non-tty, or a detached daemon) — foreground tasks can't take the terminal.
+    pub fn is_detached(&self) -> bool {
+        self.tx.is_none()
+    }
+
     /// Pause the TUI and wait for it to confirm it has released the
     /// terminal. No-op when detached.
     pub async fn acquire(&self) {

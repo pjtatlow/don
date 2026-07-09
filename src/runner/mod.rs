@@ -829,7 +829,7 @@ impl Runner {
     /// `base_dir` is the project root (where `don.toml` lives).
     /// The runner acquires don's PID file at `<base_dir>/.don/don.pid`.
     pub async fn new(
-        config: Config,
+        mut config: Config,
         platform: Platform,
         output_manager: OutputManager,
         base_dir: PathBuf,
@@ -855,6 +855,17 @@ impl Runner {
 
         setup::cleanup_stale_state(&config, &base_dir, &output_manager).await;
         let docker_client = setup::connect_docker_if_needed(&config)?;
+
+        // Detached / --no-tui: downgrade `fallback = "muxed"` foreground tasks
+        // and export DON_DETACHED so commands can skip interactive prompts.
+        if terminal_coordinator.is_detached() {
+            for task in config.tasks.values_mut() {
+                task.terminal.downgrade_for_detached();
+                task.env
+                    .entry("DON_DETACHED".to_string())
+                    .or_insert_with(|| "1".to_string());
+            }
+        }
 
         let active_items = setup::resolve_active_items(&config, platform, profile)?;
         let active_services = setup::filter_active_services(&config, active_items.as_ref());

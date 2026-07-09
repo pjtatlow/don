@@ -69,6 +69,8 @@ pub struct TaskTerminal {
     pub mode: TaskTerminalMode,
     /// Which terminal screen a foreground task should use.
     pub screen: TaskTerminalScreen,
+    /// What a foreground task does when no controlling terminal is available.
+    pub fallback: TaskTerminalFallback,
 }
 
 impl Default for TaskTerminal {
@@ -76,6 +78,7 @@ impl Default for TaskTerminal {
         Self {
             mode: TaskTerminalMode::Muxed,
             screen: TaskTerminalScreen::Main,
+            fallback: TaskTerminalFallback::Error,
         }
     }
 }
@@ -84,6 +87,20 @@ impl TaskTerminal {
     /// Returns true when this task takes exclusive ownership of the terminal.
     pub fn is_foreground(self) -> bool {
         matches!(self.mode, TaskTerminalMode::Foreground)
+    }
+
+    /// True when a foreground task should degrade to muxed (run headless)
+    /// instead of failing with no controlling terminal.
+    pub fn falls_back_to_muxed(self) -> bool {
+        matches!(self.fallback, TaskTerminalFallback::Muxed)
+    }
+
+    /// Downgrade a `fallback = "muxed"` foreground task to muxed for headless
+    /// runs. Idempotent; a no-op otherwise.
+    pub fn downgrade_for_detached(&mut self) {
+        if self.is_foreground() && self.falls_back_to_muxed() {
+            self.mode = TaskTerminalMode::Muxed;
+        }
     }
 }
 
@@ -102,6 +119,7 @@ impl<'de> Deserialize<'de> for TaskTerminal {
                 "foreground" => Ok(Self {
                     mode: TaskTerminalMode::Foreground,
                     screen: TaskTerminalScreen::Alternate,
+                    fallback: TaskTerminalFallback::Error,
                 }),
                 _ => Err(serde::de::Error::custom(format!(
                     "unknown terminal value '{value}', expected \"muxed\" or \"foreground\""
@@ -113,6 +131,7 @@ impl<'de> Deserialize<'de> for TaskTerminal {
                     TaskTerminalMode::Muxed => TaskTerminalScreen::Main,
                     TaskTerminalMode::Foreground => TaskTerminalScreen::Alternate,
                 }),
+                fallback: table.fallback.unwrap_or(TaskTerminalFallback::Error),
             }),
         }
     }
@@ -124,6 +143,8 @@ struct TaskTerminalTable {
     mode: TaskTerminalMode,
     #[serde(default)]
     screen: Option<TaskTerminalScreen>,
+    #[serde(default)]
+    fallback: Option<TaskTerminalFallback>,
 }
 
 /// Task terminal ownership mode.
@@ -144,6 +165,18 @@ pub enum TaskTerminalScreen {
     Main,
     /// Enter the terminal alternate screen for the task, then restore the main screen.
     Alternate,
+}
+
+/// What a foreground task does with no controlling terminal (detached daemon,
+/// `--no-tui`, or non-tty stdin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskTerminalFallback {
+    /// Fail — the task genuinely needs a terminal (e.g. interactive login).
+    Error,
+    /// Degrade to muxed and run headless. The command must run non-interactively
+    /// (detect a non-tty stdin and skip prompts, or take a `--force`-style flag).
+    Muxed,
 }
 
 /// A one-shot task that runs to completion.
@@ -293,5 +326,67 @@ mod tests {
         .unwrap();
         assert_eq!(task.terminal.mode, TaskTerminalMode::Foreground);
         assert_eq!(task.terminal.screen, TaskTerminalScreen::Main);
+    }
+
+    #[test]
+    fn terminal_fallback_defaults_to_error() {
+        let task: Task = toml::from_str(r#"cmd = "true""#).unwrap();
+        assert_eq!(task.terminal.fallback, TaskTerminalFallback::Error);
+        assert!(!task.terminal.falls_back_to_muxed());
+    }
+
+    #[test]
+    fn terminal_foreground_can_opt_into_muxed_fallback() {
+        let task: Task = toml::from_str(
+            r#"
+            cmd = "scurry push"
+            terminal = { mode = "foreground", fallback = "muxed" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(task.terminal.mode, TaskTerminalMode::Foreground);
+        assert!(task.terminal.falls_back_to_muxed());
+    }
+
+    #[test]
+    fn downgrade_for_detached_table() {
+        struct Case {
+            name: &'static str,
+            terminal: TaskTerminal,
+            expected_mode: TaskTerminalMode,
+        }
+        let fg = |fallback| TaskTerminal {
+            mode: TaskTerminalMode::Foreground,
+            screen: TaskTerminalScreen::Alternate,
+            fallback,
+        };
+        let cases = [
+            Case {
+                name: "foreground + muxed fallback -> muxed",
+                terminal: fg(TaskTerminalFallback::Muxed),
+                expected_mode: TaskTerminalMode::Muxed,
+            },
+            Case {
+                name: "foreground + error fallback -> unchanged",
+                terminal: fg(TaskTerminalFallback::Error),
+                expected_mode: TaskTerminalMode::Foreground,
+            },
+            Case {
+                name: "already muxed -> unchanged",
+                terminal: TaskTerminal::default(),
+                expected_mode: TaskTerminalMode::Muxed,
+            },
+        ];
+        for case in cases {
+            let mut terminal = case.terminal;
+            terminal.downgrade_for_detached();
+            assert_eq!(terminal.mode, case.expected_mode, "case '{}'", case.name);
+            terminal.downgrade_for_detached();
+            assert_eq!(
+                terminal.mode, case.expected_mode,
+                "case '{}' not idempotent",
+                case.name
+            );
+        }
     }
 }

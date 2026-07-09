@@ -21,7 +21,9 @@ pub use self::profile::Profile;
 pub use self::service::{
     DockerBuildConfig, DockerConfig, ResolvedService, RustConfig, Service, ServiceKind,
 };
-pub use self::task::{Task, TaskAutoRun, TaskTerminal, TaskTerminalMode, TaskTerminalScreen};
+pub use self::task::{
+    Task, TaskAutoRun, TaskTerminal, TaskTerminalFallback, TaskTerminalMode, TaskTerminalScreen,
+};
 pub use self::types::{
     BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
     ShutdownConfig, TurboConfig,
