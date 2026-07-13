@@ -15,8 +15,22 @@ use super::events::AppEvent;
 /// closed or the receiver is dropped.
 pub(crate) async fn run(tx: mpsc::Sender<AppEvent>) {
     let mut reader = EventStream::new();
+    // Consecutive read errors back off instead of hot-looping: EventStream
+    // reports errors as ready items, and a background-pgrp read yields EIO.
+    let mut consecutive_errors: u32 = 0;
     while let Some(result) = reader.next().await {
-        let Ok(event) = result else { continue };
+        let event = match result {
+            Ok(event) => {
+                consecutive_errors = 0;
+                event
+            }
+            Err(_) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                let backoff_ms = (u64::from(consecutive_errors) * 5).min(100);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                continue;
+            }
+        };
         let Some(app_event) = translate(event) else {
             continue;
         };

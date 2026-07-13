@@ -438,11 +438,39 @@ impl ForegroundProcessHandle {
     }
 }
 
+/// Ignores `SIGTTIN`/`SIGTTOU` process-wide for its lifetime so a foreground
+/// task backgrounding don's pgrp can't STOP the daemon. See `docs/foreground-tasks.md`.
+struct JobControlStopGuard {
+    saved_sigttin: libc::sigaction,
+    saved_sigttou: libc::sigaction,
+}
+
+impl JobControlStopGuard {
+    /// Set `SIGTTIN` and `SIGTTOU` to `SIG_IGN`, saving the previous
+    /// dispositions for restoration on drop.
+    fn install() -> Self {
+        Self {
+            saved_sigttin: ignore_signal(libc::SIGTTIN),
+            saved_sigttou: ignore_signal(libc::SIGTTOU),
+        }
+    }
+}
+
+impl Drop for JobControlStopGuard {
+    fn drop(&mut self) {
+        restore_signal(libc::SIGTTIN, self.saved_sigttin);
+        restore_signal(libc::SIGTTOU, self.saved_sigttou);
+    }
+}
+
 struct TerminalGuard {
     fd: libc::c_int,
     original_pgrp: libc::pid_t,
     original_termios: Option<libc::termios>,
     alternate_screen: bool,
+    /// Declared last so it drops *after* `TerminalGuard::drop`'s background-pgrp
+    /// `tcsetpgrp`/`tcsetattr` restore, keeping those calls signal-protected.
+    _stop_guard: JobControlStopGuard,
 }
 
 impl TerminalGuard {
@@ -482,11 +510,14 @@ impl TerminalGuard {
                 })?;
         }
 
+        // Installed last: no fallible step follows, so an early return above
+        // never leaks an altered disposition. don is still foreground here.
         Ok(Self {
             fd,
             original_pgrp,
             original_termios,
             alternate_screen,
+            _stop_guard: JobControlStopGuard::install(),
         })
     }
 
@@ -504,20 +535,13 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Restoring the terminal happens from a background process group (the
-        // foreground task owns the tty). tcsetpgrp and tcsetattr from a bg
-        // pgrp send SIGTTOU to all members of the calling pgrp, whose default
-        // action is to STOP the process — leaving don suspended right after
-        // every foreground task. Ignore SIGTTOU around the restoration calls
-        // and put the disposition back when we're done.
-        let saved_sigttou = ignore_signal(libc::SIGTTOU);
-        // Safety: best-effort terminal restoration for the saved tty fd.
+        // Runs from a background pgrp; `_stop_guard` (dropped after this body)
+        // keeps SIGTTIN/SIGTTOU ignored so the STOP-prone calls below are safe.
         let _ = unsafe { libc::tcsetpgrp(self.fd, self.original_pgrp) };
         if let Some(termios) = self.original_termios.as_ref() {
             // Safety: termios was captured by tcgetattr for this fd.
             let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, termios) };
         }
-        restore_signal(libc::SIGTTOU, saved_sigttou);
         if self.alternate_screen {
             let _ =
                 crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
@@ -979,5 +1003,54 @@ pub(crate) fn signal_name(sig: Signal) -> &'static str {
         Signal::SIGUSR1 => "SIGUSR1",
         Signal::SIGUSR2 => "SIGUSR2",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Read `signum`'s current handler without changing the disposition.
+    fn current_handler(signum: libc::c_int) -> libc::sighandler_t {
+        // Safety: a null `act` retrieves the current disposition into `cur`.
+        unsafe {
+            let mut cur: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signum, std::ptr::null(), &mut cur);
+            cur.sa_sigaction
+        }
+    }
+
+    /// Both dispositions are process-wide, so this is the only test that
+    /// touches them — a second concurrent test would race the handler state.
+    #[test]
+    fn job_control_stop_guard_ignores_then_restores() {
+        let orig_ttin = current_handler(libc::SIGTTIN);
+        let orig_ttou = current_handler(libc::SIGTTOU);
+
+        {
+            let _guard = JobControlStopGuard::install();
+            assert_eq!(
+                current_handler(libc::SIGTTIN),
+                libc::SIG_IGN,
+                "SIGTTIN must be ignored while guarded"
+            );
+            assert_eq!(
+                current_handler(libc::SIGTTOU),
+                libc::SIG_IGN,
+                "SIGTTOU must be ignored while guarded"
+            );
+        }
+
+        assert_eq!(
+            current_handler(libc::SIGTTIN),
+            orig_ttin,
+            "SIGTTIN disposition must be restored after drop"
+        );
+        assert_eq!(
+            current_handler(libc::SIGTTOU),
+            orig_ttou,
+            "SIGTTOU disposition must be restored after drop"
+        );
     }
 }
