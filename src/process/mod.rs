@@ -20,6 +20,7 @@ use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
+use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
@@ -438,28 +439,54 @@ impl ForegroundProcessHandle {
     }
 }
 
-/// Ignores `SIGTTIN`/`SIGTTOU` process-wide for its lifetime so a foreground
-/// task backgrounding don's pgrp can't STOP the daemon. See `docs/foreground-tasks.md`.
-struct JobControlStopGuard {
-    saved_sigttin: libc::sigaction,
-    saved_sigttou: libc::sigaction,
+/// Process-wide refcount and saved baseline for [`JobControlStopGuard`];
+/// `count == 0` means no foreground window is open and `saved` is `None`.
+struct JobControlStopState {
+    count: usize,
+    saved: Option<(libc::sigaction, libc::sigaction)>,
 }
 
+static JOB_CONTROL_STATE: Mutex<JobControlStopState> = Mutex::new(JobControlStopState {
+    count: 0,
+    saved: None,
+});
+
+/// Ignores `SIGTTIN`/`SIGTTOU` process-wide so a foreground task can't STOP the
+/// daemon; refcounted for overlapping windows. See `docs/foreground-tasks.md`.
+struct JobControlStopGuard;
+
 impl JobControlStopGuard {
-    /// Set `SIGTTIN` and `SIGTTOU` to `SIG_IGN`, saving the previous
-    /// dispositions for restoration on drop.
+    /// The first guard saves the true baseline and sets `SIG_IGN`; later
+    /// overlapping guards only bump the count.
     fn install() -> Self {
-        Self {
-            saved_sigttin: ignore_signal(libc::SIGTTIN),
-            saved_sigttou: ignore_signal(libc::SIGTTOU),
+        let mut state = JOB_CONTROL_STATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.count == 0 {
+            // Capture the real baseline before the first ignore is installed.
+            let ttin = ignore_signal(libc::SIGTTIN);
+            let ttou = ignore_signal(libc::SIGTTOU);
+            state.saved = Some((ttin, ttou));
         }
+        state.count += 1;
+        Self
     }
 }
 
 impl Drop for JobControlStopGuard {
     fn drop(&mut self) {
-        restore_signal(libc::SIGTTIN, self.saved_sigttin);
-        restore_signal(libc::SIGTTOU, self.saved_sigttou);
+        let mut state = JOB_CONTROL_STATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Last guard out restores the baseline; earlier drops only decrement,
+        // so an inner window never lifts an outer window's ignore.
+        state.count = state.count.saturating_sub(1);
+        if state.count == 0
+            && let Some((ttin, ttou)) = state.saved.take()
+        {
+            restore_signal(libc::SIGTTIN, ttin);
+            restore_signal(libc::SIGTTOU, ttou);
+        }
     }
 }
 
@@ -1029,13 +1056,14 @@ mod tests {
         }
     }
 
-    /// Both dispositions are process-wide, so this is the only test that
-    /// touches them — a second concurrent test would race the handler state.
+    /// The dispositions and the guard refcount are process-wide globals, so
+    /// this stays the only test touching them; a concurrent one would race.
     #[test]
-    fn job_control_stop_guard_ignores_then_restores() {
+    fn job_control_stop_guard_refcounts_overlapping_windows() {
         let orig_ttin = current_handler(libc::SIGTTIN);
         let orig_ttou = current_handler(libc::SIGTTOU);
 
+        // A single window ignores on install and restores the baseline on drop.
         {
             let _guard = JobControlStopGuard::install();
             assert_eq!(
@@ -1049,7 +1077,6 @@ mod tests {
                 "SIGTTOU must be ignored while guarded"
             );
         }
-
         assert_eq!(
             current_handler(libc::SIGTTIN),
             orig_ttin,
@@ -1059,6 +1086,33 @@ mod tests {
             current_handler(libc::SIGTTOU),
             orig_ttou,
             "SIGTTOU disposition must be restored after drop"
+        );
+
+        // Overlapping windows: the ignore holds across the union, and only the
+        // last guard out restores the baseline — regardless of drop order.
+        let a = JobControlStopGuard::install();
+        assert_eq!(current_handler(libc::SIGTTIN), libc::SIG_IGN);
+        let b = JobControlStopGuard::install();
+        assert_eq!(current_handler(libc::SIGTTIN), libc::SIG_IGN);
+
+        drop(a);
+        assert_eq!(
+            current_handler(libc::SIGTTIN),
+            libc::SIG_IGN,
+            "an inner drop must not lift the ignore while another guard is live"
+        );
+        assert_eq!(current_handler(libc::SIGTTOU), libc::SIG_IGN);
+
+        drop(b);
+        assert_eq!(
+            current_handler(libc::SIGTTIN),
+            orig_ttin,
+            "the last drop must restore the baseline SIGTTIN disposition"
+        );
+        assert_eq!(
+            current_handler(libc::SIGTTOU),
+            orig_ttou,
+            "the last drop must restore the baseline SIGTTOU disposition"
         );
     }
 }

@@ -44,6 +44,16 @@ child's exit restores the terminal) holds a `JobControlStopGuard` that sets
 dispositions on drop. Dispositions are process-wide, so this protects every
 thread regardless of which one touches the tty.
 
+Because those dispositions are a single process-wide resource, overlapping and
+nested windows are refcounted through a shared `JobControlStopState` (a static
+`Mutex` over a count plus the saved baseline). The **first** guard in captures
+the true baseline and installs `SIG_IGN`; additional guards only increment the
+count; the **last** guard out restores the saved baseline. Holding the mutex
+across the save-then-set makes the `0 → 1` transition atomic (a plain atomic
+counter would let a second installer race ahead of the first's `sigaction`), and
+the refcount keeps the ignore active for the *union* of all windows — an inner
+window's drop can never lift the protection an outer window still relies on.
+
 Ordering matters in `TerminalGuard::drop`: its `tcsetpgrp`/`tcsetattr` restore
 runs while don is *still* background and would itself raise `SIGTTOU`. The
 `_stop_guard` field is declared last so it drops **after** the `Drop` body runs,
