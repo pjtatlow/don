@@ -559,7 +559,13 @@ fn ignore_signal(signum: libc::c_int) -> libc::sigaction {
         let mut new: libc::sigaction = std::mem::zeroed();
         new.sa_sigaction = libc::SIG_IGN;
         libc::sigemptyset(&mut new.sa_mask);
-        libc::sigaction(signum, &new, &mut prev);
+        let ret = libc::sigaction(signum, &new, &mut prev);
+        debug_assert_eq!(
+            ret,
+            0,
+            "sigaction(SIG_IGN) failed: {}",
+            std::io::Error::last_os_error()
+        );
         prev
     }
 }
@@ -751,34 +757,32 @@ fn spawn_pty(
     // handles the graceful-drop case; this handles the parent-not-graceful
     // case. Linux-only — macOS doesn't expose a portable equivalent. The
     // setting survives execve(2) in the common (non-setuid) case.
-    //
-    // Safety: prctl is async-signal-safe per signal-safety(7). Runs between
-    // fork and exec in the child process only.
     let listen_fds = config.listen_fds.clone();
-    if cfg!(target_os = "linux") || !listen_fds.is_empty() {
-        // Safety: pty-process wraps this hook after its session_leader hook.
-        // prctl, dup/dup2/fcntl/close via place_fds_for_exec are
-        // async-signal-safe. Runs between fork and exec in the child only.
-        cmd = unsafe {
-            cmd.pre_exec(move || {
-                #[cfg(target_os = "linux")]
+    // Safety: pty-process runs this after its session_leader hook, between fork
+    // and exec; signal, prctl, and place_fds_for_exec are async-signal-safe.
+    cmd = unsafe {
+        cmd.pre_exec(move || {
+            // Reset SIGTTIN/SIGTTOU to SIG_DFL: a concurrent foreground window
+            // may leak SIG_IGN via fork; this child never owns don's tty.
+            libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            #[cfg(target_os = "linux")]
+            {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                ) != 0
                 {
-                    if libc::prctl(
-                        libc::PR_SET_PDEATHSIG,
-                        libc::SIGKILL as libc::c_ulong,
-                        0,
-                        0,
-                        0,
-                    ) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                    return Err(std::io::Error::last_os_error());
                 }
-                socket::place_fds_for_exec(&listen_fds)?;
-                Ok(())
-            })
-        };
-    }
+            }
+            socket::place_fds_for_exec(&listen_fds)?;
+            Ok(())
+        })
+    };
 
     let child = cmd.spawn(pts).map_err(|e| ProcessError::Spawn {
         cmd: config.cmd.to_string(),
@@ -809,7 +813,7 @@ fn spawn_pipe(config: &SpawnConfig<'_>) -> Result<tokio::process::Child, Process
     // Clone listen fds for the pre_exec closure.
     let listen_fds = config.listen_fds.clone();
 
-    // Safety: setpgid, dup2, dup, fcntl, prctl, and close are async-signal-safe.
+    // Safety: setpgid, dup2, dup, fcntl, prctl, signal, and close are async-signal-safe.
     // dup2(1, 2) merges stderr into stdout. This works because tokio has
     // already set up fd 1 as the pipe's write end before pre_exec runs.
     //
@@ -823,6 +827,10 @@ fn spawn_pipe(config: &SpawnConfig<'_>) -> Result<tokio::process::Child, Process
     // child reads matches its own process (exec preserves the PID).
     unsafe {
         cmd.pre_exec(move || {
+            // Reset SIGTTIN/SIGTTOU to SIG_DFL: a concurrent foreground window
+            // may leak SIG_IGN via fork; this child never owns don's tty.
+            libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
             #[cfg(target_os = "linux")]
             {
                 if libc::prctl(
