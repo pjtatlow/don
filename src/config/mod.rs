@@ -530,6 +530,15 @@ impl Config {
 
         // Validate tasks
         for (name, task) in &self.tasks {
+            if task.reconcile_dependents
+                && (!task.params.is_empty()
+                    || !task.auto_run.runs_automatically_on_watch()
+                    || task.watch.is_empty()
+                    || task.terminal.is_foreground()
+                    || task.build_tool_watch_enabled())
+            {
+                errors.push(format!("task '{name}': invalid reconcile_dependents task"));
+            }
             // Bazel and turbo are mutually exclusive.
             if task.bazel.is_some() && task.turbo.is_some() {
                 errors.push(format!(

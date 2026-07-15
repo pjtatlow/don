@@ -40,10 +40,7 @@ impl Runner {
         let mut deferred: Vec<String> = Vec::new();
         names.retain(|name| {
             let coming_up = self.services.get(name).is_some_and(|rs| {
-                matches!(
-                    rs.state(),
-                    ServiceState::Building | ServiceState::Pending | ServiceState::Starting
-                )
+                rs.state().is_transitioning() && rs.state() != ServiceState::Stopping
             });
             if coming_up {
                 deferred.push(name.clone());
@@ -390,22 +387,16 @@ impl Runner {
                 Some(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
         }
 
-        if !services_to_rebuild.is_empty() {
-            for name in services_to_rebuild {
-                self.output_manager
-                    .service_event(&name, "build graph changed — rebuilding");
-                if !self.pending_bt_rebuilds.contains(&name) {
-                    self.pending_bt_rebuilds.push(name);
-                }
-            }
-            self.bt_rebuild_deadline =
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(50));
+        for name in services_to_rebuild {
+            self.output_manager
+                .service_event(&name, "build graph changed — rebuilding");
+            self.handle_service_watch_trigger(&name).await;
         }
 
         for name in tasks_to_rerun {
             self.output_manager
                 .service_event(&name, "build graph changed — re-running");
-            self.handle_task_rerun(&name).await;
+            self.handle_task_watch_trigger(&name).await;
         }
     }
 

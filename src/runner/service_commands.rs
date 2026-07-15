@@ -434,16 +434,10 @@ impl Runner {
             return;
         }
         let state = self.services.get(name).map(|rs| rs.state());
-        let operation_in_progress = self.services.get(name).is_some_and(|rs| {
-            rs.start_worker.is_some()
-                || matches!(
-                    rs.state(),
-                    ServiceState::Pending
-                        | ServiceState::Building
-                        | ServiceState::Starting
-                        | ServiceState::Stopping
-                )
-        });
+        let operation_in_progress = self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.start_worker.is_some() || rs.state().is_transitioning());
         if operation_in_progress {
             let state = state.unwrap_or(ServiceState::Stopped);
             let _ = reply.send(Err(CommandError::InvalidState {
@@ -503,13 +497,7 @@ impl Runner {
                 return;
             }
         };
-        if matches!(
-            state,
-            ServiceState::Pending
-                | ServiceState::Building
-                | ServiceState::Starting
-                | ServiceState::Stopping
-        ) {
+        if state.is_transitioning() {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),
                 message: format!("cannot hard restart while {state:?}"),
@@ -620,6 +608,8 @@ impl Runner {
             return;
         }
 
+        self.record_graph_cycle_stop_result(name, &result);
+
         let (reply, stop_action) = match self.services.get_mut(name) {
             Some(rs) => {
                 rs.control_worker = None;
@@ -699,12 +689,11 @@ impl Runner {
         }
         // A failed service has no live process — drop any exited handle and
         // mark it Stopped so the user can clear it without a restart.
-        if self.services.get(name).is_some_and(|rs| {
-            matches!(
-                rs.state(),
-                ServiceState::Failed | ServiceState::DependencyFailed
-            )
-        }) {
+        if self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.state().is_failure())
+        {
             if let Some(rs) = self.services.get_mut(name) {
                 rs.stop_health_tracking();
                 rs.reset_restart_tracking();
@@ -841,16 +830,11 @@ impl Runner {
                 return;
             }
         };
-        if matches!(
-            state,
-            ServiceState::Pending
-                | ServiceState::Building
-                | ServiceState::Starting
-                | ServiceState::Stopping
-        ) || self
-            .services
-            .get(name)
-            .is_some_and(|rs| rs.start_worker.is_some())
+        if state.is_transitioning()
+            || self
+                .services
+                .get(name)
+                .is_some_and(|rs| rs.start_worker.is_some())
         {
             let _ = reply.send(Err(CommandError::InvalidState {
                 name: name.to_string(),

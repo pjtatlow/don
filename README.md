@@ -144,6 +144,17 @@ depends_on = ["postgres"]
 watch = ["db/migrations/**/*.sql"]
 ```
 
+For an idempotent maintenance task that must settle before its active
+dependents restart, set `reconcile_dependents = true`. A matching watch change
+runs one serialized cycle: Don quiesces and stops the active downstream graph,
+runs the affected tasks, then restarts the services that were active when the
+cycle began.
+
+This is intentionally limited to explicit-watch, parameterless, muxed
+maintenance tasks with `auto_run = true`; build-tool-derived watches are not a
+supported trigger. Parameterized or foreground tasks downstream of the root
+are also unsupported.
+
 Set `auto_run = false` to defer execution — when the task actually needs to run (because watched inputs changed, or another item depends on it), it moves to `pending_run` until you explicitly trigger it:
 
 ```toml
@@ -594,6 +605,7 @@ See [`examples/`](examples/) for complete working configs.
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
 | `reload` | bool | Service-level master switch for Don-managed watches, rebuilds, and restarts (default: true) |
 | `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
+| `reconcile_dependents` | bool | (tasks) Reconcile the active downstream graph after an explicit watch change (default: false; see task scope above) |
 | `terminal` | string or table | (tasks) `"muxed"` default, or `"foreground"` for exclusive stdin/stdout/stderr ownership |
 | `terminal.mode` | string | (tasks) `"muxed"` or `"foreground"` |
 | `terminal.screen` | string | (tasks) `"alternate"` default for foreground, or `"main"` to keep output in scrollback |

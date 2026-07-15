@@ -386,6 +386,12 @@ impl TaskBuilder {
         self
     }
 
+    /// Reconcile dependent tasks and active services when watched inputs change.
+    pub fn reconcile_dependents(mut self, value: bool) -> Self {
+        self.lines.push(format!("reconcile_dependents = {value}"));
+        self
+    }
+
     /// Finalize this task and return to the config builder.
     pub fn done(mut self) -> ConfigBuilder {
         writeln!(self.builder.toml, "[tasks.{}]", self.name).unwrap();

@@ -270,16 +270,10 @@ impl Runner {
     /// on B, then C also needs to be marked).
     pub(in crate::runner) fn is_dep_failed(&self, dep: &str) -> bool {
         if let Some(rs) = self.services.get(dep) {
-            return matches!(
-                rs.state(),
-                ServiceState::Failed | ServiceState::DependencyFailed
-            );
+            return rs.state().is_failure();
         }
         if let Some(rt) = self.tasks.get(dep) {
-            return matches!(
-                rt.state(),
-                TaskItemState::Failed | TaskItemState::DependencyFailed
-            );
+            return rt.state().is_failure();
         }
         false
     }
@@ -304,7 +298,7 @@ impl Runner {
                 .tasks
                 .get(&name)
                 .is_some_and(|rt| rt.state() == TaskItemState::DependencyFailed);
-            if !service_dep_failed && !task_dep_failed {
+            if (!service_dep_failed && !task_dep_failed) || self.item_waits_for_graph_cycle(&name) {
                 continue;
             }
 
@@ -516,7 +510,21 @@ impl Runner {
                 continue;
             };
 
-            if needs_startup_evaluation {
+            if self.graph_cycle_executes_task(&name) {
+                if let Err(e) = self.spawn_task_worker(
+                    &name,
+                    task_cfg,
+                    HashMap::new(),
+                    TaskRunMode::Triggered,
+                    TaskRunIntent::Scheduled {
+                        done_tx: done_tx.clone(),
+                    },
+                ) {
+                    self.set_task_state(&name, TaskItemState::Failed);
+                    self.output_manager
+                        .service_error_event(&name, &e.to_string());
+                }
+            } else if needs_startup_evaluation {
                 let has_dependents = dep_map
                     .values()
                     .any(|deps| deps.iter().any(|dep| dep == &name));
@@ -540,6 +548,9 @@ impl Runner {
     }
 
     fn is_item_pending(&self, name: &str) -> bool {
+        if self.item_waits_for_graph_cycle(name) {
+            return false;
+        }
         self.services
             .get(name)
             .is_some_and(|rs| rs.state() == ServiceState::Pending)

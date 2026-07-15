@@ -545,6 +545,12 @@ impl Runner {
     }
 
     pub(in crate::runner) async fn handle_restart_task_cmd(&mut self, name: &str) -> CommandResult {
+        if self.graph_cycle_owns_task(name) {
+            return Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "task is running in dependency reconciliation".to_string(),
+            });
+        }
         let (task_cfg, last_params, state, pgid) = match self.tasks.get(name) {
             Some(rt) => (
                 rt.config.clone(),
@@ -899,6 +905,14 @@ impl Runner {
             }
         };
 
+        if self.graph_cycle_owns_task(name) {
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "task is running in dependency reconciliation".to_string(),
+            }));
+            return;
+        }
+
         // Reject while already in flight — otherwise we'd race two spawns of
         // the same task and the output would interleave unpredictably.
         let already_in_flight = self.tasks.get(name).is_some_and(|rt| {
@@ -934,6 +948,12 @@ impl Runner {
                 name: name.to_string(),
                 message: format!("invalid wait timeout: {e}"),
             }));
+            return;
+        }
+
+        if cfg.reconcile_dependents && resolved.is_empty() {
+            self.handle_manual_graph_cycle(name, wait, wait_timeout, reply)
+                .await;
             return;
         }
 

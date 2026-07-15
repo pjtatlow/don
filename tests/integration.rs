@@ -312,6 +312,38 @@ name = "timeout"
     );
 }
 
+fn validate_reconcile_dependents_table_body() {
+    let cases = [
+        ("valid", "watch = [\"schema/**\"]", true),
+        ("requires watch", "", false),
+        (
+            "requires auto run",
+            "watch = [\"schema/**\"]\nauto_run = false",
+            false,
+        ),
+        (
+            "rejects params",
+            "watch = [\"schema/**\"]\n[[tasks.t.params]]\nname = \"scope\"",
+            false,
+        ),
+        (
+            "rejects foreground",
+            "watch = [\"schema/**\"]\nterminal = \"foreground\"",
+            false,
+        ),
+        (
+            "rejects derived watches",
+            "watch = [\"schema/**\"]\nbazel.target = \"//tools:t\"",
+            false,
+        ),
+    ];
+    for (name, fields, valid) in cases {
+        let toml = format!("[tasks.t]\ncmd = \"echo\"\nreconcile_dependents = true\n{fields}");
+        let config: Config = toml.parse().unwrap();
+        assert_eq!(config.validate(TEST_PLATFORM).is_ok(), valid, "{name}");
+    }
+}
+
 fn validate_cycle_detected_body() {
     let dir = TempDir::new("validate-cycle");
     let config_path = ConfigBuilder::new()
@@ -707,6 +739,10 @@ bounded_test!(
     validate_task_params_reject_run_flag_collisions_body
 );
 bounded_test!(validate_cycle_detected, validate_cycle_detected_body);
+bounded_test!(
+    validate_reconcile_dependents_table,
+    validate_reconcile_dependents_table_body
+);
 bounded_test!(
     validate_invalid_duration_strings,
     validate_invalid_duration_strings_body

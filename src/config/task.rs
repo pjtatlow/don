@@ -214,6 +214,9 @@ pub struct Task {
     /// have changed. Defaults to `true`.
     #[serde(default)]
     pub auto_run: TaskAutoRun,
+    /// Whether watched changes reconcile this task's dependent subgraph.
+    #[serde(default)]
+    pub reconcile_dependents: bool,
     /// Optional download configuration — artifacts to fetch before running.
     /// When a download exists for the current platform, its binary path
     /// replaces `cmd`. Without a matching platform entry, `cmd` is looked up on PATH.

@@ -106,6 +106,9 @@ impl Runner {
         reason: &str,
         limit_startup_failures: bool,
     ) {
+        if self.graph_cycle_owns_service(name) {
+            return;
+        }
         let attempt = self
             .services
             .get(name)
@@ -160,10 +163,7 @@ impl Runner {
             Some(rs) => rs.state(),
             None => return,
         };
-        if !matches!(
-            state,
-            ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
-        ) {
+        if !state.is_live() {
             return;
         }
         let current_pgid = self.services.get(name).and_then(|rs| match &rs.handle {
@@ -206,6 +206,10 @@ impl Runner {
         }
         let exit_msg = format_unexpected_exit(status);
         self.output_manager.service_error_event(name, &exit_msg);
+        if self.graph_cycle_owns_service(name) {
+            self.set_service_state(name, ServiceState::Failed);
+            return;
+        }
         let is_lazy = self
             .services
             .get(name)
@@ -287,7 +291,11 @@ impl Runner {
     /// and via the crash watcher. The state check makes this idempotent: the
     /// first caller transitions the service out of a live state, and the second
     /// sees `Lazy`/`Failed` and returns, so the streak counts one per launch.
-    pub(in crate::runner) fn handle_lazy_launch_failure(&mut self, name: &str, message: Option<&str>) {
+    pub(in crate::runner) fn handle_lazy_launch_failure(
+        &mut self,
+        name: &str,
+        message: Option<&str>,
+    ) {
         if !matches!(
             self.services.get(name).map(|rs| rs.state()),
             Some(ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy)
@@ -349,6 +357,9 @@ impl Runner {
 
     /// Handle a backoff-timer-fired auto-restart.
     pub(in crate::runner) async fn handle_auto_restart(&mut self, name: &str, attempt: u32) {
+        if self.graph_cycle_owns_service(name) {
+            return;
+        }
         let state = match self.services.get(name) {
             Some(rs) => rs.state(),
             None => return,

@@ -16,6 +16,7 @@ mod params;
 mod paths;
 mod profile;
 mod rebuild;
+mod reconcile;
 mod service_commands;
 mod service_health;
 mod service_ready;
@@ -173,6 +174,21 @@ impl ServiceState {
         matches!(self, Self::Ready | Self::Lazy | Self::Unhealthy)
     }
 
+    fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed | Self::DependencyFailed)
+    }
+
+    fn is_transitioning(&self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Building | Self::Starting | Self::Stopping
+        )
+    }
+
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Running | Self::Ready | Self::Unhealthy)
+    }
+
     /// Valid transitions from one state to another.
     #[cfg(test)]
     pub(crate) fn can_transition_to(&self, next: Self) -> bool {
@@ -231,6 +247,12 @@ pub enum TaskItemState {
     /// The task is waiting for a manual trigger. Dependency satisfaction also
     /// depends on task history and auto-run policy.
     PendingRun,
+}
+
+impl TaskItemState {
+    fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed | Self::DependencyFailed)
+    }
 }
 
 /// An item in the dependency graph — either a service or a task.
@@ -324,10 +346,7 @@ fn should_rebuild_after_graph_requery(service: &RuntimeService) -> bool {
         return false;
     }
 
-    matches!(
-        service.state(),
-        ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
-    )
+    service.state().is_live()
 }
 
 /// A command sent to the runner via its public `mpsc` channel.
@@ -727,6 +746,10 @@ pub struct Runner {
     /// Consolidated per-task runtime state.
     tasks: HashMap<String, RuntimeTask>,
 
+    graph_cycle: Option<reconcile::GraphCycle>,
+    deferred_graph_commands: std::collections::VecDeque<reconcile::DeferredGraphCommand>,
+    failed_graph_cycles: HashMap<String, std::collections::HashSet<String>>,
+
     /// Receives service names when a lazy service's proxy gets its first connection.
     lazy_start_rx: mpsc::Receiver<String>,
     /// Sender half kept for passing to ServiceProxy::bind.
@@ -883,6 +906,9 @@ impl Runner {
             base_dir,
             services,
             tasks,
+            graph_cycle: None,
+            deferred_graph_commands: std::collections::VecDeque::new(),
+            failed_graph_cycles: HashMap::new(),
             lazy_start_rx,
             lazy_start_tx,
             server_shutdown_tx: None,
@@ -935,13 +961,8 @@ impl Runner {
                 pid,
             });
             if self.done_tx.is_some()
-                && matches!(
-                    state,
-                    ServiceState::Pending
-                        | ServiceState::Ready
-                        | ServiceState::Failed
-                        | ServiceState::DependencyFailed
-                )
+                && (state.is_failure()
+                    || matches!(state, ServiceState::Pending | ServiceState::Ready))
             {
                 self.schedule_start_pending();
             }
@@ -962,15 +983,14 @@ impl Runner {
                 last_run,
             });
             if self.done_tx.is_some()
-                && matches!(
-                    state,
-                    TaskItemState::Pending
-                        | TaskItemState::PendingRun
-                        | TaskItemState::Completed
-                        | TaskItemState::Skipped
-                        | TaskItemState::Failed
-                        | TaskItemState::DependencyFailed
-                )
+                && (state.is_failure()
+                    || matches!(
+                        state,
+                        TaskItemState::Pending
+                            | TaskItemState::PendingRun
+                            | TaskItemState::Completed
+                            | TaskItemState::Skipped
+                    ))
             {
                 self.schedule_start_pending();
             }
@@ -1361,21 +1381,27 @@ impl Runner {
                                 let _ = reply.send(sink);
                             }
                             RunnerCommand::Start { name, reply } => {
-                                self.handle_start_service_cmd(&name, reply).await;
+                                if let Some(reply) = self.graph_cycle_service_control_reply(&name, reply) {
+                                    self.handle_start_service_cmd(&name, reply).await;
+                                }
                             }
                             RunnerCommand::Stop { name, reply } => {
-                                self.handle_stop_cmd(&name, reply).await;
+                                if let Some(reply) = self.graph_cycle_service_control_reply(&name, reply) {
+                                    self.handle_stop_cmd(&name, reply).await;
+                                }
                             }
                             RunnerCommand::Restart { name, reply } => {
                                 if self.tasks.contains_key(&name) {
                                     let result = self.handle_restart_task_cmd(&name).await;
                                     let _ = reply.send(result);
-                                } else {
+                                } else if let Some(reply) = self.graph_cycle_service_control_reply(&name, reply) {
                                     self.handle_restart_service_cmd(&name, reply).await;
                                 }
                             }
                             RunnerCommand::HardRestart { name, reply } => {
-                                self.handle_hard_restart_service_cmd(&name, reply).await;
+                                if let Some(reply) = self.graph_cycle_service_control_reply(&name, reply) {
+                                    self.handle_hard_restart_service_cmd(&name, reply).await;
+                                }
                             }
                             RunnerCommand::Attach { name, pid, reply } => {
                                 self.handle_attach_cmd(&name, pid, reply).await;
@@ -1384,16 +1410,16 @@ impl Runner {
                                 self.handle_detach(&name, pty_write).await;
                             }
                             RunnerCommand::Rebuild { name } => {
-                                self.handle_rebuild(&name).await;
+                                self.handle_service_watch_trigger(&name).await;
                             }
                             RunnerCommand::RebuildStale { name } => {
                                 self.mark_rebuild_stale(&name);
                             }
                             RunnerCommand::TaskRerun { name } => {
-                                self.handle_task_rerun(&name).await;
+                                self.handle_task_watch_trigger(&name).await;
                             }
                             RunnerCommand::BuildGraphChanged { name } => {
-                                self.handle_build_graph_changed(&name).await;
+                                self.handle_build_graph_watch_trigger(&name).await;
                             }
                             RunnerCommand::StartPending => {
                                 self.start_pending_items().await;
@@ -1558,6 +1584,7 @@ impl Runner {
                         break;
                     }
                 }
+                self.advance_graph_cycle().await;
             }
         }
 
@@ -2000,6 +2027,45 @@ mod tests {
         .await
         .unwrap();
         (runner, shutdown_tx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_cycle_stop_failure_keeps_target_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        runner.set_service_state("api", ServiceState::Ready);
+        runner.begin_graph_cycle("api", None, false);
+
+        runner.record_graph_cycle_stop_result("api", &Err("stop failed".to_string()));
+        runner.advance_graph_cycle().await;
+
+        assert!(runner.graph_cycle.is_none());
+        assert!(runner.failed_graph_cycles.contains_key("api"));
+        assert_eq!(
+            runner.services.get("api").map(|service| service.state()),
+            Some(ServiceState::Failed),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graph_cycle_defers_watch_commands_fifo() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        runner.set_service_state("api", ServiceState::Ready);
+        runner.begin_graph_cycle("api", None, false);
+
+        runner.handle_task_watch_trigger("task").await;
+        runner.handle_service_watch_trigger("api").await;
+        runner.handle_build_graph_watch_trigger("api").await;
+
+        let queued = runner.deferred_graph_commands.iter().collect::<Vec<_>>();
+        assert!(matches!(queued[0], reconcile::DeferredGraphCommand::Task(name) if name == "task"));
+        assert!(
+            matches!(queued[1], reconcile::DeferredGraphCommand::Service(name) if name == "api")
+        );
+        assert!(
+            matches!(queued[2], reconcile::DeferredGraphCommand::BuildGraph(name) if name == "api")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2748,6 +2814,7 @@ mod tests {
                 terminal: crate::config::TaskTerminal::default(),
                 headless: None,
                 auto_run: crate::config::TaskAutoRun::Always,
+                reconcile_dependents: false,
                 download: None,
                 bazel: None,
                 turbo: None,

@@ -226,6 +226,18 @@ The hash covers:
 
 **The hash is only written after the task exits with code 0.** A failed task will always retry on the next run, even if the files haven't changed.
 
+#### Dependency Reconciliation
+
+`reconcile_dependents = true` opts an idempotent maintenance task into a
+serialized graph cycle. When one of its explicit watch globs changes, Don
+quiesces affected work, stops the active downstream-service snapshot in reverse
+dependency order, runs the affected task graph, and restarts that snapshot in
+dependency order. Changes received during a cycle are replayed afterward.
+
+The root must be parameterless, muxed, `auto_run = true`, and use explicit
+watch globs rather than build-tool-derived watches. Parameterized and foreground
+tasks in the downstream graph are unsupported.
+
 ### Ready Checks
 
 Ready checks gate dependents — a service's dependents won't start until the check passes. Exactly one check type must be set:

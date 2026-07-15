@@ -88,6 +88,13 @@ impl Runner {
                 self.output_manager.service_event(&item.name, &message);
             }
         } else {
+            if self.graph_cycle_owns_service(&item.name) {
+                self.set_service_state(&item.name, ServiceState::Failed);
+                if let Some(ref message) = item.message {
+                    self.output_manager.service_error_event(&item.name, message);
+                }
+                return;
+            }
             // If a lazy service fails, reset to Lazy so the next connection
             // can re-trigger it instead of leaving it permanently failed.
             let is_lazy = self

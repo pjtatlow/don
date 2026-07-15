@@ -1297,7 +1297,8 @@ on_failure = "restart"
             .parse()
             .unwrap();
         assert_eq!(
-            launches, 2,
+            launches,
+            2,
             "initial start plus one retry should produce exactly two fast crashes \
              before giving up. output: {}",
             read_buf(&buf)

@@ -411,6 +411,7 @@ mod tests {
             terminal: crate::config::TaskTerminal::default(),
             headless: None,
             auto_run: crate::config::TaskAutoRun::Always,
+            reconcile_dependents: false,
             download: None,
             bazel: None,
             turbo: None,

@@ -384,6 +384,7 @@ fn integration_task_download_resolves_cmd() {
             terminal: don::config::TaskTerminal::default(),
             headless: None,
             auto_run: don::config::TaskAutoRun::Always,
+            reconcile_dependents: false,
             download: Some(download),
             bazel: None,
             turbo: None,

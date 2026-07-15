@@ -140,6 +140,103 @@ async fn wait_for_output(buf: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Durat
     }
 }
 
+async fn wait_for_file(path: &std::path::Path, expected: &str, timeout: Duration) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        if std::fs::read_to_string(path).unwrap_or_default() == expected {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_service_state(
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<don::runner::RunnerCommand>,
+    name: &str,
+    expected: don::runner::ServiceState,
+    timeout: Duration,
+) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        let (reply, status) = tokio::sync::oneshot::channel();
+        if cmd_tx
+            .send(don::runner::RunnerCommand::Status {
+                verbose: false,
+                name: Some(name.to_string()),
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if status.await.ok().is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(item, don::runner::ItemStatus::Service { state, .. } if *state == expected)
+            })
+        }) {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_terminal_failed_cycle(
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<don::runner::RunnerCommand>,
+    timeout: Duration,
+) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        let (reply, status) = tokio::sync::oneshot::channel();
+        if cmd_tx
+            .send(don::runner::RunnerCommand::Status {
+                verbose: false,
+                name: None,
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if status.await.ok().is_some_and(|items| {
+            let task_completed = items.iter().any(|item| {
+                matches!(
+                    item,
+                    don::runner::ItemStatus::Task { name, state, .. }
+                        if name == "other" && *state == don::runner::TaskItemState::Completed
+                )
+            });
+            let culprit_failed = items.iter().any(|item| {
+                matches!(
+                    item,
+                    don::runner::ItemStatus::Service { name, state, .. }
+                        if name == "consumer" && *state == don::runner::ServiceState::Failed
+                )
+            });
+            let dependent_blocked = items.iter().any(|item| {
+                matches!(
+                    item,
+                    don::runner::ItemStatus::Service { name, state, .. }
+                        if name == "bridge"
+                            && *state == don::runner::ServiceState::DependencyFailed
+                )
+            });
+            task_completed && culprit_failed && dependent_blocked
+        }) {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // --- Integration test: service restarts on file change ---
 
 #[test]
@@ -252,6 +349,411 @@ ready.exec.cmd = "true"
         assert!(
             !output.contains("ignored/a.txt"),
             "globally-ignored file produced a verbose log line. output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_reconciled_task_restarts_dependents_and_retries_failed_cycle() {
+    run_with_timeout(Duration::from_secs(25), async {
+        let dir = TempDir::new("watch-task-graph-reconcile");
+        let input = dir.path().join("config.txt");
+        let consumer_input = dir.path().join("consumer.txt");
+        let other_input = dir.path().join("other.txt");
+        let order = dir.path().join("order.log");
+        let fail_consumer = dir.path().join("fail-consumer");
+        let fail_consumer_arg = fail_consumer.to_string_lossy().to_string();
+        std::fs::write(&input, "v1").unwrap();
+        std::fs::write(&consumer_input, "v1").unwrap();
+        std::fs::write(&other_input, "v1").unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_task(
+                "configure",
+                "bash",
+                &[
+                    "-c",
+                    "echo configure >> order.log; if [ -f slow-configure ]; then sleep 1; fi; test ! -f fail-configure",
+                ],
+            )
+            .watch(&["config.txt"])
+            .reconcile_dependents(true)
+            .done()
+            .add_task("other", "bash", &["-c", "echo other >> order.log"])
+            .watch(&["other.txt"])
+            .reconcile_dependents(true)
+            .done()
+            .add_custom_service(
+                "bridge",
+                "bash",
+                &["-c", "echo bridge >> order.log; sleep 60"],
+            )
+            .depends_on(&["configure"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task(
+                "configure-dependent",
+                "bash",
+                &["-c", "echo dependent >> order.log"],
+            )
+            .depends_on(&["bridge"])
+            .done()
+            .add_custom_service(
+                "consumer",
+                "bash",
+                &["-c", "echo consumer >> order.log; sleep 60"],
+            )
+            .depends_on(&["configure-dependent"])
+            .watch(&["consumer.txt"])
+            .log("ignore")
+            .ready_exec_with("test", &["!", "-f", &fail_consumer_arg], "50ms", 2)
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(6)).await,
+            "startup timed out. output: {}",
+            read_buf(&buf)
+        );
+        std::fs::write(&order, "").unwrap();
+        std::fs::write(&input, "v2").unwrap();
+        assert!(
+            wait_for_file(
+                &order,
+                "configure\nbridge\ndependent\nconsumer\n",
+                Duration::from_secs(8),
+            )
+            .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(&order).unwrap(),
+            "configure\nbridge\ndependent\nconsumer\n",
+        );
+
+        std::fs::write(&fail_consumer, "fail").unwrap();
+        std::fs::write(dir.path().join("slow-configure"), "slow").unwrap();
+        std::fs::write(&input, "v3").unwrap();
+        assert!(
+            wait_for_file(
+                &order,
+                "configure\nbridge\ndependent\nconsumer\nconfigure\n",
+                Duration::from_secs(4),
+            )
+            .await
+        );
+        std::fs::write(&consumer_input, "v2").unwrap();
+        assert!(
+            wait_for_service_state(
+                &cmd_tx,
+                "consumer",
+                don::runner::ServiceState::Failed,
+                Duration::from_secs(8),
+            )
+            .await,
+            "failed reconciliation timed out. output: {}",
+            read_buf(&buf)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&order).unwrap(),
+            "configure\nbridge\ndependent\nconsumer\nconfigure\nbridge\ndependent\nconsumer\n",
+        );
+        assert!(
+            wait_for_service_state(
+                &cmd_tx,
+                "bridge",
+                don::runner::ServiceState::DependencyFailed,
+                Duration::from_secs(2),
+            )
+            .await,
+            "the partially restarted dependency was not cleaned up",
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_to_string(&order).unwrap(),
+            "configure\nbridge\ndependent\nconsumer\nconfigure\nbridge\ndependent\nconsumer\n",
+            "a deferred target watch restarted the retained failed graph",
+        );
+
+        std::fs::write(&other_input, "v2").unwrap();
+        assert!(
+            wait_for_file(
+                &order,
+                "configure\nbridge\ndependent\nconsumer\nconfigure\nbridge\ndependent\nconsumer\nother\n",
+                Duration::from_secs(4),
+            )
+            .await,
+            "unrelated reconciliation did not run. output: {}",
+            read_buf(&buf)
+        );
+        assert!(
+            wait_for_terminal_failed_cycle(&cmd_tx, Duration::from_secs(4)).await,
+            "unrelated reconciliation did not settle while retaining the failed graph. output: {}",
+            read_buf(&buf)
+        );
+
+        std::fs::remove_file(&fail_consumer).unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(don::runner::RunnerCommand::RunTask {
+                name: "configure".to_string(),
+                params: std::collections::HashMap::new(),
+                wait: true,
+                wait_timeout: None,
+                reply: reply_tx,
+            })
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_ok(),
+            "manual retry should restore the original active service set. output: {}",
+            read_buf(&buf)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&order).unwrap(),
+            "configure\nbridge\ndependent\nconsumer\nconfigure\nbridge\ndependent\nconsumer\nother\nconfigure\nbridge\ndependent\nconsumer\n",
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_reconciliation_waits_for_running_task_and_replays_later_edit() {
+    run_with_timeout(Duration::from_secs(25), async {
+        let dir = TempDir::new("watch-task-graph-fifo");
+        let root_input = dir.path().join("root.txt");
+        let downstream_input = dir.path().join("downstream.txt");
+        let order = dir.path().join("order.log");
+        let slow_root = dir.path().join("slow-root");
+        let root_command = format!(
+            "echo root-start >> order.log; if [ -f {} ]; then sleep 1; fi; echo root-end >> order.log",
+            slow_root.display()
+        );
+        std::fs::write(&root_input, "v1").unwrap();
+        std::fs::write(&downstream_input, "v1").unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_task("root", "bash", &["-c", &root_command])
+            .watch(&["root.txt"])
+            .reconcile_dependents(true)
+            .done()
+            .add_task(
+                "downstream",
+                "bash",
+                &[
+                    "-c",
+                    "echo downstream-start >> order.log; sleep 1; echo downstream-end >> order.log",
+                ],
+            )
+            .depends_on(&["root"])
+            .watch(&["downstream.txt"])
+            .done()
+            .add_custom_service(
+                "keeper",
+                "bash",
+                &["-c", "echo keeper >> order.log; sleep 60"],
+            )
+            .depends_on(&["downstream"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move { runner.run().await.unwrap() });
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(6)).await,
+            "startup timed out. output: {}",
+            read_buf(&buf)
+        );
+        std::fs::write(&order, "").unwrap();
+
+        std::fs::write(&downstream_input, "v2").unwrap();
+        assert!(wait_for_file(&order, "downstream-start\n", Duration::from_secs(4)).await);
+        std::fs::write(&root_input, "v2").unwrap();
+        let first = "downstream-start\ndownstream-end\nroot-start\nroot-end\ndownstream-start\ndownstream-end\nkeeper\n";
+        assert!(
+            wait_for_file(&order, first, Duration::from_secs(8)).await,
+            "the graph cycle did not wait for the pre-existing task. output: {}",
+            read_buf(&buf)
+        );
+
+        std::fs::write(&slow_root, "slow").unwrap();
+        std::fs::write(&root_input, "v3").unwrap();
+        let first_root_start = format!("{first}root-start\n");
+        assert!(wait_for_file(&order, &first_root_start, Duration::from_secs(4)).await);
+        std::fs::write(&root_input, "v4").unwrap();
+        let cycle = "root-start\nroot-end\ndownstream-start\ndownstream-end\nkeeper\n";
+        let expected = format!("{first}{cycle}{cycle}");
+        assert!(
+            wait_for_file(&order, &expected, Duration::from_secs(10)).await,
+            "the edit received during reconciliation was not replayed FIFO. order: {:?}",
+            std::fs::read_to_string(&order).unwrap_or_default()
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+#[test]
+fn integration_reconciliation_only_restarts_active_snapshot() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("watch-task-graph-active-snapshot");
+        let root_input = dir.path().join("root.txt");
+        let inactive_input = dir.path().join("inactive.txt");
+        let order = dir.path().join("order.log");
+        std::fs::write(&root_input, "v1").unwrap();
+        std::fs::write(&inactive_input, "v1").unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_task(
+                "root",
+                "bash",
+                &[
+                    "-c",
+                    "echo root-start >> order.log; sleep 1; echo root-end >> order.log",
+                ],
+            )
+            .watch(&["root.txt"])
+            .reconcile_dependents(true)
+            .done()
+            .add_custom_service(
+                "active",
+                "bash",
+                &["-c", "echo active >> order.log; sleep 60"],
+            )
+            .depends_on(&["root"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_custom_service(
+                "inactive",
+                "bash",
+                &[
+                    "-c",
+                    "trap 'sleep 1; exit 0' TERM INT; echo inactive >> order.log; while true; do sleep 1; done",
+                ],
+            )
+            .depends_on(&["root"])
+            .watch(&["inactive.txt"])
+            .shutdown("SIGTERM", "3s")
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_custom_service("prefailed", "bash", &["-c", "exit 1"])
+            .depends_on(&["root"])
+            .log("ignore")
+            .ready_exec_with("true", &[], "50ms", 1)
+            .done()
+            .add_custom_service("lazy", "bash", &["-c", "echo lazy >> order.log; sleep 60"])
+            .depends_on(&["root"])
+            .lazy(true)
+            .proxy_env("127.0.0.1:0", "LAZY_PORT")
+            .log("ignore")
+            .done()
+            .build();
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let cmd_tx = runner.command_sender();
+        let handle = tokio::spawn(async move { runner.run().await.unwrap() });
+        assert!(
+            wait_for_output(&buf, "all services running", Duration::from_secs(6)).await,
+            "startup timed out. output: {}",
+            read_buf(&buf)
+        );
+        assert!(
+            wait_for_service_state(
+                &cmd_tx,
+                "prefailed",
+                don::runner::ServiceState::Failed,
+                Duration::from_secs(3),
+            )
+            .await
+        );
+        std::fs::write(&order, "").unwrap();
+
+        let (stop_reply, stopped) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(don::runner::RunnerCommand::Stop {
+                name: "inactive".to_string(),
+                reply: stop_reply,
+            })
+            .unwrap();
+        assert!(
+            wait_for_output(&buf, "stopping... (requested)", Duration::from_secs(2)).await,
+            "inactive service never entered Stopping. output: {}",
+            read_buf(&buf)
+        );
+        std::fs::write(&root_input, "v2").unwrap();
+        assert!(stopped.await.unwrap().is_ok());
+        assert!(wait_for_file(&order, "root-start\n", Duration::from_secs(5)).await);
+
+        let (start_reply, started) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(don::runner::RunnerCommand::Start {
+                name: "inactive".to_string(),
+                reply: start_reply,
+            })
+            .unwrap();
+        assert!(
+            started.await.unwrap().is_err(),
+            "manual mutation was not rejected"
+        );
+        std::fs::write(&inactive_input, "v2").unwrap();
+
+        assert!(
+            wait_for_file(
+                &order,
+                "root-start\nroot-end\nactive\n",
+                Duration::from_secs(7)
+            )
+            .await,
+            "active service did not restart exactly once. order: {:?}",
+            std::fs::read_to_string(&order).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            wait_for_service_state(
+                &cmd_tx,
+                "inactive",
+                don::runner::ServiceState::Stopped,
+                Duration::from_secs(2),
+            )
+            .await,
+            "queued inactive watch unexpectedly started the service",
+        );
+        assert!(
+            wait_for_service_state(
+                &cmd_tx,
+                "lazy",
+                don::runner::ServiceState::Lazy,
+                Duration::from_secs(2),
+            )
+            .await,
+            "untriggered lazy service unexpectedly started",
+        );
+        assert!(
+            wait_for_service_state(
+                &cmd_tx,
+                "prefailed",
+                don::runner::ServiceState::Failed,
+                Duration::from_secs(2),
+            )
+            .await,
+            "pre-failed service unexpectedly restarted",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&order).unwrap(),
+            "root-start\nroot-end\nactive\n"
         );
 
         let _ = shutdown_tx.send(()).await;
