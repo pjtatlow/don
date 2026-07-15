@@ -563,6 +563,11 @@ impl Config {
             {
                 errors.push(format!("task '{name}': invalid timeout: {e}"));
             }
+            if task.auto_run == TaskAutoRun::AlwaysOnStart && !task.params.is_empty() {
+                errors.push(format!(
+                    "task '{name}': auto_run = \"always-on-start\" cannot be used with interactive params"
+                ));
+            }
             // Validate params and any placeholders that reference them.
             validate_task_params(name, task, &mut errors);
             // Validate download config.
@@ -2908,6 +2913,20 @@ turbo.task = "build"
             err.contains("mutually exclusive"),
             "expected mutual exclusivity error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_always_on_start_rejects_interactive_params() {
+        let config: Config = r#"
+[tasks.configure]
+cmd = "configure"
+auto_run = "always-on-start"
+params = [{ name = "cluster" }]
+"#
+        .parse()
+        .unwrap();
+        let error = config.validate(TEST_PLATFORM).unwrap_err().to_string();
+        assert!(error.contains("always-on-start"), "{error}");
     }
 
     #[test]

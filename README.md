@@ -144,6 +144,10 @@ depends_on = ["postgres"]
 watch = ["db/migrations/**/*.sql"]
 ```
 
+For idempotent external-state checks, set `auto_run = "always-on-start"`. The
+task runs on every `don start` without trusting its saved watch hash, and on
+watched changes. This mode cannot be used with interactive `params`.
+
 Set `auto_run = false` to defer execution — when the task actually needs to run (because watched inputs changed, or another item depends on it), it moves to `pending_run` until you explicitly trigger it:
 
 ```toml
@@ -593,7 +597,7 @@ See [`examples/`](examples/) for complete working configs.
 | `ready.unhealthy_after` | u32 | Consecutive monitor failures → Unhealthy (default: 3) |
 | `on_failure` | string | `"notify"` or `"restart"` on crash/unhealthy (default: "notify") |
 | `reload` | bool | Service-level master switch for Don-managed watches, rebuilds, and restarts (default: true) |
-| `auto_run` | bool or string | (tasks) `true`/`"always"`, `false`/`"never"`, or `"once"` for startup-only until first success (default: true) |
+| `auto_run` | bool or string | (tasks) `true`/`"always"` when needed, `false`/`"never"`, `"once"` until first success, or `"always-on-start"` for every startup plus watched changes (default: true) |
 | `terminal` | string or table | (tasks) `"muxed"` default, or `"foreground"` for exclusive stdin/stdout/stderr ownership |
 | `terminal.mode` | string | (tasks) `"muxed"` or `"foreground"` |
 | `terminal.screen` | string | (tasks) `"alternate"` default for foreground, or `"main"` to keep output in scrollback |

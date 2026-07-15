@@ -470,6 +470,47 @@ fn integration_auto_run_once_only_runs_on_first_startup() {
     });
 }
 
+#[test]
+fn integration_always_on_start_runs_each_start_and_on_watch_change() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("always-run-on-start");
+        std::fs::write(dir.path().join("input.txt"), "unchanged").unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_task("configure", "bash", &["-c", "echo run >> startup-runs.log"])
+            .watch(&["input.txt"])
+            .auto_run_mode("always-on-start")
+            .done()
+            .add_custom_service("keeper", "bash", &["-c", "sleep 60"])
+            .depends_on(&["configure"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .build();
+        let run_count = || {
+            std::fs::read_to_string(dir.path().join("startup-runs.log"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+
+        for expected_runs in 1..=2 {
+            let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+            let handle = tokio::spawn(async move { runner.run().await.unwrap() });
+            wait_for_substr(&buf, "all services running", Duration::from_secs(5)).await;
+            assert_eq!(run_count(), expected_runs);
+            if expected_runs == 2 {
+                buf.lock().unwrap().clear();
+                std::fs::write(dir.path().join("input.txt"), "changed").unwrap();
+                wait_for_substr(&buf, "configure: complete", Duration::from_secs(5)).await;
+                assert_eq!(run_count(), 3);
+            }
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+        }
+    });
+}
+
 // --- TCP ready check ---
 
 #[test]

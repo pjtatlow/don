@@ -118,6 +118,10 @@ fn decide_startup_task(inputs: StartupTaskInputs) -> StartupTaskDecision {
         has_dependents,
     } = inputs;
 
+    if auto_run.runs_on_every_startup() && !has_params {
+        return StartupTaskDecision::Run;
+    }
+
     if has_watch && !needs_watch_run {
         return StartupTaskDecision::Skip {
             message: "skipped (no changes)",
@@ -128,7 +132,7 @@ fn decide_startup_task(inputs: StartupTaskInputs) -> StartupTaskDecision {
         needs_watch_run || (!has_success && has_dependents)
     } else {
         match auto_run {
-            TaskAutoRun::Always => !has_watch || needs_watch_run,
+            TaskAutoRun::Always | TaskAutoRun::AlwaysOnStart => !has_watch || needs_watch_run,
             TaskAutoRun::Never => needs_watch_run || (!has_success && has_dependents),
             TaskAutoRun::Once => !has_success || needs_watch_run,
         }
@@ -151,7 +155,9 @@ fn decide_startup_task(inputs: StartupTaskInputs) -> StartupTaskDecision {
     if !auto_run.runs_automatically_on_startup(has_success) {
         return StartupTaskDecision::PendingRun {
             message: match auto_run {
-                TaskAutoRun::Always => "pending — run manually".to_string(),
+                TaskAutoRun::Always | TaskAutoRun::AlwaysOnStart => {
+                    "pending — run manually".to_string()
+                }
                 TaskAutoRun::Never => {
                     if has_dependents {
                         "pending — required by dependents, run manually".to_string()
@@ -197,7 +203,7 @@ pub(in crate::runner) async fn run_task_worker(
             &global_watch_ignore,
         );
         let task_state = TaskState::new(base_dir.join(".don").join("task-state"));
-        let needs_watch_run = if has_watch {
+        let needs_watch_run = if has_watch && !task_cfg.auto_run.runs_on_every_startup() {
             let check_started = Instant::now();
             emitter.service_debug_event(
                 name,
@@ -374,6 +380,16 @@ mod tests {
                 has_success: true,
                 has_dependents: false,
                 expected: skip("skipped (no changes)"),
+            },
+            Case {
+                name: "always-on-start: watch unchanged after success -> run",
+                auto_run: TaskAutoRun::AlwaysOnStart,
+                has_params: false,
+                has_watch: true,
+                needs_watch_run: false,
+                has_success: true,
+                has_dependents: false,
+                expected: StartupTaskDecision::Run,
             },
             // Regression: a `auto_run = false` task that already succeeded must
             // still be parked as pending when its watched inputs change. Before

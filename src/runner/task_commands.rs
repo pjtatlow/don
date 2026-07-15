@@ -621,16 +621,15 @@ impl Runner {
         // a matching file changed. The hash check is only needed at startup
         // (to skip tasks whose inputs haven't changed since the last run).
 
-        // Only `auto_run = true` / `"always"` allows watch-triggered reruns.
-        // `"once"` is intentionally startup-only, and `false` / `"never"`
-        // keeps the task manual forever.
+        // `"always"` and `"always-on-start"` auto-run watched changes;
+        // `"once"` and `false` / `"never"` stay manual.
         if !task_cfg.auto_run.runs_automatically_on_watch() {
             if let Some(rt) = self.tasks.get_mut(name) {
                 rt.set_needs_run_now(true);
             }
             self.set_task_state(name, TaskItemState::PendingRun);
             let message = match task_cfg.auto_run {
-                TaskAutoRun::Always => "files changed (pending)",
+                TaskAutoRun::Always | TaskAutoRun::AlwaysOnStart => "files changed (pending)",
                 TaskAutoRun::Never => "files changed (pending — auto_run = false)",
                 TaskAutoRun::Once => "files changed (pending — auto_run = once)",
             };

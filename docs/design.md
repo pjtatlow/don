@@ -174,6 +174,7 @@ log = "ignore"
 | `env` | map | Environment variables |
 | `depends_on` | list of names | Services or tasks that must be ready/complete first |
 | `watch` | list of globs | File patterns — task only re-runs if these changed since last success. Empty = always runs |
+| `auto_run` | bool or string | Automatic run policy; `"always-on-start"` runs every startup without trusting the saved watch hash and also on watched changes |
 | `timeout` | duration string | Maximum time the task is allowed to run (e.g. "5m"). No timeout by default |
 | `log` | string or table | Logging output destination |
 | `terminal` | string or table | `"muxed"` (default) routes through Don output; `"foreground"` gives the task exclusive terminal ownership |

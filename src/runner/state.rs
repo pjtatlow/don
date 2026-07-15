@@ -18,7 +18,6 @@ use super::service::ServiceHandle;
 use super::{
     AttachWaiter, CommandResult, ServiceState, ServiceStopAction, TaskItemState, TaskRunWaiter,
 };
-use crate::config::TaskAutoRun;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -294,7 +293,7 @@ impl RuntimeTask {
         }
         if self.needs_run_now
             && self.config.params.is_empty()
-            && matches!(self.config.auto_run, TaskAutoRun::Always)
+            && self.config.auto_run.runs_automatically_on_watch()
         {
             return false;
         }

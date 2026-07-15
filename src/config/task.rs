@@ -16,6 +16,8 @@ pub enum TaskAutoRun {
     /// Run automatically whenever the runner decides the task is needed.
     #[default]
     Always,
+    /// Run every startup regardless of the saved watch hash, and on watched changes.
+    AlwaysOnStart,
     /// Never run automatically; move to `PendingRun` instead.
     Never,
     /// Run automatically only on startup, and only until the task has one
@@ -27,14 +29,18 @@ pub enum TaskAutoRun {
 impl TaskAutoRun {
     pub(crate) fn runs_automatically_on_startup(self, has_success: bool) -> bool {
         match self {
-            Self::Always => true,
+            Self::Always | Self::AlwaysOnStart => true,
             Self::Never => false,
             Self::Once => !has_success,
         }
     }
 
     pub(crate) fn runs_automatically_on_watch(self) -> bool {
-        matches!(self, Self::Always)
+        matches!(self, Self::Always | Self::AlwaysOnStart)
+    }
+
+    pub(crate) fn runs_on_every_startup(self) -> bool {
+        matches!(self, Self::AlwaysOnStart)
     }
 }
 
@@ -52,10 +58,11 @@ impl<'de> Deserialize<'de> for TaskAutoRun {
             RawTaskAutoRun::Bool(false) => Ok(TaskAutoRun::Never),
             RawTaskAutoRun::String(value) => match value.as_str() {
                 "always" => Ok(TaskAutoRun::Always),
+                "always-on-start" => Ok(TaskAutoRun::AlwaysOnStart),
                 "never" => Ok(TaskAutoRun::Never),
                 "once" => Ok(TaskAutoRun::Once),
                 _ => Err(serde::de::Error::custom(format!(
-                    "unknown auto_run value '{value}', expected true, false, \"always\", \"never\", or \"once\""
+                    "unknown auto_run value '{value}', expected true, false, \"always\", \"always-on-start\", \"never\", or \"once\""
                 ))),
             },
         }
@@ -298,6 +305,26 @@ mod tests {
         let task: Task = toml::from_str(r#"cmd = "true""#).unwrap();
         assert_eq!(task.terminal.mode, TaskTerminalMode::Muxed);
         assert_eq!(task.terminal.screen, TaskTerminalScreen::Main);
+    }
+
+    #[test]
+    fn auto_run_values_deserialize() {
+        for (value, expected) in [
+            ("true", TaskAutoRun::Always),
+            ("\"always\"", TaskAutoRun::Always),
+            ("\"always-on-start\"", TaskAutoRun::AlwaysOnStart),
+            ("false", TaskAutoRun::Never),
+            ("\"never\"", TaskAutoRun::Never),
+            ("\"once\"", TaskAutoRun::Once),
+        ] {
+            let task: Task =
+                toml::from_str(&format!("cmd = \"true\"\nauto_run = {value}")).unwrap();
+            assert_eq!(task.auto_run, expected, "value {value}");
+        }
+        let error = toml::from_str::<Task>("cmd = \"true\"\nauto_run = \"sometimes\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("\"always-on-start\""), "{error}");
     }
 
     #[test]
