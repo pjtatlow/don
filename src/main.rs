@@ -9,9 +9,27 @@ use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForeground
 use don::TaskRunInfo;
 use don::client::{Client, ClientError, RunTaskOptions};
 use don::runner::{ItemStatus, ServiceState, TaskItemState};
+use regex::Regex;
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Strip terminal *query* sequences from captured output before printing it to
+/// a live terminal. A replayed log can contain queries a program emitted at
+/// startup — OSC color queries, cursor-position / device-status reports — which
+/// the user's terminal would *answer*. Since the command has already exited,
+/// those answers land on the shell prompt as stray input. Drop the queries;
+/// SGR colors, OSC-8 hyperlinks, and all display sequences are preserved.
+fn strip_terminal_queries(line: &str) -> Cow<'_, str> {
+    static QUERY: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"\x1b\][0-9;]*\?(?:\x07|\x1b\\)?|\x1b\[[0-9;>=?]*[nc]").ok());
+    match QUERY.as_ref() {
+        Some(re) => re.replace_all(line, ""),
+        None => Cow::Borrowed(line),
+    }
+}
 
 /// Write a line to stderr. Used for CLI error messages so they stay on the
 /// error stream (scripts / tests / shell redirection expect it). We avoid
@@ -826,12 +844,12 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
                 match serde_json::from_str::<serde_json::Value>(line) {
                     Ok(v) => {
                         if let Some(s) = v.get("line").and_then(|x| x.as_str()) {
-                            println!("{s}");
+                            println!("{}", strip_terminal_queries(s));
                         }
                     }
                     Err(_) => {
                         // Fall back to raw line — shouldn't happen with this server.
-                        println!("{line}");
+                        println!("{}", strip_terminal_queries(line));
                     }
                 }
                 Ok(())
@@ -848,7 +866,7 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
         match client.logs(name, last).await {
             Ok(lines) => {
                 for line in lines {
-                    println!("{line}");
+                    println!("{}", strip_terminal_queries(&line));
                 }
                 0
             }
@@ -1874,9 +1892,26 @@ fn map_join_result<T>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{item_name, parse_task_args, split_run_flags, status_sort_bucket};
+    use super::{item_name, parse_task_args, split_run_flags, status_sort_bucket, strip_terminal_queries};
     use don::config::{ParamKind, TaskParam};
     use don::runner::{ItemStatus, ServiceState, TaskItemState};
+
+    #[test]
+    fn strips_terminal_queries_keeps_display_sequences() {
+        // OSC 11 background-color query + DSR cursor-position query are dropped.
+        assert_eq!(strip_terminal_queries("\x1b]11;?\x07hi"), "hi");
+        assert_eq!(strip_terminal_queries("a\x1b[6nb"), "ab");
+        // SGR color, OSC-8 hyperlink, and an OSC-11 *set* (no `?`) are preserved.
+        assert_eq!(
+            strip_terminal_queries("\x1b[37mcolor\x1b[0m"),
+            "\x1b[37mcolor\x1b[0m"
+        );
+        assert_eq!(
+            strip_terminal_queries("\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\"),
+            "\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\"
+        );
+        assert_eq!(strip_terminal_queries("plain"), "plain");
+    }
 
     fn p(name: &str) -> TaskParam {
         TaskParam {
