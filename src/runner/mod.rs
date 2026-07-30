@@ -486,6 +486,21 @@ enum RunnerInternalCommand {
         success: bool,
         message: Option<String>,
     },
+    /// Failed lazy launch cleanup has stopped the old process and entered
+    /// durable proxy rejection.
+    LazyFailureRecoveryComplete {
+        name: String,
+        op_id: u64,
+        rearm: bool,
+        result: Result<(), String>,
+    },
+    /// Proxy controllers reached their non-triggering prepared phase after a
+    /// failed lazy launch.
+    LazyProxyPrepareComplete {
+        name: String,
+        op_id: u64,
+        result: Result<(), String>,
+    },
     /// Completion from a detached manual service stop/restart worker.
     ServiceStopComplete {
         name: String,
@@ -742,10 +757,10 @@ pub struct Runner {
     /// Consolidated per-task runtime state.
     tasks: HashMap<String, RuntimeTask>,
 
-    /// Receives service names when a lazy service's proxy gets its first connection.
-    lazy_start_rx: mpsc::Receiver<String>,
+    /// Receives epoch-tagged triggers when a lazy proxy gets a connection.
+    lazy_start_rx: mpsc::Receiver<crate::proxy::LazyProxyTrigger>,
     /// Sender half kept for passing to ServiceProxy::bind.
-    lazy_start_tx: mpsc::Sender<String>,
+    lazy_start_tx: mpsc::Sender<crate::proxy::LazyProxyTrigger>,
 
     /// Signals the API server task to stop accepting connections.
     server_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -960,6 +975,15 @@ impl Runner {
             .get_mut(name)
             .and_then(|rs| rs.set_state(new_state));
         if let Some(state) = changed {
+            if let Some(rs) = self.services.get_mut(name)
+                && rs.resolved.lazy
+                && let Some(proxy) = rs.proxy.as_mut()
+            {
+                proxy.set_connection_state(
+                    matches!(state, ServiceState::Failed | ServiceState::DependencyFailed),
+                    state == ServiceState::Lazy,
+                );
+            }
             self.broadcast_service_state(name, state);
             if self.done_tx.is_some()
                 && matches!(
@@ -989,6 +1013,11 @@ impl Runner {
         let state_changed = rs.state() != ServiceState::DependencyFailed;
         if !rs.mark_dependency_failed(dependencies) {
             return false;
+        }
+        if rs.resolved.lazy
+            && let Some(proxy) = rs.proxy.as_mut()
+        {
+            proxy.set_connection_state(true, false);
         }
         self.broadcast_service_state(name, ServiceState::DependencyFailed);
         if state_changed && self.done_tx.is_some() {
@@ -1595,6 +1624,23 @@ impl Runner {
                                     message,
                                 );
                             }
+                            RunnerInternalCommand::LazyFailureRecoveryComplete {
+                                name,
+                                op_id,
+                                rearm,
+                                result,
+                            } => {
+                                self.handle_lazy_failure_recovery_complete(
+                                    &name, op_id, rearm, result,
+                                );
+                            }
+                            RunnerInternalCommand::LazyProxyPrepareComplete {
+                                name,
+                                op_id,
+                                result,
+                            } => {
+                                self.handle_lazy_proxy_prepare_complete(&name, op_id, result);
+                            }
                             RunnerInternalCommand::BatchBuildComplete(outcome) => {
                                 // Drop the abort-on-drop handle: the task is done,
                                 // and leaving the handle live would abort after the
@@ -1624,11 +1670,11 @@ impl Runner {
                             }
                         }
                     }
-                    Some(name) = self.lazy_start_rx.recv() => {
+                    Some(trigger) = self.lazy_start_rx.recv() => {
                         // Only the first connection acts: it moves Lazy →
                         // Pending, and the normal dependency scheduler owns
                         // the service from there.
-                        self.handle_lazy_connection(&name);
+                        self.handle_lazy_connection(trigger);
                     }
                     // Flush batched build-tool rebuilds when the batch window expires.
                     _ = async {
@@ -2123,6 +2169,211 @@ mod tests {
         .await
         .unwrap();
         (runner, shutdown_tx)
+    }
+
+    async fn attach_lazy_forward_proxy(runner: &mut Runner) {
+        let (lazy_tx, _lazy_rx) = mpsc::channel(8);
+        let proxy = crate::proxy::ServiceProxy::bind(
+            &[crate::config::ProxyEntry {
+                listen: "127.0.0.1:0".to_string(),
+                mode: crate::config::ProxyMode::Env("PORT".to_string()),
+            }],
+            false,
+            Some(lazy_tx),
+            "api",
+            runner.output_manager.clone_lifecycle_emitter(),
+        )
+        .await
+        .unwrap();
+        if let Some(service) = runner.services.get_mut("api") {
+            service.resolved.lazy = true;
+            service.proxy = Some(proxy);
+        }
+    }
+
+    async fn apply_lazy_failure_recovery_completion(runner: &mut Runner) {
+        let command =
+            tokio::time::timeout(std::time::Duration::from_secs(2), runner.internal_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        match command {
+            RunnerInternalCommand::LazyFailureRecoveryComplete {
+                name,
+                op_id,
+                rearm,
+                result,
+            } => runner.handle_lazy_failure_recovery_complete(&name, op_id, rearm, result),
+            _ => panic!("unexpected internal command"),
+        }
+        let prepare_command =
+            tokio::time::timeout(std::time::Duration::from_secs(2), runner.internal_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        match prepare_command {
+            RunnerInternalCommand::LazyProxyPrepareComplete {
+                name,
+                op_id,
+                result,
+            } => runner.handle_lazy_proxy_prepare_complete(&name, op_id, result),
+            _ => panic!("unexpected internal command"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lazy_preparation_failures_rearm_after_cleanup() {
+        #[derive(Clone, Copy)]
+        enum FailureStage {
+            SpawnPreparation,
+            JustInTimeBuild,
+        }
+
+        struct Case {
+            name: &'static str,
+            stage: FailureStage,
+        }
+
+        let cases = vec![
+            Case {
+                name: "spawn preparation",
+                stage: FailureStage::SpawnPreparation,
+            },
+            Case {
+                name: "just-in-time build",
+                stage: FailureStage::JustInTimeBuild,
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+            attach_lazy_forward_proxy(&mut runner).await;
+
+            match case.stage {
+                FailureStage::SpawnPreparation => {
+                    runner.set_service_state("api", ServiceState::Starting);
+                    let resolved = runner.services.get("api").unwrap().resolved.clone();
+                    let context = Box::new(ServiceStartContext {
+                        resolved,
+                        batch_built: false,
+                        listen_fds: Vec::new(),
+                        listen_fds_env: HashMap::new(),
+                        listenfd_start_barrier: crate::proxy::ListenfdStartBarrier::default(),
+                        fallback_ports: false,
+                        prior_docker_port_bindings: Vec::new(),
+                    });
+                    runner
+                        .handle_service_start_prepared(
+                            "api",
+                            0,
+                            context,
+                            ServiceStartIntent::Background,
+                            Err("spawn failed".to_string()),
+                        )
+                        .await;
+                }
+                FailureStage::JustInTimeBuild => {
+                    runner.set_service_state("api", ServiceState::Building);
+                    runner.handle_lazy_build_complete(
+                        "api",
+                        0,
+                        build_tools::BatchBuildOutcome {
+                            resolved_watches: Vec::new(),
+                            warnings: Vec::new(),
+                            succeeded: std::collections::HashSet::new(),
+                            failed: vec![("api".to_string(), "build failed".to_string())],
+                            binary_paths: HashMap::new(),
+                            replay_items: Vec::new(),
+                        },
+                    );
+                }
+            }
+
+            assert_eq!(
+                runner.services.get("api").map(RuntimeService::state),
+                Some(ServiceState::Stopping),
+                "case '{}'",
+                case.name,
+            );
+            apply_lazy_failure_recovery_completion(&mut runner).await;
+            let service = runner.services.get("api").unwrap();
+            assert_eq!(service.state(), ServiceState::Lazy, "case '{}'", case.name,);
+            assert_eq!(service.rapid_crashes, 1, "case '{}'", case.name);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lazy_proxy_prepare_failure_respects_current_state() {
+        let cases = vec![
+            (
+                "current prepare operation becomes terminal",
+                ServiceState::Stopping,
+                ServiceState::Failed,
+            ),
+            (
+                "stale error cannot clobber Starting",
+                ServiceState::Starting,
+                ServiceState::Starting,
+            ),
+        ];
+
+        for (name, state, expected) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+            attach_lazy_forward_proxy(&mut runner).await;
+            runner.set_service_state("api", state);
+
+            runner.handle_lazy_proxy_prepare_complete(
+                "api",
+                0,
+                Err("controller failed".to_string()),
+            );
+
+            assert_eq!(
+                runner.services.get("api").map(RuntimeService::state),
+                Some(expected),
+                "{name}",
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_lazy_triggers_cannot_escape_prepared_or_newer_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = single_bazel_runner(temp.path()).await;
+        attach_lazy_forward_proxy(&mut runner).await;
+        runner.set_service_state("api", ServiceState::Lazy);
+        let stale = crate::proxy::LazyProxyTrigger {
+            service_name: "api".to_string(),
+            failure_epoch: 0,
+        };
+        runner.lazy_start_tx.send(stale.clone()).await.unwrap();
+        runner.lazy_start_tx.send(stale).await.unwrap();
+        runner.set_service_state("api", ServiceState::Stopping);
+
+        let rejection = runner
+            .services
+            .get_mut("api")
+            .and_then(|service| service.proxy.as_mut())
+            .unwrap()
+            .begin_lazy_failure_recovery();
+        rejection.wait().await.unwrap();
+        let prepare = runner
+            .services
+            .get("api")
+            .and_then(|service| service.proxy.as_ref())
+            .unwrap()
+            .begin_lazy_rearm();
+        prepare.wait().await.unwrap();
+        let trigger = runner.lazy_start_rx.recv().await.unwrap();
+        runner.handle_lazy_connection(trigger);
+        assert_eq!(runner.services["api"].state(), ServiceState::Stopping);
+
+        runner.set_service_state("api", ServiceState::Lazy);
+        let trigger = runner.lazy_start_rx.recv().await.unwrap();
+        runner.handle_lazy_connection(trigger);
+        assert_eq!(runner.services["api"].state(), ServiceState::Lazy);
     }
 
     #[tokio::test(flavor = "current_thread")]

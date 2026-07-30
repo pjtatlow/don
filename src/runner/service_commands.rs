@@ -34,14 +34,23 @@ impl Runner {
             }
         };
         self.render_runtime_env(name, &mut resolved.env)?;
-        let (listen_fds, listen_fds_env) = if let Some(rs) = self.services.get(name)
+        let (listen_fds, listen_fds_env, listenfd_start_barrier) = if let Some(rs) =
+            self.services.get(name)
             && let Some(ref proxy) = rs.proxy
         {
             resolved.env.extend(proxy.env_vars());
             resolved.env.extend(proxy.public_env_vars());
-            (proxy.listenfd_raw_fds(), proxy.listenfd_env())
+            (
+                proxy.listenfd_raw_fds(),
+                proxy.listenfd_env(),
+                proxy.listenfd_start_barrier(),
+            )
         } else {
-            (Vec::new(), HashMap::new())
+            (
+                Vec::new(),
+                HashMap::new(),
+                crate::proxy::ListenfdStartBarrier::default(),
+            )
         };
         let batch_built = self.services.get(name).is_some_and(|rs| rs.batch_built);
         let prior_docker_port_bindings = self
@@ -54,6 +63,7 @@ impl Runner {
             batch_built,
             listen_fds,
             listen_fds_env,
+            listenfd_start_barrier,
             fallback_ports: self.config.fallback_ports,
             prior_docker_port_bindings,
         })
@@ -199,16 +209,24 @@ impl Runner {
                 }
             },
             Err(message) => {
-                self.set_service_state(name, ServiceState::Failed);
-                self.output_manager.service_error_event(name, &message);
-                let should_auto_restart = matches!(intent, ServiceStartIntent::Background)
-                    && self.services.get(name).is_some_and(|rs| {
-                        rs.resolved.on_failure == crate::config::OnFailure::Restart
-                    });
-                if should_auto_restart {
-                    self.schedule_auto_restart(name, &message, true);
-                } else if let Some(rs) = self.services.get_mut(name) {
-                    rs.reset_restart_tracking();
+                let is_lazy = self
+                    .services
+                    .get(name)
+                    .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
+                if is_lazy {
+                    self.handle_lazy_launch_failure(name, Some(&message));
+                } else {
+                    self.set_service_state(name, ServiceState::Failed);
+                    self.output_manager.service_error_event(name, &message);
+                    let should_auto_restart = matches!(intent, ServiceStartIntent::Background)
+                        && self.services.get(name).is_some_and(|rs| {
+                            rs.resolved.on_failure == crate::config::OnFailure::Restart
+                        });
+                    if should_auto_restart {
+                        self.schedule_auto_restart(name, &message, true);
+                    } else if let Some(rs) = self.services.get_mut(name) {
+                        rs.reset_restart_tracking();
+                    }
                 }
                 match intent {
                     ServiceStartIntent::Scheduled { done_tx } => {

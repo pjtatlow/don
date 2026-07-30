@@ -377,6 +377,8 @@ impl Runner {
                 | RunnerInternalCommand::AutoRestart { .. }
                 | RunnerInternalCommand::ServiceExited { .. }
                 | RunnerInternalCommand::ReadyCheckComplete { .. }
+                | RunnerInternalCommand::LazyFailureRecoveryComplete { .. }
+                | RunnerInternalCommand::LazyProxyPrepareComplete { .. }
                 | RunnerInternalCommand::UpdateCheckComplete(_) => {}
             }
         }

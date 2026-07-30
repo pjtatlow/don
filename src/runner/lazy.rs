@@ -13,15 +13,27 @@ impl Runner {
     /// Moving to `Pending` is the request: no parallel name set is needed, and
     /// the normal pending-item scheduler can wait, cascade dependency failure,
     /// and start the service when its dependencies become ready.
-    pub(in crate::runner) fn handle_lazy_connection(&mut self, name: &str) {
-        let deps = match self.services.get(name) {
-            Some(rs) if rs.state() == ServiceState::Lazy => rs.resolved.depends_on.clone(),
+    pub(in crate::runner) fn handle_lazy_connection(
+        &mut self,
+        trigger: crate::proxy::LazyProxyTrigger,
+    ) {
+        let name = trigger.service_name;
+        let deps = match self.services.get(&name) {
+            Some(rs)
+                if rs.state() == ServiceState::Lazy
+                    && rs
+                        .proxy
+                        .as_ref()
+                        .is_some_and(|proxy| proxy.accepts_lazy_trigger(trigger.failure_epoch)) =>
+            {
+                rs.resolved.depends_on.clone()
+            }
             _ => return,
         };
 
         if let Some(failed) = deps.iter().find(|dep| self.is_dep_failed(dep)) {
             self.output_manager.service_error_event(
-                name,
+                &name,
                 &format!("first connection — dependency '{failed}' has failed"),
             );
         } else {
@@ -32,10 +44,10 @@ impl Runner {
                 .collect();
             if unsatisfied.is_empty() {
                 self.output_manager
-                    .service_event(name, "first connection — dependencies satisfied");
+                    .service_event(&name, "first connection — dependencies satisfied");
             } else {
                 self.output_manager.service_event(
-                    name,
+                    &name,
                     &format!(
                         "waiting for dependencies before start: {}",
                         unsatisfied.join(", ")
@@ -44,7 +56,7 @@ impl Runner {
             }
         }
 
-        self.set_service_state(name, ServiceState::Pending);
+        self.set_service_state(&name, ServiceState::Pending);
     }
 
     /// Start the detached build-tool chain for a triggered lazy service when
@@ -94,7 +106,11 @@ impl Runner {
         }
         let replay_items = outcome.replay_items.clone();
         self.apply_batch_build_outcome(outcome);
-        if let Some(item) = replay_items.iter().find(|item| item.name == name) {
+        let can_replay = self
+            .services
+            .get(name)
+            .is_some_and(|rs| rs.state() == ServiceState::Pending);
+        if can_replay && let Some(item) = replay_items.iter().find(|item| item.name == name) {
             self.schedule_lazy_build_replay(item);
         }
     }

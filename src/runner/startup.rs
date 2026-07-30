@@ -94,7 +94,12 @@ impl Runner {
         for (name, msg) in outcome.failed {
             self.output_manager
                 .service_error_event(&name, &format!("batch build failed: {msg}"));
-            if self.services.contains_key(&name) {
+            let is_triggered_lazy_build = self.services.get(&name).is_some_and(|rs| {
+                rs.resolved.lazy && rs.proxy.is_some() && rs.state() == ServiceState::Building
+            });
+            if is_triggered_lazy_build {
+                self.handle_lazy_launch_failure(&name, Some(&format!("batch build failed: {msg}")));
+            } else if self.services.contains_key(&name) {
                 self.set_service_state(&name, ServiceState::Failed);
             }
             if self.tasks.contains_key(&name) {

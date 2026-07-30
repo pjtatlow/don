@@ -11,6 +11,7 @@ use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 const PLATFORM: Platform = Platform::LinuxX86_64;
@@ -119,6 +120,32 @@ async fn wait_for_output(buf: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Durat
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn assert_connection_closed(
+    mut stream: tokio::net::TcpStream,
+    timeout: Duration,
+    context: &str,
+) {
+    let mut byte = [0u8; 1];
+    match tokio::time::timeout(timeout, stream.read(&mut byte)).await {
+        Ok(Ok(0) | Err(_)) => {}
+        Ok(Ok(count)) => panic!("{context}: expected a closed connection, read {count} byte(s)"),
+        Err(_) => panic!("{context}: connection remained open past {timeout:?}"),
+    }
+}
+
+async fn assert_connection_still_open(
+    stream: &mut tokio::net::TcpStream,
+    timeout: Duration,
+    context: &str,
+) {
+    let mut byte = [0u8; 1];
+    match tokio::time::timeout(timeout, stream.read(&mut byte)).await {
+        Err(_) => {}
+        Ok(Ok(0) | Err(_)) => panic!("{context}: connection closed while service was pending"),
+        Ok(Ok(count)) => panic!("{context}: unexpected {count} byte(s) while service was pending"),
     }
 }
 
@@ -772,79 +799,218 @@ fn integration_lazy_listenfd_triggers_on_connect() {
 }
 
 /// A lazy service that dies the instant it launches must not be relaunched
-/// forever. The trigger connection the dying service never accepts stays queued
-/// and re-fires the launch the moment the proxy re-arms; without the crash-loop
-/// guard on the lazy path this is a tight, no-backoff restart loop. After the
-/// rapid-crash ceiling the service is left Failed with its trigger un-armed.
+/// forever. Each failed launch closes its triggering connection and re-arms
+/// lazy activation for a later client. After the rapid-crash ceiling the
+/// service is left Failed and all subsequent connections are closed.
 #[test]
 fn integration_lazy_crash_loop_gives_up_and_stops_relaunching() {
-    run_with_timeout(Duration::from_secs(20), async {
-        let dir = TempDir::new("lazy-crash-loop");
-        let port = free_port();
-        let addr = format!("127.0.0.1:{port}");
-        let counter = dir.path().join("launches");
-
-        let cmd = format!(
-            "N=$(cat {ctr} 2>/dev/null || echo 0); N=$((N + 1)); echo $N > {ctr}; exit 1",
-            ctr = counter.display()
-        );
-        let toml = ConfigBuilder::new()
-            .add_custom_service("api", "bash", &["-c", &cmd])
-            .proxy_listenfd(&[&addr])
-            .lazy(true)
-            .ready_exec("true", &[])
-            .done()
-            .build();
-
-        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
-
-        assert!(
-            wait_for_output(
-                &buf,
-                &format!("proxy listening on {addr}"),
-                Duration::from_secs(5)
-            )
-            .await,
-            "expected proxy to bind. output: {}",
-            read_buf(&buf)
-        );
-
-        // A single connection triggers the lazy start. The service crashes,
-        // the queued connection re-fires the launch once more, then the guard
-        // must give up.
-        let _stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        assert!(
-            wait_for_output(&buf, "giving up", Duration::from_secs(10)).await,
-            "expected the lazy crash loop to give up. output: {}",
-            read_buf(&buf)
-        );
-
-        // Let any errant retrigger fire, then probe a few more times: with the
-        // trigger un-armed these connections must not relaunch the service.
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        for _ in 0..3 {
-            let _ = tokio::net::TcpStream::connect(&addr).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    run_with_timeout(Duration::from_secs(40), async {
+        #[derive(Clone, Copy)]
+        enum ProxyKind {
+            Env,
+            Listenfd,
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let _ = shutdown_tx.send(()).await;
-        handle.await.unwrap();
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum FailureKind {
+            Crash,
+            LingeringDescendant,
+            ReadyCheck,
+        }
 
-        let launches: i32 = std::fs::read_to_string(&counter)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_eq!(
-            launches,
-            2,
-            "lazy service should launch exactly twice before giving up, got {launches}. output: {}",
-            read_buf(&buf)
-        );
+        struct Case {
+            name: &'static str,
+            proxy_kind: ProxyKind,
+            failure_kind: FailureKind,
+        }
+
+        let cases = vec![
+            Case {
+                name: "env-crash",
+                proxy_kind: ProxyKind::Env,
+                failure_kind: FailureKind::Crash,
+            },
+            Case {
+                name: "listenfd-crash",
+                proxy_kind: ProxyKind::Listenfd,
+                failure_kind: FailureKind::Crash,
+            },
+            Case {
+                name: "listenfd-lingering-descendant",
+                proxy_kind: ProxyKind::Listenfd,
+                failure_kind: FailureKind::LingeringDescendant,
+            },
+            Case {
+                name: "env-ready-check",
+                proxy_kind: ProxyKind::Env,
+                failure_kind: FailureKind::ReadyCheck,
+            },
+            Case {
+                name: "listenfd-ready-check",
+                proxy_kind: ProxyKind::Listenfd,
+                failure_kind: FailureKind::ReadyCheck,
+            },
+        ];
+
+        for case in cases {
+            let dir = TempDir::new(&format!("lazy-crash-loop-{}", case.name));
+            let port = free_port();
+            let addr = format!("127.0.0.1:{port}");
+            let counter = dir.path().join("launches");
+            let child_pid = dir.path().join("child-pid");
+            let overlap = dir.path().join("overlap");
+
+            let cmd = match case.failure_kind {
+                FailureKind::Crash => format!(
+                    "N=$(cat {ctr} 2>/dev/null || echo 0); N=$((N + 1)); \
+                     echo $N > {ctr}; sleep 0.2; exit 1",
+                    ctr = counter.display()
+                ),
+                FailureKind::LingeringDescendant => format!(
+                    "N=$(cat {ctr} 2>/dev/null || echo 0); N=$((N + 1)); \
+                     echo $N > {ctr}; \
+                     if test -f {pid} && kill -0 $(cat {pid}) 2>/dev/null; then \
+                       echo overlap > {overlap}; \
+                     fi; \
+                     sleep 60 </dev/null >/dev/null 2>&1 & echo $! > {pid}; exit 1",
+                    ctr = counter.display(),
+                    pid = child_pid.display(),
+                    overlap = overlap.display()
+                ),
+                FailureKind::ReadyCheck => format!(
+                    "N=$(cat {ctr} 2>/dev/null || echo 0); N=$((N + 1)); \
+                     echo $N > {ctr}; exec sleep 60",
+                    ctr = counter.display()
+                ),
+            };
+            let service = ConfigBuilder::new().add_custom_service("api", "bash", &["-c", &cmd]);
+            let service = match case.proxy_kind {
+                ProxyKind::Env => service.proxy_env(&addr, "PORT"),
+                ProxyKind::Listenfd => service.proxy_listenfd(&[&addr]),
+            };
+            let service = service.lazy(true);
+            let service = match case.failure_kind {
+                FailureKind::Crash | FailureKind::LingeringDescendant => {
+                    service.ready_exec("true", &[])
+                }
+                FailureKind::ReadyCheck => {
+                    service.ready_exec_with("bash", &["-c", "sleep 0.1; false"], "10ms", 1)
+                }
+            };
+            let toml = service.done().build();
+
+            let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+            let handle = tokio::spawn(async move {
+                runner.run().await.unwrap();
+            });
+
+            assert!(
+                wait_for_output(
+                    &buf,
+                    &format!("proxy listening on {addr}"),
+                    Duration::from_secs(5)
+                )
+                .await,
+                "{}: expected proxy to bind. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            for attempt in 1..=2 {
+                let mut streams = Vec::new();
+                if attempt == 2 && case.failure_kind == FailureKind::LingeringDescendant {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                        stream.write_all(b"probe").await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        let launches = std::fs::read_to_string(&counter)
+                            .ok()
+                            .and_then(|value| value.trim().parse::<u32>().ok())
+                            .unwrap_or(0);
+                        if launches >= 2 {
+                            streams.push(stream);
+                            break;
+                        }
+                        assert_connection_closed(
+                            stream,
+                            Duration::from_secs(1),
+                            &format!("{} cleanup-phase probe", case.name),
+                        )
+                        .await;
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "{}: proxy did not re-arm after cleaning up the failed process group. output: {}",
+                            case.name,
+                            read_buf(&buf)
+                        );
+                    }
+                }
+                while streams.len() < 3 {
+                    let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                    stream
+                        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .await
+                        .unwrap();
+                    streams.push(stream);
+                }
+                let expected = if attempt == 1 {
+                    "will retry on next connection"
+                } else {
+                    "giving up"
+                };
+                assert!(
+                    wait_for_output(&buf, expected, Duration::from_secs(10)).await,
+                    "{} attempt {attempt}: expected {expected:?}. output: {}",
+                    case.name,
+                    read_buf(&buf)
+                );
+                for (index, stream) in streams.into_iter().enumerate() {
+                    assert_connection_closed(
+                        stream,
+                        Duration::from_secs(2),
+                        &format!("{} failed launch {attempt} client {index}", case.name),
+                    )
+                    .await;
+                }
+            }
+
+            // Terminal failure keeps the public listener bound, but it closes
+            // every new connection without launching again.
+            for probe in 1..=3 {
+                let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                let _ = stream.write_all(b"probe").await;
+                assert_connection_closed(
+                    stream,
+                    Duration::from_secs(2),
+                    &format!("{} terminal probe {probe}", case.name),
+                )
+                .await;
+            }
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+
+            let launches: i32 = std::fs::read_to_string(&counter)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                launches,
+                2,
+                "{}: lazy service should launch exactly twice before giving up. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+            assert!(
+                !overlap.exists(),
+                "{}: a later launch overlapped a descendant from the failed process group. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+        }
     });
 }
 
@@ -989,77 +1155,132 @@ fn integration_lazy_starts_immediately_when_dependency_satisfied() {
 }
 
 /// A lazy service with a pending first connection whose dependency then fails
-/// must surface DependencyFailed and never launch its process.
+/// must surface DependencyFailed, close the connection, and never launch.
 #[test]
-fn integration_lazy_dependency_failure_blocks_start() {
-    run_with_timeout(Duration::from_secs(20), async {
-        let dir = TempDir::new("lazy-dep-failure");
-        let port = free_port();
-        let addr = format!("127.0.0.1:{port}");
+fn integration_lazy_dependency_failure_closes_connection() {
+    run_with_timeout(Duration::from_secs(35), async {
+        #[derive(Clone, Copy)]
+        enum ProxyKind {
+            Env,
+            Listenfd,
+        }
 
-        let toml = ConfigBuilder::new()
-            .add_task(
-                "setup",
-                "bash",
-                &["-c", "sleep 1; echo SETUP_FAILING; exit 1"],
-            )
-            .done()
-            .add_custom_service("api", "bash", &["-c", "echo API_STARTED; exec sleep 60"])
-            .proxy_listenfd(&[&addr])
-            .lazy(true)
-            .depends_on(&["setup"])
-            .ready_exec("true", &[])
-            .done()
-            .build();
+        struct Case {
+            name: &'static str,
+            proxy_kind: ProxyKind,
+        }
 
-        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
-        let handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
+        let cases = vec![
+            Case {
+                name: "env",
+                proxy_kind: ProxyKind::Env,
+            },
+            Case {
+                name: "listenfd",
+                proxy_kind: ProxyKind::Listenfd,
+            },
+        ];
 
-        assert!(
-            wait_for_output(
-                &buf,
-                &format!("proxy listening on {addr}"),
-                Duration::from_secs(5)
-            )
-            .await,
-            "expected proxy to bind. output: {}",
-            read_buf(&buf)
-        );
+        for case in cases {
+            let dir = TempDir::new(&format!("lazy-dep-failure-{}", case.name));
+            let port = free_port();
+            let addr = format!("127.0.0.1:{port}");
 
-        // Connect while `setup` is still running, so the start defers.
-        let _stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        assert!(
-            wait_for_output(
-                &buf,
-                "waiting for dependencies before start: setup",
-                Duration::from_secs(5)
-            )
-            .await,
-            "expected the lazy start to defer for its dependency. output: {}",
-            read_buf(&buf)
-        );
-        assert!(
-            wait_for_output(
-                &buf,
-                "api: skipped (dependency 'setup' failed)",
-                Duration::from_secs(8)
-            )
-            .await,
-            "expected api to surface DependencyFailed. output: {}",
-            read_buf(&buf)
-        );
+            let service = ConfigBuilder::new()
+                .add_task(
+                    "setup",
+                    "bash",
+                    &["-c", "sleep 1; echo SETUP_FAILING; exit 1"],
+                )
+                .done()
+                .add_custom_service("api", "bash", &["-c", "echo API_STARTED; exec sleep 60"]);
+            let service = match case.proxy_kind {
+                ProxyKind::Env => service.proxy_env(&addr, "PORT"),
+                ProxyKind::Listenfd => service.proxy_listenfd(&[&addr]),
+            };
+            let toml = service
+                .lazy(true)
+                .depends_on(&["setup"])
+                .ready_exec("true", &[])
+                .done()
+                .build();
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let output = read_buf(&buf);
-        assert!(
-            !output.contains("API_STARTED"),
-            "api must not launch when its dependency failed. output: {output}"
-        );
+            let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+            let handle = tokio::spawn(async move {
+                runner.run().await.unwrap();
+            });
 
-        let _ = shutdown_tx.send(()).await;
-        handle.await.unwrap();
+            assert!(
+                wait_for_output(
+                    &buf,
+                    &format!("proxy listening on {addr}"),
+                    Duration::from_secs(5)
+                )
+                .await,
+                "{}: expected proxy to bind. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            // Connect while `setup` is still running, so the start defers.
+            let mut streams = Vec::new();
+            for _ in 0..3 {
+                let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                streams.push(stream);
+            }
+            assert!(
+                wait_for_output(
+                    &buf,
+                    "waiting for dependencies before start: setup",
+                    Duration::from_secs(5)
+                )
+                .await,
+                "{}: expected lazy start to defer. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+            for (index, stream) in streams.iter_mut().enumerate() {
+                assert_connection_still_open(
+                    stream,
+                    Duration::from_millis(100),
+                    &format!("{} pending dependency client {index}", case.name),
+                )
+                .await;
+            }
+            assert!(
+                wait_for_output(
+                    &buf,
+                    "api: skipped (dependency 'setup' failed)",
+                    Duration::from_secs(8)
+                )
+                .await,
+                "{}: expected DependencyFailed. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+            for (index, stream) in streams.into_iter().enumerate() {
+                assert_connection_closed(
+                    stream,
+                    Duration::from_secs(2),
+                    &format!("{} dependency failure client {index}", case.name),
+                )
+                .await;
+            }
+
+            let output = read_buf(&buf);
+            assert!(
+                !output.contains("API_STARTED"),
+                "{}: api must not launch. output: {output}",
+                case.name
+            );
+
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+        }
     });
 }
 

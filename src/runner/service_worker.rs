@@ -15,6 +15,7 @@ pub(in crate::runner) struct ServiceStartContext {
     pub(in crate::runner) batch_built: bool,
     pub(in crate::runner) listen_fds: Vec<RawFd>,
     pub(in crate::runner) listen_fds_env: HashMap<String, String>,
+    pub(in crate::runner) listenfd_start_barrier: crate::proxy::ListenfdStartBarrier,
     pub(in crate::runner) fallback_ports: bool,
     pub(in crate::runner) prior_docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
 }
@@ -219,6 +220,13 @@ pub(in crate::runner) async fn start_service_worker(
         )
         .await?;
     }
+
+    context
+        .listenfd_start_barrier
+        .clone()
+        .wait()
+        .await
+        .map_err(|error| format!("listenfd handoff failed: {error}"))?;
 
     service::start_service(
         name,

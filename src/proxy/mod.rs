@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -40,6 +40,15 @@ pub enum ProxyError {
     EphemeralPort(std::io::Error),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// A lazy-start request tagged with the connection cohort that produced it.
+pub(crate) struct LazyProxyTrigger {
+    /// Service whose proxy received the connection.
+    pub(crate) service_name: String,
+    /// Failure epoch observed when the connection was accepted.
+    pub(crate) failure_epoch: u64,
+}
+
 /// A forwarding listener: don accepts on the public address and shuttles
 /// bytes to/from a backend that the service itself binds. The backend
 /// address is either ephemeral (don allocates, injects as env var) or
@@ -47,6 +56,7 @@ pub enum ProxyError {
 struct ForwardListener {
     backend: ForwardBackend,
     backend_tx: watch::Sender<Option<SocketAddr>>,
+    controller: Controller<ForwardControl>,
     accept_handle: JoinHandle<()>,
 }
 
@@ -70,8 +80,8 @@ impl ForwardBackend {
 }
 
 /// A listenfd listener: don holds the bound public listener and passes its
-/// fd to the child. If `lazy_watcher` is Some, don is watching for POLLIN
-/// so the first queued connection triggers a lazy start.
+/// fd to the child. Its controller watches POLLIN to trigger a lazy start and
+/// temporarily accepts connections only while a failed service is unavailable.
 struct ListenfdListener {
     listen_addr: SocketAddr,
     /// `std::net::TcpListener` (not tokio's) because we need `AsRawFd` and
@@ -79,7 +89,107 @@ struct ListenfdListener {
     /// Wrapped in an `Arc` so the POLLIN watcher can hold its own handle
     /// that survives across re-arms.
     listener: std::sync::Arc<std::net::TcpListener>,
-    lazy_watcher: Option<JoinHandle<()>>,
+    controller: Controller<ListenfdControl>,
+    control_handle: JoinHandle<()>,
+}
+
+/// What Don should do with connections on a forwarding listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardControl {
+    Accepting,
+    Paused,
+    Rejecting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ControllerCommand<Control> {
+    control: Control,
+    /// Incremented exactly once when a new service failure starts.
+    ///
+    /// Connections retain the epoch in which they were accepted. A later
+    /// accepting command deliberately keeps the new epoch, so connections
+    /// from the failed attempt close even if watch updates coalesce.
+    failure_epoch: u64,
+}
+
+type ControllerStatus<Control> = Result<ControllerCommand<Control>, String>;
+
+#[derive(Clone)]
+struct Controller<Control> {
+    command_tx: watch::Sender<ControllerCommand<Control>>,
+    status_rx: watch::Receiver<ControllerStatus<Control>>,
+}
+
+impl<Control> Controller<Control>
+where
+    Control: Copy + PartialEq,
+{
+    fn set(&self, control: Control) -> ControllerCommand<Control> {
+        let mut issued = *self.command_tx.borrow();
+        let _ = self.command_tx.send_if_modified(|current| {
+            issued = *current;
+            if current.control == control {
+                return false;
+            }
+            current.control = control;
+            issued = *current;
+            true
+        });
+        issued
+    }
+
+    /// Enter rejection and advance to a new failed connection cohort.
+    ///
+    /// A later attempt cannot fail until the controller first leaves rejection,
+    /// so an already-matching phase still represents the same failure.
+    fn reject(&self, control: Control) -> ControllerCommand<Control> {
+        let mut issued = *self.command_tx.borrow();
+        let _ = self.command_tx.send_if_modified(|current| {
+            issued = *current;
+            if current.control == control {
+                return false;
+            }
+            current.control = control;
+            current.failure_epoch = current.failure_epoch.saturating_add(1);
+            issued = *current;
+            true
+        });
+        issued
+    }
+
+    async fn wait_for(&mut self, command: ControllerCommand<Control>) -> Result<(), String> {
+        loop {
+            match &*self.status_rx.borrow_and_update() {
+                Ok(actual) if *actual == command => {
+                    if *self.command_tx.borrow() == command {
+                        return Ok(());
+                    }
+                    return Err("proxy controller command was superseded".to_string());
+                }
+                Err(message) => return Err(message.clone()),
+                Ok(_) => {}
+            }
+            if *self.command_tx.borrow() != command {
+                return Err("proxy controller command was superseded".to_string());
+            }
+            if self.status_rx.changed().await.is_err() {
+                return Err("proxy controller stopped unexpectedly".to_string());
+            }
+        }
+    }
+}
+
+/// What Don should do with connections queued on a listenfd listener.
+///
+/// The controller is permanent so only one [`AsyncFd`] registration exists
+/// for the blocking listener at a time. The child remains the sole acceptor
+/// while disarmed; Don accepts and closes connections only while a failed
+/// service is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenfdControl {
+    Armed,
+    Disarmed,
+    Rejecting,
 }
 
 /// Runtime metadata for one proxy listener, in configuration declaration
@@ -119,9 +229,62 @@ pub(crate) struct ServiceProxy {
     forward: Vec<ForwardListener>,
     listenfd: Vec<ListenfdListener>,
     bindings: Vec<ProxyBinding>,
-    service_name: String,
-    lazy_tx: Option<mpsc::Sender<String>>,
     active_forward_connections: Arc<AtomicUsize>,
+}
+
+/// Waits until every listenfd controller has stopped accepting and restored
+/// the inherited listener to blocking mode before a child is spawned.
+#[derive(Clone, Default)]
+pub(crate) struct ListenfdStartBarrier {
+    controllers: Vec<Controller<ListenfdControl>>,
+}
+
+impl ListenfdStartBarrier {
+    pub(crate) async fn wait(mut self) -> Result<(), String> {
+        for controller in &mut self.controllers {
+            let command = *controller.command_tx.borrow();
+            if command.control != ListenfdControl::Disarmed {
+                return Err("listenfd proxy was not prepared for child handoff".to_string());
+            }
+            controller.wait_for(command).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Exact controller commands awaited across a detached runner operation.
+///
+/// This preserves ownership of an acknowledgement: a superseding phase or
+/// failure epoch makes the wait fail instead of satisfying stale work.
+pub(crate) struct LazyProxyBarrier {
+    forward: Vec<(
+        Controller<ForwardControl>,
+        ControllerCommand<ForwardControl>,
+    )>,
+    listenfd: Vec<(
+        Controller<ListenfdControl>,
+        ControllerCommand<ListenfdControl>,
+    )>,
+}
+
+impl LazyProxyBarrier {
+    /// Wait for every controller to acknowledge its exact requested phase.
+    pub(crate) async fn wait(self) -> Result<(), String> {
+        wait_for_controllers(self.forward).await?;
+        wait_for_controllers(self.listenfd).await
+    }
+}
+
+async fn wait_for_controllers<Control>(
+    controllers: Vec<(Controller<Control>, ControllerCommand<Control>)>,
+) -> Result<(), String>
+where
+    Control: Copy + PartialEq,
+{
+    for (mut controller, command) in controllers {
+        controller.wait_for(command).await?;
+    }
+    Ok(())
 }
 
 enum PendingListener {
@@ -149,6 +312,16 @@ struct ProxyConnectionAccounting {
     service_active_connections: Arc<AtomicUsize>,
 }
 
+struct ForwardControllerConfig {
+    backend_rx: watch::Receiver<Option<SocketAddr>>,
+    control_rx: watch::Receiver<ControllerCommand<ForwardControl>>,
+    status_tx: watch::Sender<ControllerStatus<ForwardControl>>,
+    initial_command: ControllerCommand<ForwardControl>,
+    lazy_tx: Option<mpsc::Sender<LazyProxyTrigger>>,
+    service_name: String,
+    emitter: crate::output::LifecycleEmitter,
+}
+
 impl ServiceProxy {
     /// Bind proxy listeners for a service's proxy entries.
     ///
@@ -163,7 +336,7 @@ impl ServiceProxy {
     pub(crate) async fn bind(
         entries: &[ProxyEntry],
         fallback_ports: bool,
-        lazy_tx: Option<mpsc::Sender<String>>,
+        lazy_tx: Option<mpsc::Sender<LazyProxyTrigger>>,
         service_name: &str,
         emitter: crate::output::LifecycleEmitter,
     ) -> Result<Self, ProxyError> {
@@ -232,8 +405,9 @@ impl ServiceProxy {
                 ProxyMode::Listenfd => {
                     // `std::net::TcpListener` gives us stable fd semantics for
                     // the LISTEN_FDS handoff. It deliberately remains blocking:
-                    // O_NONBLOCK is shared across dup/dup2 and would otherwise
-                    // change the child's fd too.
+                    // O_NONBLOCK is shared across dup/dup2, so the controller
+                    // restores blocking mode and acknowledges the handoff
+                    // before a child can inherit the fd.
                     let bound =
                         bind_std_listener(configured_addr, fallback_ports).map_err(|source| {
                             ProxyError::Bind {
@@ -265,17 +439,33 @@ impl ServiceProxy {
             match listener {
                 PendingListener::Forward { listener, backend } => {
                     let (backend_tx, backend_rx) = watch::channel(None);
+                    let initial_command = ControllerCommand {
+                        control: ForwardControl::Accepting,
+                        failure_epoch: 0,
+                    };
+                    let (control_tx, control_rx) = watch::channel(initial_command);
+                    let (status_tx, status_rx) = watch::channel(Ok(initial_command));
+                    let controller = Controller {
+                        command_tx: control_tx,
+                        status_rx,
+                    };
                     let accept_handle = tokio::spawn(proxy_accept_loop(
                         listener,
-                        backend_rx,
-                        lazy_tx.clone(),
-                        service_name.to_string(),
-                        emitter.clone(),
+                        ForwardControllerConfig {
+                            backend_rx,
+                            control_rx,
+                            status_tx,
+                            initial_command,
+                            lazy_tx: lazy_tx.clone(),
+                            service_name: service_name.to_string(),
+                            emitter: emitter.clone(),
+                        },
                         active_forward_connections.clone(),
                     ));
                     forward.push(ForwardListener {
                         backend,
                         backend_tx,
+                        controller,
                         accept_handle,
                     });
                 }
@@ -284,17 +474,35 @@ impl ServiceProxy {
                     listen_addr,
                 } => {
                     let listener = std::sync::Arc::new(listener);
-                    let lazy_watcher = lazy_tx.as_ref().map(|tx| {
-                        spawn_listenfd_watcher(
-                            listener.clone(),
-                            tx.clone(),
-                            service_name.to_string(),
-                        )
-                    });
+                    let initial_control = if lazy_tx.is_some() {
+                        ListenfdControl::Armed
+                    } else {
+                        ListenfdControl::Disarmed
+                    };
+                    let initial_command = ControllerCommand {
+                        control: initial_control,
+                        failure_epoch: 0,
+                    };
+                    let (control_tx, control_rx) = watch::channel(initial_command);
+                    let (status_tx, status_rx) = watch::channel(Ok(initial_command));
+                    let controller = Controller {
+                        command_tx: control_tx.clone(),
+                        status_rx,
+                    };
+                    let control_handle = spawn_listenfd_controller(
+                        listener.clone(),
+                        control_rx,
+                        status_tx,
+                        initial_command,
+                        lazy_tx.clone(),
+                        service_name.to_string(),
+                        emitter.clone(),
+                    );
                     listenfd.push(ListenfdListener {
                         listen_addr,
                         listener,
-                        lazy_watcher,
+                        controller,
+                        control_handle,
                     });
                 }
             }
@@ -304,8 +512,6 @@ impl ServiceProxy {
             forward,
             listenfd,
             bindings,
-            service_name: service_name.to_string(),
-            lazy_tx,
             active_forward_connections,
         })
     }
@@ -324,6 +530,97 @@ impl ServiceProxy {
     pub(crate) fn clear_backend(&self) {
         for fwd in &self.forward {
             let _ = fwd.backend_tx.send(None);
+        }
+    }
+
+    /// Apply the runner-owned proxy phase for a lazy service state.
+    pub(crate) fn set_connection_state(&self, rejecting: bool, armed: bool) {
+        for listener in &self.forward {
+            if rejecting {
+                listener.controller.reject(ForwardControl::Rejecting);
+            } else {
+                listener.controller.set(ForwardControl::Accepting);
+            }
+        }
+        for listener in &self.listenfd {
+            if rejecting {
+                listener.controller.reject(ListenfdControl::Rejecting);
+            } else if armed {
+                listener.controller.set(ListenfdControl::Armed);
+            } else {
+                listener.controller.set(ListenfdControl::Disarmed);
+            }
+        }
+    }
+
+    /// Enter durable rejection and return its exact acknowledgement barrier.
+    pub(crate) fn begin_lazy_failure_recovery(&mut self) -> LazyProxyBarrier {
+        let forward = self
+            .forward
+            .iter()
+            .map(|listener| {
+                let controller = listener.controller.clone();
+                let command = controller.reject(ForwardControl::Rejecting);
+                (controller, command)
+            })
+            .collect();
+        let listenfd = self
+            .listenfd
+            .iter()
+            .map(|listener| {
+                let controller = listener.controller.clone();
+                let command = controller.reject(ListenfdControl::Rejecting);
+                (controller, command)
+            })
+            .collect();
+        LazyProxyBarrier { forward, listenfd }
+    }
+
+    /// Drain every failed backlog into a non-triggering prepared phase.
+    pub(crate) fn begin_lazy_rearm(&self) -> LazyProxyBarrier {
+        let forward = self
+            .forward
+            .iter()
+            .map(|listener| {
+                let controller = listener.controller.clone();
+                let command = controller.set(ForwardControl::Paused);
+                (controller, command)
+            })
+            .collect();
+        let listenfd = self
+            .listenfd
+            .iter()
+            .map(|listener| {
+                let controller = listener.controller.clone();
+                let command = controller.set(ListenfdControl::Disarmed);
+                (controller, command)
+            })
+            .collect();
+        LazyProxyBarrier { forward, listenfd }
+    }
+
+    /// Whether every listener is enabled for the trigger's connection cohort.
+    pub(crate) fn accepts_lazy_trigger(&self, failure_epoch: u64) -> bool {
+        (!self.forward.is_empty() || !self.listenfd.is_empty())
+            && self.forward.iter().all(|listener| {
+                let command = listener.controller.command_tx.borrow();
+                command.control == ForwardControl::Accepting
+                    && command.failure_epoch == failure_epoch
+            })
+            && self.listenfd.iter().all(|listener| {
+                let command = listener.controller.command_tx.borrow();
+                command.control == ListenfdControl::Armed && command.failure_epoch == failure_epoch
+            })
+    }
+
+    /// Barrier used by start workers before inheriting listenfd descriptors.
+    pub(crate) fn listenfd_start_barrier(&self) -> ListenfdStartBarrier {
+        ListenfdStartBarrier {
+            controllers: self
+                .listenfd
+                .iter()
+                .map(|listener| listener.controller.clone())
+                .collect(),
         }
     }
 
@@ -514,36 +811,14 @@ impl ServiceProxy {
         Some(self.active_forward_connections.load(Ordering::Relaxed))
     }
 
-    /// Re-arm lazy POLLIN watchers for listenfd entries. Called after the
-    /// service stops and re-enters the `Lazy` state so the next queued
-    /// connection triggers another start cycle. No-op if the service isn't
-    /// lazy (no `lazy_tx`) or if a watcher is already armed.
-    pub(crate) fn rearm_lazy_watchers(&mut self) {
-        let Some(tx) = self.lazy_tx.clone() else {
-            return;
-        };
-        for l in &mut self.listenfd {
-            if l.lazy_watcher.as_ref().is_some_and(|h| !h.is_finished()) {
-                continue;
-            }
-            l.lazy_watcher = Some(spawn_listenfd_watcher(
-                l.listener.clone(),
-                tx.clone(),
-                self.service_name.clone(),
-            ));
-        }
-    }
-
-    /// Shut down all proxy work — abort forwarding accept loops and any
-    /// lazy POLLIN watchers.
+    /// Shut down all proxy work — abort forwarding accept loops and listenfd
+    /// controllers.
     pub(crate) fn shutdown(&self) {
         for fwd in &self.forward {
             fwd.accept_handle.abort();
         }
         for l in &self.listenfd {
-            if let Some(ref h) = l.lazy_watcher {
-                h.abort();
-            }
+            l.control_handle.abort();
         }
     }
 }
@@ -627,48 +902,193 @@ fn sanitize_env_suffix(name: &str) -> String {
         .collect()
 }
 
-/// Spawn a watcher that waits for POLLIN readability on `listener` (i.e.
-/// a queued connection) and sends `service_name` on `lazy_tx`. The watcher
-/// does not `accept` — the child will do that once it inherits the fd.
+/// Spawn the permanent controller for a listenfd listener.
 ///
-/// `AsyncFd::readable()` can return false positives per tokio's docs
-/// ("the function may complete without the file descriptor being ready"),
-/// typically from spurious epoll wakeups or from edge-triggered state
-/// transitions on sibling events. For a listening socket, false positives
-/// would trigger lazy starts with no real client behind them.
-///
-/// To verify, after `readable()` fires we re-check POLLIN using level-
-/// triggered `poll(2)` with zero timeout — that returns `POLLIN` iff the
-/// accept queue is *currently* non-empty. If empty, we call `clear_ready()`
-/// and wait again; only a confirmed pending connection triggers `lazy_tx`.
-///
-/// Does not `accept` — the kernel's accept queue entry is preserved so the
-/// child's first `accept` consumes the queued connection.
-fn spawn_listenfd_watcher(
+/// In `Armed` mode it observes POLLIN without accepting and triggers lazy
+/// startup. In `Disarmed` mode it leaves the listener entirely to the child.
+/// In `Rejecting` mode the child is terminally unavailable, so it accepts and
+/// closes every queued connection until the runner begins a recovery. When the
+/// desired mode leaves `Rejecting`, the controller drains to an empty accept
+/// queue and restores blocking mode before acknowledging the target mode.
+fn spawn_listenfd_controller(
     listener: std::sync::Arc<std::net::TcpListener>,
-    lazy_tx: mpsc::Sender<String>,
+    mut control_rx: watch::Receiver<ControllerCommand<ListenfdControl>>,
+    status_tx: watch::Sender<ControllerStatus<ListenfdControl>>,
+    initial_command: ControllerCommand<ListenfdControl>,
+    lazy_tx: Option<mpsc::Sender<LazyProxyTrigger>>,
     service_name: String,
+    emitter: crate::output::LifecycleEmitter,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let raw_fd = listener.as_raw_fd();
-        let Ok(async_fd) = AsyncFd::new(listener) else {
-            return;
-        };
-        loop {
-            let mut guard = match async_fd.readable().await {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            // Level-triggered verification: `poll(2)` returns the fd's
-            // current state, not a cached wakeup. POLLIN on a listening
-            // socket means the accept queue has at least one entry.
-            if has_pending_connection(raw_fd) {
-                let _ = lazy_tx.try_send(service_name);
-                return;
-            }
-            guard.clear_ready();
+        if let Err(message) = run_listenfd_controller(
+            listener,
+            &mut control_rx,
+            &status_tx,
+            initial_command,
+            lazy_tx,
+            &service_name,
+        )
+        .await
+        {
+            emitter.service_error_event(&service_name, &message);
+            let _ = status_tx.send_replace(Err(message));
         }
     })
+}
+
+async fn run_listenfd_controller(
+    listener: std::sync::Arc<std::net::TcpListener>,
+    control_rx: &mut watch::Receiver<ControllerCommand<ListenfdControl>>,
+    status_tx: &watch::Sender<ControllerStatus<ListenfdControl>>,
+    initial_command: ControllerCommand<ListenfdControl>,
+    lazy_tx: Option<mpsc::Sender<LazyProxyTrigger>>,
+    service_name: &str,
+) -> Result<(), String> {
+    let raw_fd = listener.as_raw_fd();
+    let async_fd = AsyncFd::new(listener)
+        .map_err(|error| format!("failed to register listenfd proxy: {error}"))?;
+    let mut applied = initial_command;
+    let mut nonblocking = false;
+    loop {
+        let desired = *control_rx.borrow_and_update();
+        let needs_drain = desired.control != ListenfdControl::Rejecting
+            && (applied.control == ListenfdControl::Rejecting
+                || desired.failure_epoch > applied.failure_epoch);
+        if needs_drain {
+            if !nonblocking {
+                async_fd
+                    .get_ref()
+                    .set_nonblocking(true)
+                    .map_err(|error| format!("failed to change listenfd proxy mode: {error}"))?;
+                nonblocking = true;
+            }
+            match drain_pending_batch(raw_fd, control_rx, desired) {
+                Ok(true) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Ok(false) if *control_rx.borrow() != desired => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(format!("failed to drain listenfd connections: {error}"));
+                }
+            }
+        }
+
+        let should_be_nonblocking = desired.control == ListenfdControl::Rejecting;
+        if should_be_nonblocking != nonblocking {
+            async_fd
+                .get_ref()
+                .set_nonblocking(should_be_nonblocking)
+                .map_err(|error| format!("failed to change listenfd proxy mode: {error}"))?;
+            nonblocking = should_be_nonblocking;
+        }
+        applied = desired;
+        let _ = status_tx.send_replace(Ok(applied));
+
+        match applied.control {
+            ListenfdControl::Armed => {
+                let Some(tx) = lazy_tx.as_ref() else {
+                    if control_rx.changed().await.is_err() {
+                        return Ok(());
+                    }
+                    continue;
+                };
+                tokio::select! {
+                    ready = async_fd.readable() => {
+                        let mut guard = match ready {
+                            Ok(guard) => guard,
+                            Err(_) => return Ok(()),
+                        };
+                        // AsyncFd readiness can be a false positive. A
+                        // level-triggered poll confirms that the accept
+                        // queue is non-empty without consuming it.
+                        if has_pending_connection(raw_fd)
+                            && *control_rx.borrow() == applied
+                        {
+                            tokio::select! {
+                                    result = tx.send(LazyProxyTrigger {
+                                        service_name: service_name.to_string(),
+                                        failure_epoch: applied.failure_epoch,
+                                    }) => {
+                                        if result.is_err() {
+                                            return Ok(());
+                                        }
+                                        if control_rx.changed().await.is_err() {
+                                            return Ok(());
+                                        }
+                                    }
+                                changed = control_rx.changed() => {
+                                    if changed.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        } else {
+                            guard.clear_ready();
+                        }
+                    }
+                    changed = control_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            ListenfdControl::Disarmed => {
+                if control_rx.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
+            ListenfdControl::Rejecting => {
+                tokio::select! {
+                    ready = async_fd.readable() => {
+                        let mut guard = match ready {
+                            Ok(guard) => guard,
+                            Err(_) => return Ok(()),
+                        };
+                        drain_pending_batch(raw_fd, control_rx, applied).map_err(
+                            |error| format!("failed to reject listenfd connection: {error}"),
+                        )?;
+                        if !has_pending_connection(raw_fd) {
+                            guard.clear_ready();
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    changed = control_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+const MAX_REJECT_DRAIN_BATCH: usize = 64;
+
+/// Drain a bounded batch while the requested controller mode is unchanged.
+///
+/// Returns `true` when the batch limit was reached and more work may remain,
+/// or `false` once `accept` reports that the kernel queue is empty.
+fn drain_pending_batch<Control>(
+    fd: RawFd,
+    control_rx: &watch::Receiver<ControllerCommand<Control>>,
+    expected: ControllerCommand<Control>,
+) -> Result<bool, std::io::Error>
+where
+    Control: Copy + PartialEq,
+{
+    for _ in 0..MAX_REJECT_DRAIN_BATCH {
+        if *control_rx.borrow() != expected {
+            return Ok(false);
+        }
+        if !close_pending_nonblocking(fd)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Non-blocking check for a queued connection on a listening fd.
@@ -712,10 +1132,7 @@ async fn allocate_ephemeral_port() -> Result<SocketAddr, ProxyError> {
 /// waits for a backend to be available, then spawns per-connection forwarding.
 async fn proxy_accept_loop(
     listener: TcpListener,
-    backend_rx: watch::Receiver<Option<SocketAddr>>,
-    lazy_tx: Option<mpsc::Sender<String>>,
-    service_name: String,
-    emitter: crate::output::LifecycleEmitter,
+    config: ForwardControllerConfig,
     active_connections: Arc<AtomicUsize>,
 ) {
     let connection_pool = proxy_connection_pool();
@@ -725,110 +1142,279 @@ async fn proxy_accept_loop(
         global_active_connections: connection_pool.active_connections,
         service_active_connections: active_connections,
     };
-    proxy_accept_loop_with_permits(
-        listener,
-        backend_rx,
-        lazy_tx,
-        service_name,
-        emitter,
-        accounting,
-    )
-    .await;
+    proxy_accept_loop_with_permits(listener, config, accounting).await;
 }
 
 async fn proxy_accept_loop_with_permits(
     listener: TcpListener,
-    backend_rx: watch::Receiver<Option<SocketAddr>>,
-    lazy_tx: Option<mpsc::Sender<String>>,
-    service_name: String,
-    emitter: crate::output::LifecycleEmitter,
+    config: ForwardControllerConfig,
     accounting: ProxyConnectionAccounting,
 ) {
+    let ForwardControllerConfig {
+        backend_rx,
+        mut control_rx,
+        status_tx,
+        initial_command,
+        lazy_tx,
+        service_name,
+        emitter,
+    } = config;
     let mut consecutive_errors: u32 = 0;
     let mut connection_limit_reported = false;
     let listen_addr = listener
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
+    let mut applied = initial_command;
     loop {
-        let (client, _peer) = match listener.accept().await {
-            Ok(conn) => {
-                consecutive_errors = 0;
-                conn
-            }
-            Err(e) => {
-                consecutive_errors += 1;
-                // Back off on repeated errors to avoid busy-spinning.
-                // First few errors get a short delay; persistent errors
-                // get longer pauses.
-                let delay =
-                    std::time::Duration::from_millis((10 * consecutive_errors.min(100)) as u64);
-                emitter.lifecycle_event(&format!(
-                    "{service_name}: proxy {listen_addr} accept error: {e} (backoff {delay:?})"
-                ));
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-        };
-
-        let connection_guard = match accounting.permits.clone().try_acquire_owned() {
-            Ok(permit) => {
-                connection_limit_reported = false;
-                ProxyConnectionGuard::new(
-                    permit,
-                    accounting.service_active_connections.clone(),
-                    emitter.clone(),
-                    service_name.clone(),
-                    listen_addr.clone(),
-                    accounting.max_connections,
-                    accounting.global_active_connections.clone(),
-                )
-            }
-            Err(TryAcquireError::NoPermits) => {
-                if !connection_limit_reported {
-                    connection_limit_reported = true;
-                    let max_connections = accounting.max_connections;
+        let desired = *control_rx.borrow_and_update();
+        let needs_drain = desired.control != ForwardControl::Rejecting
+            && (applied.control == ForwardControl::Rejecting
+                || desired.failure_epoch > applied.failure_epoch);
+        if needs_drain {
+            match drain_pending_batch(listener.as_raw_fd(), &control_rx, desired) {
+                Ok(true) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Ok(false) if *control_rx.borrow() != desired => continue,
+                Ok(false) => {}
+                Err(error) => {
                     let message = format!(
-                        "{service_name}: proxy {listen_addr} connection limit reached; closing new connections ({max_connections}/{max_connections} active)"
+                        "{service_name}: failed to drain forward proxy {listen_addr}: {error}"
                     );
                     emitter.lifecycle_event(&message);
-                }
-                let max_connections = accounting.max_connections;
-                emitter.service_debug_event(
-                    &service_name,
-                    &format!(
-                        "proxy {listen_addr} closed overflow connection ({max_connections}/{max_connections} active)"
-                    ),
-                );
-                drop(client);
-                continue;
-            }
-            Err(TryAcquireError::Closed) => return,
-        };
-
-        // Trigger lazy start if configured. The runner checks service state
-        // before acting, so duplicate sends are harmless. We use try_send to
-        // avoid blocking — if the channel is full, a trigger is already queued.
-        if let Some(ref tx) = lazy_tx {
-            let _ = tx.try_send(service_name.clone());
-        }
-
-        // Wait for a backend address to become available.
-        let backend_addr = {
-            let mut rx = backend_rx.clone();
-            loop {
-                if let Some(addr) = *rx.borrow() {
-                    break addr;
-                }
-                if rx.changed().await.is_err() {
-                    // Channel closed — shutting down.
+                    let _ = status_tx.send_replace(Err(message));
                     return;
                 }
             }
-        };
+        }
+        applied = desired;
+        let _ = status_tx.send_replace(Ok(applied));
+        match applied.control {
+            ForwardControl::Accepting => {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => Some(accepted),
+                    changed = control_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        None
+                    }
+                };
+                let Some(accepted) = accepted else {
+                    continue;
+                };
+                let (client, _peer) = match accepted {
+                    Ok(connection) => {
+                        consecutive_errors = 0;
+                        connection
+                    }
+                    Err(error) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        let delay = std::time::Duration::from_millis(
+                            (10 * consecutive_errors.min(100)) as u64,
+                        );
+                        emitter.lifecycle_event(&format!(
+                            "{service_name}: proxy {listen_addr} accept error: {error} (backoff {delay:?})"
+                        ));
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {}
+                            changed = control_rx.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
 
-        // Spawn a forwarding task for this connection.
-        tokio::spawn(proxy_connection(client, backend_addr, connection_guard));
+                let connection_guard = match accounting.permits.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        connection_limit_reported = false;
+                        ProxyConnectionGuard::new(
+                            permit,
+                            accounting.service_active_connections.clone(),
+                            emitter.clone(),
+                            service_name.clone(),
+                            listen_addr.clone(),
+                            accounting.max_connections,
+                            accounting.global_active_connections.clone(),
+                        )
+                    }
+                    Err(TryAcquireError::NoPermits) => {
+                        if !connection_limit_reported {
+                            connection_limit_reported = true;
+                            let max_connections = accounting.max_connections;
+                            emitter.lifecycle_event(&format!(
+                                "{service_name}: proxy {listen_addr} connection limit reached; \
+                                 closing new connections ({max_connections}/{max_connections} active)"
+                            ));
+                        }
+                        let max_connections = accounting.max_connections;
+                        emitter.service_debug_event(
+                            &service_name,
+                            &format!(
+                                "proxy {listen_addr} closed overflow connection \
+                                 ({max_connections}/{max_connections} active)"
+                            ),
+                        );
+                        drop(client);
+                        continue;
+                    }
+                    Err(TryAcquireError::Closed) => return,
+                };
+
+                tokio::spawn(handle_forward_client(
+                    client,
+                    backend_rx.clone(),
+                    control_rx.clone(),
+                    applied.failure_epoch,
+                    lazy_tx.clone(),
+                    service_name.clone(),
+                    connection_guard,
+                ));
+            }
+            ForwardControl::Rejecting => {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        match accepted {
+                            Ok((client, _)) => drop(client),
+                            Err(error) => {
+                                emitter.lifecycle_event(&format!(
+                                    "{service_name}: proxy {listen_addr} reject accept error: {error}"
+                                ));
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                    changed = control_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            ForwardControl::Paused => {
+                if control_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn close_pending_nonblocking(fd: RawFd) -> Result<bool, std::io::Error> {
+    loop {
+        // Safety: `fd` is a live nonblocking listening socket owned by the
+        // forwarding controller. Null address pointers omit peer metadata.
+        let accepted = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if accepted >= 0 {
+            // Safety: accept returned a new owned descriptor. OwnedFd closes
+            // it exactly once at the end of this scope.
+            let _accepted = unsafe { OwnedFd::from_raw_fd(accepted) };
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
+        if is_retryable_accept_error(&error) {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+/// Errors tied to one queued peer do not invalidate the listening socket.
+///
+/// POSIX explicitly allows these network/protocol errors to surface from
+/// `accept`; BSD-derived stacks commonly report `ECONNABORTED` when a peer
+/// disconnects before Don drains it.
+fn is_retryable_accept_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+    ) {
+        return true;
+    }
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EPROTO | libc::ENOPROTOOPT | libc::EHOSTDOWN | libc::EOPNOTSUPP)
+    )
+}
+
+async fn handle_forward_client(
+    mut client: TcpStream,
+    backend_rx: watch::Receiver<Option<SocketAddr>>,
+    mut control_rx: watch::Receiver<ControllerCommand<ForwardControl>>,
+    accepted_failure_epoch: u64,
+    lazy_tx: Option<mpsc::Sender<LazyProxyTrigger>>,
+    service_name: String,
+    connection_guard: ProxyConnectionGuard,
+) {
+    if !forward_command_accepts(&control_rx.borrow(), accepted_failure_epoch) {
+        let _ = client.shutdown().await;
+        return;
+    }
+    if let Some(tx) = lazy_tx {
+        let triggered = tokio::select! {
+            result = tx.send(LazyProxyTrigger {
+                service_name,
+                failure_epoch: accepted_failure_epoch,
+            }) => result.is_ok(),
+            () = wait_for_forward_rejection(&mut control_rx, accepted_failure_epoch) => false,
+        };
+        if !triggered {
+            let _ = client.shutdown().await;
+            return;
+        }
+    }
+
+    let Some(backend_addr) =
+        wait_for_backend_or_rejection(backend_rx, &mut control_rx, accepted_failure_epoch).await
+    else {
+        let _ = client.shutdown().await;
+        return;
+    };
+    proxy_connection(
+        client,
+        backend_addr,
+        control_rx,
+        accepted_failure_epoch,
+        connection_guard,
+    )
+    .await;
+}
+
+/// Wait until forwarding can begin, unless the runner reports a terminal
+/// service failure first.
+async fn wait_for_backend_or_rejection(
+    mut backend_rx: watch::Receiver<Option<SocketAddr>>,
+    control_rx: &mut watch::Receiver<ControllerCommand<ForwardControl>>,
+    accepted_failure_epoch: u64,
+) -> Option<SocketAddr> {
+    loop {
+        if !forward_command_accepts(&control_rx.borrow(), accepted_failure_epoch) {
+            return None;
+        }
+        if let Some(addr) = *backend_rx.borrow() {
+            return Some(addr);
+        }
+        tokio::select! {
+            changed = backend_rx.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+            }
+            () = wait_for_forward_rejection(control_rx, accepted_failure_epoch) => return None,
+        }
     }
 }
 
@@ -894,13 +1480,22 @@ impl Drop for ProxyConnectionGuard {
 async fn proxy_connection(
     mut client: TcpStream,
     backend_addr: SocketAddr,
+    mut control_rx: watch::Receiver<ControllerCommand<ForwardControl>>,
+    accepted_failure_epoch: u64,
     _connection_guard: ProxyConnectionGuard,
 ) {
     let backend_candidates = backend_connect_candidates(backend_addr);
     let mut backend = None;
     for attempt in 0..20u32 {
         for candidate in &backend_candidates {
-            match TcpStream::connect(candidate).await {
+            let result = tokio::select! {
+                result = TcpStream::connect(candidate) => result,
+                () = wait_for_forward_rejection(&mut control_rx, accepted_failure_epoch) => {
+                    let _ = client.shutdown().await;
+                    return;
+                }
+            };
+            match result {
                 Ok(stream) => {
                     backend = Some(stream);
                     break;
@@ -915,7 +1510,13 @@ async fn proxy_connection(
 
         // Exponential backoff: 10ms, 20ms, 40ms, ... capped at 500ms.
         let delay = std::time::Duration::from_millis((10 * (1 << attempt.min(6))).min(500));
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = wait_for_forward_rejection(&mut control_rx, accepted_failure_epoch) => {
+                let _ = client.shutdown().await;
+                return;
+            }
+        }
     }
 
     let Some(mut backend) = backend else {
@@ -924,8 +1525,38 @@ async fn proxy_connection(
         return;
     };
 
-    // Shovel bytes in both directions until either side closes.
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+    // Shovel bytes in both directions until either side closes. A terminal
+    // runner failure also closes the client promptly even if the backend
+    // socket has not observed the process exit yet.
+    let rejected = tokio::select! {
+        _ = tokio::io::copy_bidirectional(&mut client, &mut backend) => false,
+        () = wait_for_forward_rejection(&mut control_rx, accepted_failure_epoch) => true,
+    };
+    if rejected {
+        let _ = client.shutdown().await;
+        let _ = backend.shutdown().await;
+    }
+}
+
+fn forward_command_accepts(
+    command: &ControllerCommand<ForwardControl>,
+    accepted_failure_epoch: u64,
+) -> bool {
+    command.control == ForwardControl::Accepting && command.failure_epoch == accepted_failure_epoch
+}
+
+async fn wait_for_forward_rejection(
+    control_rx: &mut watch::Receiver<ControllerCommand<ForwardControl>>,
+    accepted_failure_epoch: u64,
+) {
+    loop {
+        if !forward_command_accepts(&control_rx.borrow(), accepted_failure_epoch) {
+            return;
+        }
+        if control_rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -996,19 +1627,23 @@ fn backend_connect_candidates(backend_addr: SocketAddr) -> Vec<SocketAddr> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::os::fd::AsRawFd;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use tokio::io::AsyncReadExt;
     use tokio::sync::{Semaphore, mpsc, watch};
 
     use crate::config::{LogConfig, ProxyEntry, ProxyMode};
     use crate::output::{LifecycleEmitter, OutputManager};
 
     use super::{
-        DEFAULT_PROXY_CONNECTION_LIMIT, MIN_PROXY_CONNECTION_LIMIT, PROXY_FD_RESERVE, ProxyBinding,
-        ProxyBindingMode, ProxyConnectionAccounting, ProxyError, ServiceProxy,
-        backend_connect_candidates, proxy_accept_loop_with_permits,
-        proxy_connection_limit_for_soft_nofile,
+        Controller, ControllerCommand, DEFAULT_PROXY_CONNECTION_LIMIT, ForwardControl,
+        ForwardControllerConfig, ListenfdControl, ListenfdStartBarrier, MIN_PROXY_CONNECTION_LIMIT,
+        PROXY_FD_RESERVE, ProxyBinding, ProxyBindingMode, ProxyConnectionAccounting, ProxyError,
+        ServiceProxy, backend_connect_candidates, is_retryable_accept_error,
+        proxy_accept_loop_with_permits, proxy_connection_limit_for_soft_nofile,
+        spawn_listenfd_controller, wait_for_forward_rejection,
     };
 
     #[tokio::test]
@@ -1368,11 +2003,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn accept_error_retry_classification_table() {
+        struct Case {
+            name: &'static str,
+            errno: i32,
+            retryable: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "peer aborted before accept",
+                errno: libc::ECONNABORTED,
+                retryable: true,
+            },
+            Case {
+                name: "protocol error belongs to queued peer",
+                errno: libc::EPROTO,
+                retryable: true,
+            },
+            Case {
+                name: "listener descriptor failure is fatal",
+                errno: libc::EBADF,
+                retryable: false,
+            },
+        ];
+
+        for case in cases {
+            let error = std::io::Error::from_raw_os_error(case.errno);
+            assert_eq!(
+                is_retryable_accept_error(&error),
+                case.retryable,
+                "case '{}'",
+                case.name,
+            );
+        }
+    }
+
     #[tokio::test]
     async fn proxy_accept_loop_does_not_reserve_permits_while_idle() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
         let (_backend_tx, backend_rx) = watch::channel(None);
+        let initial_command = ControllerCommand {
+            control: ForwardControl::Accepting,
+            failure_epoch: 0,
+        };
+        let (control_tx, control_rx) = watch::channel(initial_command);
+        let (status_tx, _status_rx) = watch::channel(Ok(initial_command));
         let (lazy_tx, mut lazy_rx) = mpsc::channel(1);
         let permits = Arc::new(Semaphore::new(1));
         let global_active_connections = Arc::new(AtomicUsize::new(0));
@@ -1387,10 +2065,15 @@ mod tests {
 
         let handle = tokio::spawn(proxy_accept_loop_with_permits(
             listener,
-            backend_rx,
-            Some(lazy_tx),
-            "svc".to_string(),
-            emitter,
+            ForwardControllerConfig {
+                backend_rx,
+                control_rx,
+                status_tx,
+                initial_command,
+                lazy_tx: Some(lazy_tx),
+                service_name: "svc".to_string(),
+                emitter,
+            },
             accounting,
         ));
 
@@ -1415,7 +2098,12 @@ mod tests {
         let triggered = tokio::time::timeout(std::time::Duration::from_secs(1), lazy_rx.recv())
             .await
             .unwrap();
-        assert_eq!(triggered.as_deref(), Some("svc"));
+        assert_eq!(
+            triggered
+                .as_ref()
+                .map(|trigger| trigger.service_name.as_str()),
+            Some("svc")
+        );
         assert_eq!(
             active_connections.load(Ordering::Relaxed),
             1,
@@ -1427,6 +2115,7 @@ mod tests {
             "accepted connections should count against the global pool"
         );
 
+        drop(control_tx);
         handle.abort();
         let _ = handle.await;
         assert_eq!(
@@ -1439,6 +2128,279 @@ mod tests {
             0,
             "abandoned connections should release global active counts"
         );
+    }
+
+    #[tokio::test]
+    async fn listenfd_start_barrier_ignores_stale_disarmed_status() {
+        let desired = ControllerCommand {
+            control: ListenfdControl::Disarmed,
+            failure_epoch: 2,
+        };
+        let (control_tx, _control_rx) = watch::channel(desired);
+        let (status_tx, status_rx) = watch::channel(Ok(ControllerCommand {
+            control: ListenfdControl::Disarmed,
+            failure_epoch: 0,
+        }));
+        let barrier = ListenfdStartBarrier {
+            controllers: vec![super::Controller {
+                command_tx: control_tx,
+                status_rx,
+            }],
+        };
+        let mut waiter = tokio::spawn(barrier.wait());
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "a stale Disarmed acknowledgement must not release the start"
+        );
+        let _ = status_tx.send_replace(Ok(ControllerCommand {
+            control: ListenfdControl::Disarmed,
+            failure_epoch: 2,
+        }));
+        assert!(waiter.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn lazy_rearm_prepares_all_controllers_before_global_enable() {
+        let entries = vec![
+            ProxyEntry {
+                listen: "127.0.0.1:0".to_string(),
+                mode: ProxyMode::Env("PORT".to_string()),
+            },
+            ProxyEntry {
+                listen: "127.0.0.1:0".to_string(),
+                mode: ProxyMode::Listenfd,
+            },
+        ];
+        let (lazy_tx, mut lazy_rx) = mpsc::channel(8);
+        let mut proxy = ServiceProxy::bind(
+            &entries,
+            false,
+            Some(lazy_tx),
+            "svc",
+            test_lifecycle_emitter().await,
+        )
+        .await
+        .unwrap();
+
+        proxy.begin_lazy_failure_recovery().wait().await.unwrap();
+        proxy.begin_lazy_rearm().wait().await.unwrap();
+        let mut clients = Vec::new();
+        for addr in proxy.listen_addrs() {
+            clients.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), lazy_rx.recv())
+                .await
+                .is_err(),
+            "prepared controllers must not trigger before global enable"
+        );
+
+        proxy.set_connection_state(false, true);
+        for _ in 0..entries.len() {
+            let triggered = tokio::time::timeout(std::time::Duration::from_secs(1), lazy_rx.recv())
+                .await
+                .unwrap();
+            assert_eq!(
+                triggered
+                    .as_ref()
+                    .map(|trigger| trigger.service_name.as_str()),
+                Some("svc")
+            );
+        }
+        drop(clients);
+    }
+
+    #[tokio::test]
+    async fn forward_connection_observes_coalesced_failure_epoch() {
+        let initial = ControllerCommand {
+            control: ForwardControl::Accepting,
+            failure_epoch: 0,
+        };
+        let (control_tx, mut control_rx) = watch::channel(initial);
+        control_tx.send_replace(ControllerCommand {
+            control: ForwardControl::Rejecting,
+            failure_epoch: 1,
+        });
+        control_tx.send_replace(ControllerCommand {
+            control: ForwardControl::Accepting,
+            failure_epoch: 1,
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            wait_for_forward_rejection(&mut control_rx, initial.failure_epoch),
+        )
+        .await
+        .expect("the failed connection epoch should close immediately");
+    }
+
+    #[tokio::test]
+    async fn forward_actor_drains_backlog_after_coalesced_failure_epoch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let initial = ControllerCommand {
+            control: ForwardControl::Accepting,
+            failure_epoch: 0,
+        };
+        let final_command = ControllerCommand {
+            control: ForwardControl::Accepting,
+            failure_epoch: 1,
+        };
+        let (control_tx, control_rx) = watch::channel(initial);
+        let (status_tx, status_rx) = watch::channel(Ok(initial));
+        let (_backend_tx, backend_rx) = watch::channel(None);
+        let (lazy_tx, mut lazy_rx) = mpsc::channel(8);
+        let stale_clients = vec![
+            tokio::net::TcpStream::connect(listen_addr).await.unwrap(),
+            tokio::net::TcpStream::connect(listen_addr).await.unwrap(),
+            tokio::net::TcpStream::connect(listen_addr).await.unwrap(),
+        ];
+
+        control_tx.send_replace(ControllerCommand {
+            control: ForwardControl::Rejecting,
+            failure_epoch: 1,
+        });
+        control_tx.send_replace(final_command);
+
+        let permits = Arc::new(Semaphore::new(8));
+        let handle = tokio::spawn(proxy_accept_loop_with_permits(
+            listener,
+            ForwardControllerConfig {
+                backend_rx,
+                control_rx,
+                status_tx,
+                initial_command: initial,
+                lazy_tx: Some(lazy_tx),
+                service_name: "svc".to_string(),
+                emitter: test_lifecycle_emitter().await,
+            },
+            ProxyConnectionAccounting {
+                permits,
+                max_connections: 8,
+                global_active_connections: Arc::new(AtomicUsize::new(0)),
+                service_active_connections: Arc::new(AtomicUsize::new(0)),
+            },
+        ));
+        let mut controller = Controller {
+            command_tx: control_tx,
+            status_rx,
+        };
+        controller.wait_for(final_command).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), lazy_rx.recv())
+                .await
+                .is_err(),
+            "failed-cohort backlog must not trigger a new lazy start"
+        );
+        for client in stale_clients {
+            assert_stream_closed(client).await;
+        }
+
+        let _fresh_client = tokio::net::TcpStream::connect(listen_addr).await.unwrap();
+        let triggered = tokio::time::timeout(std::time::Duration::from_secs(1), lazy_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(
+            triggered
+                .as_ref()
+                .map(|trigger| trigger.service_name.as_str()),
+            Some("svc")
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn listenfd_actor_drains_coalesced_epoch_and_restores_blocking() {
+        let listener = Arc::new(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        let listen_addr = listener.local_addr().unwrap();
+        let initial = ControllerCommand {
+            control: ListenfdControl::Armed,
+            failure_epoch: 0,
+        };
+        let final_command = ControllerCommand {
+            control: ListenfdControl::Armed,
+            failure_epoch: 1,
+        };
+        let (control_tx, control_rx) = watch::channel(initial);
+        let (status_tx, status_rx) = watch::channel(Ok(initial));
+        let (lazy_tx, mut lazy_rx) = mpsc::channel(8);
+        let stale_clients = vec![
+            tokio::net::TcpStream::connect(listen_addr).await.unwrap(),
+            tokio::net::TcpStream::connect(listen_addr).await.unwrap(),
+            tokio::net::TcpStream::connect(listen_addr).await.unwrap(),
+        ];
+
+        control_tx.send_replace(ControllerCommand {
+            control: ListenfdControl::Rejecting,
+            failure_epoch: 1,
+        });
+        control_tx.send_replace(final_command);
+
+        let handle = spawn_listenfd_controller(
+            listener.clone(),
+            control_rx,
+            status_tx,
+            initial,
+            Some(lazy_tx),
+            "svc".to_string(),
+            test_lifecycle_emitter().await,
+        );
+        let mut controller = Controller {
+            command_tx: control_tx,
+            status_rx,
+        };
+        controller.wait_for(final_command).await.unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), lazy_rx.recv())
+                .await
+                .is_err(),
+            "failed-cohort listenfd backlog must not trigger a new lazy start"
+        );
+        for client in stale_clients {
+            assert_stream_closed(client).await;
+        }
+        // Safety: fcntl reads the status flags for the live listener fd.
+        let flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "listenfd must be blocking before the armed phase is acknowledged"
+        );
+
+        let _fresh_client = tokio::net::TcpStream::connect(listen_addr).await.unwrap();
+        let triggered = tokio::time::timeout(std::time::Duration::from_secs(1), lazy_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(
+            triggered
+                .as_ref()
+                .map(|trigger| trigger.service_name.as_str()),
+            Some("svc")
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    async fn assert_stream_closed(mut stream: tokio::net::TcpStream) {
+        let mut byte = [0_u8; 1];
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut byte))
+                .await
+                .expect("failed-cohort connection did not close");
+        match result {
+            Ok(0) | Err(_) => {}
+            Ok(count) => panic!("failed-cohort connection returned {count} unexpected bytes"),
+        }
     }
 
     async fn test_lifecycle_emitter() -> LifecycleEmitter {

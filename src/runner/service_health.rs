@@ -173,14 +173,13 @@ impl Runner {
         if current_pgid != Some(pgid) {
             return;
         }
-        let handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
+        let mut handle = match self.services.get_mut(name).and_then(|rs| rs.handle.take()) {
             Some(h) => h,
             None => return,
         };
-        let status = if let ServiceHandle::Process(mut proc) = handle {
-            proc.wait().await.ok()
-        } else {
-            None
+        let status = match &mut handle {
+            ServiceHandle::Process(proc) => proc.wait().await.ok(),
+            ServiceHandle::Docker(_) => None,
         };
         if let Some(rs) = self.services.get_mut(name) {
             rs.stop_health_tracking();
@@ -201,9 +200,6 @@ impl Runner {
             return;
         }
 
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.pgid = None;
-        }
         let exit_msg = format_unexpected_exit(status);
         self.output_manager.service_error_event(name, &exit_msg);
         let is_lazy = self
@@ -211,6 +207,13 @@ impl Runner {
             .get(name)
             .is_some_and(|rs| rs.resolved.lazy && rs.proxy.is_some());
         if is_lazy {
+            // `wait` only reaps the direct child. Keep its ProcessHandle (and
+            // therefore the PGID) available to lazy failure recovery so it can
+            // kill and await any same-group descendants before the proxy is
+            // re-armed. A descendant may still hold an inherited listenfd.
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.handle = Some(handle);
+            }
             // A lazy service restarts on a proxy connection, not on the
             // backoff timer, so route its crash through the connection-aware
             // crash-loop guard rather than scheduling an auto-restart. This
@@ -218,6 +221,9 @@ impl Runner {
             // tight loop by its still-queued trigger connection.
             self.handle_lazy_launch_failure(name, Some(&exit_msg));
         } else {
+            if let Some(rs) = self.services.get_mut(name) {
+                rs.pgid = None;
+            }
             self.set_service_state(name, ServiceState::Failed);
             let policy = self
                 .services
@@ -279,25 +285,47 @@ impl Runner {
     /// crash loop. This applies the same rapid-crash ceiling. Each failed
     /// launch bumps the streak (cleared by a launch that survives
     /// [`RAPID_CRASH_WINDOW`]); once it trips we leave the service `Failed` and
-    /// do **not** re-arm the proxy trigger, so the queued connection stops
-    /// relaunching it. Otherwise the service returns to `Lazy` and re-arms so a
-    /// later connection can retry.
+    /// do **not** re-arm the proxy trigger. Otherwise a detached cleanup first
+    /// confirms the old process group has exited, drains the failed connection
+    /// cohort, and only then returns the service to `Lazy`.
     ///
     /// A failed launch can surface twice — via the ready-check/`ItemDone` path
     /// and via the crash watcher. The state check makes this idempotent: the
     /// first caller transitions the service out of a live state, and the second
-    /// sees `Lazy`/`Failed` and returns, so the streak counts one per launch.
-    pub(in crate::runner) fn handle_lazy_launch_failure(&mut self, name: &str, message: Option<&str>) {
-        if !matches!(
-            self.services.get(name).map(|rs| rs.state()),
-            Some(ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy)
-        ) {
+    /// sees the cleanup in `Stopping` and returns, so the streak counts one per
+    /// launch.
+    pub(in crate::runner) fn handle_lazy_launch_failure(
+        &mut self,
+        name: &str,
+        message: Option<&str>,
+    ) {
+        let can_begin_recovery = self.services.get(name).is_some_and(|rs| {
+            rs.control_worker.is_none()
+                && matches!(
+                    rs.state(),
+                    ServiceState::Building
+                        | ServiceState::Starting
+                        | ServiceState::Running
+                        | ServiceState::Ready
+                        | ServiceState::Unhealthy
+                )
+        });
+        if !can_begin_recovery {
             return;
         }
         let lived = self
             .services
             .get(name)
-            .and_then(|rs| rs.last_start)
+            .and_then(|rs| {
+                if matches!(
+                    rs.state(),
+                    ServiceState::Running | ServiceState::Ready | ServiceState::Unhealthy
+                ) {
+                    rs.last_start
+                } else {
+                    None
+                }
+            })
             .map(|started| started.elapsed());
         let prior = self
             .services
@@ -305,24 +333,34 @@ impl Runner {
             .map(|rs| rs.rapid_crashes)
             .unwrap_or(0);
         let (rapid_crashes, give_up) = rapid_crash_outcome(lived, prior);
-        if let Some(rs) = self.services.get_mut(name) {
-            rs.rapid_crashes = rapid_crashes;
-            if let Some(prev) = rs.pending_restart.take() {
-                prev.abort();
+        let (handle, op_id) = match self.services.get_mut(name) {
+            Some(rs) => {
+                if rs.proxy.is_none() {
+                    return;
+                }
+                rs.control_generation = rs.control_generation.saturating_add(1);
+                let op_id = rs.control_generation;
+                rs.stop_health_tracking();
+                rs.rapid_crashes = rapid_crashes;
+                rs.last_start = None;
+                if let Some(prev) = rs.pending_restart.take() {
+                    prev.abort();
+                }
+                rs.osc_sink = None;
+                (rs.handle.take(), op_id)
             }
-            // Drop the failed launch's process handle and OSC sink. If a ready
-            // check failed while the process was still alive (e.g. it never
-            // bound its port), nothing else stops it — without this it lingers
-            // running and, via the OSC sink, holds the PTY master open. The
-            // handle's `kill_on_drop` reaps the process and the `OscSinkHandle`
-            // drop releases the PTY. On the crash path the handle is already
-            // gone, so these are no-ops. The output worker drains and drops the
-            // read half on EOF once the process is gone.
-            rs.handle = None;
-            rs.osc_sink = None;
-        }
+            None => return,
+        };
+        self.set_service_state(name, ServiceState::Stopping);
+        let recovery = match self.services.get_mut(name).and_then(|rs| rs.proxy.as_mut()) {
+            Some(proxy) => {
+                proxy.clear_backend();
+                proxy.begin_lazy_failure_recovery()
+            }
+            None => return,
+        };
+
         if give_up {
-            self.set_service_state(name, ServiceState::Failed);
             self.output_manager.service_error_event(
                 name,
                 &format!(
@@ -332,16 +370,125 @@ impl Runner {
                     rapid_crashes
                 ),
             );
-        } else {
-            self.set_service_state(name, ServiceState::Lazy);
-            if let Some(rs) = self.services.get_mut(name)
-                && let Some(ref mut proxy) = rs.proxy
-            {
-                proxy.rearm_lazy_watchers();
+        } else if let Some(msg) = message {
+            self.output_manager.service_error_event(
+                name,
+                &format!("{msg} (closing failed connections; will retry on next connection)"),
+            );
+        }
+
+        let shutdown_config = self.effective_shutdown_config(name);
+        let cmd_tx = self.internal_tx.clone();
+        let name_owned = name.to_string();
+        let debug = super::service::StopDebug::new(
+            name_owned.clone(),
+            self.output_manager.clone_lifecycle_emitter(),
+        );
+        let worker = tokio::spawn(async move {
+            let stop_result = match handle {
+                Some(handle) => super::service::stop_service(
+                    handle,
+                    Some(&shutdown_config),
+                    true,
+                    true,
+                    Some(debug),
+                )
+                .await
+                .map_err(|error| error.to_string()),
+                None => Ok(()),
+            };
+            let result = match stop_result {
+                Ok(()) => recovery.wait().await,
+                Err(error) => Err(error),
+            };
+            let _ = cmd_tx
+                .send(RunnerInternalCommand::LazyFailureRecoveryComplete {
+                    name: name_owned,
+                    op_id,
+                    rearm: !give_up,
+                    result,
+                })
+                .await;
+        });
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.control_worker = Some(worker);
+        }
+    }
+
+    pub(in crate::runner) fn handle_lazy_failure_recovery_complete(
+        &mut self,
+        name: &str,
+        op_id: u64,
+        rearm: bool,
+        result: Result<(), String>,
+    ) {
+        let is_current = self.services.get(name).is_some_and(|rs| {
+            rs.control_generation == op_id && rs.state() == ServiceState::Stopping
+        });
+        if !is_current {
+            return;
+        }
+        if let Some(rs) = self.services.get_mut(name) {
+            rs.control_worker = None;
+            rs.pgid = None;
+        }
+        match result {
+            Ok(()) if rearm => {
+                let barrier = self
+                    .services
+                    .get(name)
+                    .and_then(|rs| rs.proxy.as_ref())
+                    .map(|proxy| proxy.begin_lazy_rearm());
+                let Some(barrier) = barrier else {
+                    self.set_service_state(name, ServiceState::Failed);
+                    self.output_manager.service_error_event(
+                        name,
+                        "failed to prepare lazy proxy: proxy is unavailable",
+                    );
+                    return;
+                };
+                let cmd_tx = self.internal_tx.clone();
+                let name_owned = name.to_string();
+                tokio::spawn(async move {
+                    let result = barrier.wait().await;
+                    let _ = cmd_tx
+                        .send(RunnerInternalCommand::LazyProxyPrepareComplete {
+                            name: name_owned,
+                            op_id,
+                            result,
+                        })
+                        .await;
+                });
             }
-            if let Some(msg) = message {
+            Ok(()) => self.set_service_state(name, ServiceState::Failed),
+            Err(error) => {
+                self.set_service_state(name, ServiceState::Failed);
+                self.output_manager.service_error_event(
+                    name,
+                    &format!("failed to finish lazy launch cleanup: {error}"),
+                );
+            }
+        }
+    }
+
+    pub(in crate::runner) fn handle_lazy_proxy_prepare_complete(
+        &mut self,
+        name: &str,
+        op_id: u64,
+        result: Result<(), String>,
+    ) {
+        let is_current = self.services.get(name).is_some_and(|rs| {
+            rs.control_generation == op_id && rs.state() == ServiceState::Stopping
+        });
+        if !is_current {
+            return;
+        }
+        match result {
+            Ok(()) => self.set_service_state(name, ServiceState::Lazy),
+            Err(error) => {
+                self.set_service_state(name, ServiceState::Failed);
                 self.output_manager
-                    .service_error_event(name, &format!("{msg} (will retry on next connection)"));
+                    .service_error_event(name, &format!("failed to prepare lazy proxy: {error}"));
             }
         }
     }
