@@ -523,3 +523,57 @@ fn cli_run_timeout_after_task_name_limits_wait() {
         handle.await.unwrap();
     });
 }
+
+#[test]
+fn cli_stop_kills_a_running_task() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("cli-stop-task");
+        let marker = dir.path().join("done.marker");
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["60"])
+            .log("ignore")
+            .ready_exec("true", &[])
+            .done()
+            .add_task(
+                "slow",
+                "sh",
+                &["-c", &format!("sleep 5; echo done > {}", marker.display())],
+            )
+            .log("ignore")
+            .auto_run(false)
+            .done()
+            .build();
+        let config_path = dir.path().join("don.toml");
+        std::fs::write(&config_path, &toml).unwrap();
+
+        let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
+        assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
+
+        // Start the task in the background and let it enter its sleep.
+        let cp = config_path.clone();
+        let (code, _out, err) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["run", "slow"]))
+                .await
+                .unwrap();
+        assert_eq!(code, 0, "run stderr: {err}");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // `don stop <task>` should now succeed (previously rejected as a task).
+        let cp = config_path.clone();
+        let (scode, _sout, serr) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["stop", "slow"]))
+                .await
+                .unwrap();
+        assert_eq!(scode, 0, "stopping a running task should succeed; stderr: {serr}");
+
+        // The 5s sleep was killed before completing → marker never written.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !marker.exists(),
+            "stopping the task should have killed it before it finished"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}

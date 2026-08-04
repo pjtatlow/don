@@ -1526,7 +1526,11 @@ impl Runner {
                                 self.handle_start_service_cmd(&name, reply).await;
                             }
                             RunnerCommand::Stop { name, reply } => {
-                                self.handle_stop_cmd(&name, reply).await;
+                                if self.tasks.contains_key(&name) {
+                                    self.handle_stop_task_cmd(&name, reply).await;
+                                } else {
+                                    self.handle_stop_cmd(&name, reply).await;
+                                }
                             }
                             RunnerCommand::Restart { name, reply } => {
                                 if self.tasks.contains_key(&name) {

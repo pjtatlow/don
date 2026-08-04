@@ -187,7 +187,7 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App) {
         frame,
         area,
         StatusTableView {
-            title: " don tasks — [j/k ↑↓] move  [enter] run/form  [l] logs  [/] filter  [esc] clear/dismiss "
+            title: " don tasks — [j/k ↑↓] move  [enter] run/form  [s] stop  [l] logs  [/] filter  [esc] clear/dismiss "
                 .to_string(),
             header,
             rows,

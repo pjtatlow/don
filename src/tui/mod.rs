@@ -1026,6 +1026,12 @@ fn handle_tasks_key(
         };
         open_log_popup_for_name(app, store, item.name);
         redraw_modal(modal, app)?;
+    } else if key.code == KeyCode::Char('s') {
+        let Some(item) = highlighted_task_item(app) else {
+            return Ok(());
+        };
+        dispatch_stop_task(command_tx, item.name);
+        redraw_modal(modal, app)?;
     }
     Ok(())
 }
@@ -1295,6 +1301,19 @@ fn dispatch_run_task(command_tx: &mpsc::UnboundedSender<RunnerCommand>, name: St
             reply: reply_tx,
         };
         let _ = command_tx.send(cmd);
+    });
+}
+
+/// Fire a `RunnerCommand::Stop` for a task without waiting for the reply. The
+/// runner SIGKILLs a running task's process group; a no-op for non-running.
+fn dispatch_stop_task(command_tx: &mpsc::UnboundedSender<RunnerCommand>, name: String) {
+    let command_tx = command_tx.clone();
+    tokio::spawn(async move {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = command_tx.send(RunnerCommand::Stop {
+            name,
+            reply: reply_tx,
+        });
     });
 }
 

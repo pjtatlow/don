@@ -585,6 +585,34 @@ impl Runner {
         Ok(())
     }
 
+    /// SIGKILL a running task's process group. Its natural exit path records
+    /// the result; errors if the name is unknown or the task isn't running.
+    pub(in crate::runner) async fn handle_stop_task_cmd(
+        &mut self,
+        name: &str,
+        reply: oneshot::Sender<CommandResult>,
+    ) {
+        let (state, pgid) = match self.tasks.get(name) {
+            Some(rt) => (rt.state(), rt.pgid),
+            None => {
+                let _ = reply.send(Err(CommandError::UnknownTask {
+                    name: name.to_string(),
+                }));
+                return;
+            }
+        };
+        if matches!(state, TaskItemState::Running | TaskItemState::Building)
+            && let Some(pgid) = pgid
+        {
+            let _ = reply.send(self.stop_task_pgid(name, pgid).await);
+        } else {
+            let _ = reply.send(Err(CommandError::InvalidState {
+                name: name.to_string(),
+                message: "task is not running".to_string(),
+            }));
+        }
+    }
+
     /// Handle a file-watch-triggered task re-run.
     ///
     /// Respects the task's auto-run policy — tasks that should not auto-rerun
