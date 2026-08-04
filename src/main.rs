@@ -84,9 +84,10 @@ enum Commands {
     },
     /// Show status of all services and tasks, or a single one when NAME is given
     Status {
-        /// Name of a single service or task to inspect (omit to show all).
-        /// Combine with `--verbose` to list its fully-resolved watch paths —
-        /// useful for debugging why a build-tool service isn't reloading.
+        /// Name of a single service or task to inspect (omit to show all),
+        /// or `services` / `tasks` to show only that kind. Combine a name
+        /// with `--verbose` to list its fully-resolved watch paths — useful
+        /// for debugging why a build-tool service isn't reloading.
         name: Option<String>,
         /// Show detailed info: watch paths, ports, build tool targets, commands
         #[arg(short, long)]
@@ -694,9 +695,27 @@ async fn wait_for_daemon_socket_gone(
 }
 
 async fn run_status(config_path: &Path, name: Option<&str>, verbose: bool, json: bool) -> i32 {
+    // `services` / `tasks` filter the table by kind — unless an actual item
+    // shadows the keyword, in which case the item wins.
+    let kind_filter = match name {
+        Some(keyword @ ("services" | "tasks")) => {
+            let shadowed = don::config::Config::from_file(config_path)
+                .map(|c| c.services.contains_key(keyword) || c.tasks.contains_key(keyword))
+                .unwrap_or(false);
+            if shadowed { None } else { Some(keyword) }
+        }
+        _ => None,
+    };
+    let name = if kind_filter.is_some() { None } else { name };
+
     let client = client_for(config_path);
     match client.status(verbose, name).await {
         Ok(mut items) => {
+            match kind_filter {
+                Some("services") => items.retain(|i| matches!(i, ItemStatus::Service { .. })),
+                Some(_) => items.retain(|i| matches!(i, ItemStatus::Task { .. })),
+                None => {}
+            }
             // A named query is filtered server-side; an empty result means the
             // name didn't match anything. Fetch the full list to offer a
             // did-you-mean before failing.
