@@ -761,12 +761,12 @@ impl WatchManager {
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             // Missed n events. If one was a RebuildComplete,
                             // the corresponding WatchedItem is stuck in
-                            // `Rebuilding` and will swallow future edits until
-                            // the item is re-registered. Surface it loudly.
+                            // `Rebuilding`. A pattern update cannot safely reset
+                            // it because updates also race active rebuilds.
                             self.runner_event_lag_count =
                                 self.runner_event_lag_count.saturating_add(n);
                             self.emitter.lifecycle_event(&format!(
-                                "watch: broadcast lag — missed {n} runner events; a service may be stuck in Rebuilding"
+                                "watch: broadcast lag — missed {n} runner events; restart don if edits stop triggering rebuilds"
                             ));
                         }
                     }
@@ -1749,13 +1749,8 @@ fn refresh_item_definition(
     patterns: Vec<Pattern>,
     ignore_patterns: Vec<Pattern>,
 ) {
-    // A build-tool re-query is a full re-registration of this item's watch
-    // definition. If we previously missed a RebuildComplete /
-    // TaskRerunComplete broadcast, the item may be stuck in `Rebuilding` and
-    // would otherwise swallow future edits forever.
-    item.state = WatchState::Idle;
-    item.debounce_deadline = None;
-    item.stale = false;
+    // Definition updates are independent of the in-flight state machine.
+    // Resetting here loses pending debounces or stale follow-up cycles.
     item.kind = kind;
     item.patterns = patterns;
     item.ignore_patterns = ignore_patterns;
@@ -3066,37 +3061,110 @@ bazel.target = "//services/api:api"
         );
     }
 
-    #[test]
-    fn test_refresh_item_definition_resets_stuck_rebuilding_state() {
-        let original_patterns = vec![Pattern::new("src/**/*.rs").unwrap()];
-        let replacement_patterns = vec![Pattern::new("pkg/**").unwrap()];
-        let replacement_ignore = vec![Pattern::new("pkg/generated/**").unwrap()];
+    #[tokio::test]
+    async fn test_watch_refresh_during_stale_rebuild_keeps_follow_up_cycle() {
+        tokio::time::pause();
 
-        let mut item = WatchedItem {
-            state: WatchState::Rebuilding,
-            debounce_duration: Duration::from_millis(200),
-            debounce_deadline: Some(Instant::now() + Duration::from_millis(50)),
-            stale: true,
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        let initial_path = temp.path().join("src/main.rs");
+        let refreshed_path = temp.path().join("src/schema.txt");
+        std::fs::write(&initial_path, "fn main() {}").unwrap();
+        std::fs::write(&refreshed_path, "schema").unwrap();
+        let config: Config = r#"
+[services.api]
+run.cmd = "true"
+watch = ["src/**/*.rs"]
+"#
+        .parse()
+        .unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = broadcast::channel(8);
+        let (_update_tx, update_rx) = mpsc::unbounded_channel();
+        let (_query_tx, query_rx) = mpsc::channel(8);
+        let output = crate::output::OutputManager::new(
+            &[("api", &crate::config::LogConfig::Stdout)],
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap();
+        let (mut manager, _warnings) = WatchManager::new(
+            &config,
+            Platform::LinuxX86_64,
+            temp.path(),
+            cmd_tx,
+            event_rx,
+            update_rx,
+            query_rx,
+            output.clone_lifecycle_emitter(),
+        )
+        .unwrap();
+        let initial_event = notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![initial_path],
+            attrs: Default::default(),
+        };
+        let refreshed_event = notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![refreshed_path],
+            attrs: Default::default(),
+        };
+        let watch_update = || WatchUpdate {
+            name: "api".to_string(),
             kind: WatchItemKind::Service,
-            patterns: original_patterns,
-            ignore_patterns: vec![],
-            last_error: None,
+            patterns: vec!["src/**".to_string()],
+            ignore_patterns: Vec::new(),
+            base_dir: temp.path().to_path_buf(),
+            applied_tx: None,
         };
 
-        refresh_item_definition(
-            &mut item,
-            WatchItemKind::Task,
-            replacement_patterns,
-            replacement_ignore,
-        );
+        manager.handle_notify_event(&initial_event).await;
+        let debounce_deadline = manager.items["api"].debounce_deadline;
+        manager.apply_watch_update(watch_update());
+        assert_eq!(manager.items["api"].state, WatchState::Debouncing);
+        assert_eq!(manager.items["api"].debounce_deadline, debounce_deadline);
+        tokio::time::advance(Duration::from_millis(200)).await;
+        manager.fire_debounce_timers().await;
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            RunnerCommand::Rebuild { ref name } if name == "api"
+        ));
 
-        assert_eq!(item.state, WatchState::Idle);
-        assert_eq!(item.debounce_deadline, None);
-        assert!(!item.stale);
-        assert_eq!(item.kind, WatchItemKind::Task);
-        assert_eq!(item.patterns.len(), 1);
-        assert_eq!(item.patterns[0].as_str(), "pkg/**");
-        assert_eq!(item.ignore_patterns.len(), 1);
-        assert_eq!(item.ignore_patterns[0].as_str(), "pkg/generated/**");
+        manager.handle_notify_event(&refreshed_event).await;
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            RunnerCommand::RebuildStale { ref name } if name == "api"
+        ));
+
+        manager.apply_watch_update(watch_update());
+        assert_eq!(manager.items["api"].state, WatchState::Rebuilding);
+        assert!(manager.items["api"].stale);
+
+        manager
+            .handle_runner_event(&RunnerEvent::RebuildComplete {
+                name: "api".to_string(),
+                success: true,
+            })
+            .await;
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            RunnerCommand::Rebuild { ref name } if name == "api"
+        ));
+        assert_eq!(manager.items["api"].state, WatchState::Rebuilding);
+        assert!(!manager.items["api"].stale);
+        assert!(cmd_rx.try_recv().is_err());
+
+        manager
+            .handle_runner_event(&RunnerEvent::RebuildComplete {
+                name: "api".to_string(),
+                success: true,
+            })
+            .await;
+        assert_eq!(manager.items["api"].state, WatchState::Idle);
+        assert!(cmd_rx.try_recv().is_err());
     }
 }
