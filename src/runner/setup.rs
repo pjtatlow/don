@@ -1,3 +1,4 @@
+use super::baked_bazel_manifest::BakedBazelManifest;
 use super::profile::resolve_profile_items_for_platform;
 use super::{RunnerError, RuntimeService, RuntimeTask, ServiceState, TaskItemState};
 use crate::config::{Config, Platform, ServiceKind};
@@ -199,4 +200,74 @@ pub(in crate::runner) async fn build_runtime_maps(
         }
     }
     (services, tasks)
+}
+
+/// Apply a matching baked manifest; reject it as a whole on any stale or missing output.
+pub(in crate::runner) async fn apply_baked_bazel_launch_manifest(
+    config: &Config,
+    platform: Platform,
+    base_dir: &Path,
+    don_dir: &Path,
+    services: &mut HashMap<String, RuntimeService>,
+) -> Result<Option<usize>, String> {
+    let Some(manifest) = BakedBazelManifest::load(don_dir)? else {
+        return Ok(None);
+    };
+    let workspace = crate::build_tool::bazel::find_workspace_root(base_dir).ok_or_else(|| {
+        format!(
+            "could not find a Bazel workspace above {}",
+            base_dir.display()
+        )
+    })?;
+    let git_output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .map_err(|error| format!("failed to read workspace commit: {error}"))?;
+    if !git_output.status.success() {
+        return Err(format!(
+            "failed to read workspace commit: {}",
+            String::from_utf8_lossy(&git_output.stderr).trim()
+        ));
+    }
+    let current_commit = String::from_utf8_lossy(&git_output.stdout)
+        .trim()
+        .to_string();
+    if !manifest.matches_commit(&current_commit) {
+        return Err(format!(
+            "manifest commit does not match workspace HEAD ({current_commit})"
+        ));
+    }
+
+    let mut binaries = HashMap::new();
+    for (name, runtime) in services.iter() {
+        let Some(bazel) = runtime.resolved.bazel_config() else {
+            continue;
+        };
+        if runtime.resolved.build_tool_watch_enabled() {
+            return Err(format!(
+                "{name} has Bazel source watching enabled and cannot use a baked manifest"
+            ));
+        }
+        let executable = manifest.executable_for_target(&bazel.target, &workspace)?;
+        binaries.insert(name.clone(), executable.to_string_lossy().into_owned());
+    }
+
+    for (name, binary) in &binaries {
+        let Some(runtime) = services.get_mut(name) else {
+            continue;
+        };
+        let Some(service) = config.services.get(name) else {
+            continue;
+        };
+        let mut resolved = service.resolve_with_bazel_binary(platform, binary);
+        resolved.depends_on = config.effective_depends_on(name, &resolved.depends_on);
+        runtime.resolved = resolved;
+        runtime.bazel_binary_path = Some(binary.clone());
+        runtime.batch_built = true;
+    }
+
+    Ok(Some(binaries.len()))
 }

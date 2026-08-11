@@ -113,7 +113,7 @@ impl Runner {
 
     fn collect_batch_build_item_by_name(&self, name: &str) -> Option<BatchBuildItem> {
         if let Some(rs) = self.services.get(name) {
-            if rs.resolved.is_build_tool_managed() {
+            if rs.resolved.is_build_tool_managed() && !rs.batch_built {
                 return Some(self.build_batch_item(name, NodeKind::Service, rs));
             }
             return None;
@@ -479,7 +479,7 @@ impl Runner {
         let mut items: Vec<BatchBuildItem> = Vec::new();
 
         for (name, rs) in &self.services {
-            if !rs.resolved.is_build_tool_managed() {
+            if !rs.resolved.is_build_tool_managed() || rs.batch_built {
                 continue;
             }
             // Lazy bazel/turbo services defer their query+build+cquery to

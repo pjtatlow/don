@@ -444,6 +444,15 @@ Don will:
 
 Multiple services sharing the same source files are batched into one `bazel build` invocation.
 
+For immutable workspace snapshots, a builder can write
+`.don/bazel-launch-manifest.json` with a version, the workspace Git commit, and
+workspace-relative target executable paths. On an exact commit match, Don
+launches every active Bazel service from that manifest and skips the initial
+build/cquery pass. Active manifest services must opt out of Bazel source-watch
+resolution (`bazel.watch = false` or `reload = false`); a missing, stale,
+incomplete, or invalid manifest is ignored as a whole and uses normal Bazel
+startup.
+
 Set `bazel.watch = false` to keep Bazel startup builds/runs but skip Bazel-derived watch paths. This is useful when Bazel queries are too broad or too expensive and you want explicit watch globs instead:
 
 ```toml
