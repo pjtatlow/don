@@ -6,6 +6,7 @@
 //! Communication uses channels: `mpsc` for commands in, `broadcast` for events out.
 
 mod attach;
+mod baked_bazel_manifest;
 mod build_tools;
 mod completions;
 mod env_refs;
@@ -894,7 +895,7 @@ impl Runner {
 
         setup::prune_download_cache(&config, platform, &don_dir, &output_manager);
 
-        let (services, tasks) = setup::build_runtime_maps(
+        let (mut services, tasks) = setup::build_runtime_maps(
             &config,
             platform,
             &base_dir,
@@ -903,6 +904,25 @@ impl Runner {
             headless,
         )
         .await;
+
+        match setup::apply_baked_bazel_launch_manifest(
+            &config,
+            platform,
+            &base_dir,
+            &don_dir,
+            &mut services,
+        )
+        .await
+        {
+            Ok(Some(count)) if count > 0 => output_manager.lifecycle_event(&format!(
+                "using baked Bazel launch manifest for {count} service{}",
+                if count == 1 { "" } else { "s" }
+            )),
+            Ok(_) => {}
+            Err(reason) => output_manager.lifecycle_event(&format!(
+                "ignoring baked Bazel launch manifest: {reason}; using normal Bazel startup"
+            )),
+        }
 
         let (manifest_writer_tx, manifest_writer_handle) = runtime_ports::spawn_manifest_writer(
             base_dir.clone(),
@@ -2124,7 +2144,10 @@ mod tests {
     /// Build a runner with a single watch-enabled bazel service "api", for
     /// exercising the rebuild-batch completion paths directly. Returns the
     /// shutdown sender too so the runner's `shutdown_rx` stays open.
-    async fn single_bazel_runner(temp: &std::path::Path) -> (Runner, mpsc::Sender<()>) {
+    async fn single_bazel_runner_with_reload(
+        temp: &std::path::Path,
+        reload: bool,
+    ) -> (Runner, mpsc::Sender<()>) {
         use crate::config::service::{Service, ServiceKind};
         use crate::config::types::{BazelConfig, LogConfig, LogFilterConfig};
 
@@ -2146,7 +2169,7 @@ mod tests {
                     shutdown: None,
                     log: LogConfig::Stdout,
                     log_filter: LogFilterConfig::default(),
-                    reload: true,
+                    reload,
                     tty: true,
                     on_failure: crate::config::OnFailure::Notify,
                     platform: HashMap::new(),
@@ -2190,6 +2213,68 @@ mod tests {
         .await
         .unwrap();
         (runner, shutdown_tx)
+    }
+
+    async fn single_bazel_runner(temp: &std::path::Path) -> (Runner, mpsc::Sender<()>) {
+        single_bazel_runner_with_reload(temp, true).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn matching_baked_manifest_skips_the_startup_bazel_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("MODULE.bazel"),
+            "module(name = \"test\")\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init"],
+            vec!["add", "MODULE.bazel"],
+            vec![
+                "-c",
+                "user.email=don@example.com",
+                "-c",
+                "user.name=Don Test",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let commit = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(temp.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let binary = temp.path().join("bazel-out/bin/api");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, "#!/bin/sh\n").unwrap();
+        fs::create_dir_all(temp.path().join(".don")).unwrap();
+        fs::write(
+            temp.path().join(".don/bazel-launch-manifest.json"),
+            format!(
+                "{{\"version\":1,\"commit\":\"{commit}\",\"targets\":{{\"//api:api\":\"bazel-out/bin/api\"}}}}"
+            ),
+        )
+        .unwrap();
+
+        let (runner, _shutdown_tx) = single_bazel_runner_with_reload(temp.path(), false).await;
+        let service = runner.services.get("api").unwrap();
+        assert!(service.batch_built);
+        assert_eq!(service.bazel_binary_path.as_deref(), binary.to_str());
+        assert!(runner.collect_batch_build_items().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
