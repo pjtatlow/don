@@ -4,6 +4,7 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::{ProcessStatus, Runner, RunnerCommand, ServiceState};
+use don::task_state::TaskStateStore;
 use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
@@ -2238,6 +2239,72 @@ fn integration_don_pid_file_prevents_double_start() {
         assert!(
             err.to_string().contains("already running"),
             "error should mention already running: {err}"
+        );
+    });
+}
+
+/// A task that fails before it spawns still has to leave a record saying so.
+///
+/// Without one, `.last-run.json` keeps describing the last run that reached a
+/// process, so the tables read `failed` in the state column and `ok` in the
+/// result column — and the failure vanishes completely on the next start,
+/// where every phase begins at `Pending` and the record is read off disk.
+#[test]
+fn integration_task_that_never_spawns_records_its_failure() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("task-prepare-failure");
+
+        // This task ran, and worked, before today.
+        let state = TaskStateStore::new(dir.path().join(".don").join("task-state"));
+        state.record_success("sync", &[], &[], None).await.unwrap();
+        assert!(
+            state.last_run("sync").await.unwrap().unwrap().success,
+            "the run before this one succeeded"
+        );
+
+        // And now its command isn't on PATH, so nothing is ever spawned.
+        let toml = ConfigBuilder::new()
+            .add_task("sync", "don-test-no-such-command", &[])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
+        let control = runner.process_control();
+        let handle = tokio::spawn(async move { runner.run().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = control
+            .run_task("sync", std::collections::HashMap::new(), false, None)
+            .await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let recorded = loop {
+            match state.last_run("sync").await.unwrap() {
+                Some(run) if !run.success => break Some(run),
+                _ if tokio::time::Instant::now() >= deadline => break None,
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        };
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+
+        let recorded = recorded.expect("a run that never spawned must still be recorded");
+        assert!(
+            recorded.message.is_some(),
+            "the record carries why: {recorded:?}"
+        );
+        assert_eq!(
+            (recorded.duration_ms, recorded.exit_code),
+            (None, None),
+            "nothing ran, so nothing took time or exited: {recorded:?}"
+        );
+        // The gates are the other half. A failure that never ran must not
+        // touch the success marker, or the task would stop blocking its
+        // dependents on the strength of a run that didn't happen.
+        assert!(
+            state.has_success("sync").await.unwrap(),
+            "the success marker belongs to the last run that actually worked"
         );
     });
 }

@@ -12,7 +12,7 @@
 use super::TaskExit;
 use super::paths::{resolve_watch_ignore_patterns, working_dir_for};
 use crate::task_state::{TaskRunInfo, TaskStateStore};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -850,11 +850,18 @@ async fn supervise(
                                         awaiting_artifact = false;
                                         // Not retried — see the service side.
                                         demand = super::Demand::None;
-                                        ctx.emitter.service_error_event(
-                                            &name,
-                                            &format!("build failed: {message}"),
-                                        );
-                                        owner.set(crate::process::TaskState::Failed);
+                                        // Classified like any other run that
+                                        // never spawned: one was asked for,
+                                        // and it did not happen. Says the
+                                        // same thing and records the same
+                                        // thing as a failure to prepare.
+                                        let outcome = NoSpawnOutcome::failed(format!(
+                                            "build failed: {message}"
+                                        ));
+                                        outcome.emit(&ctx.emitter, &name);
+                                        let last_run =
+                                            outcome.record(&ctx.base_dir, &name).await;
+                                        owner.settle_without_run(outcome.state, last_run);
                                     }
                                 }
                                 continue;
@@ -1073,10 +1080,11 @@ async fn supervise(
             // see it — a line emitted afterwards lands behind the "starting..."
             // it was supposed to explain.
             outcome.emit(&ctx.emitter, &name);
+            let last_run = outcome.record(&ctx.base_dir, &name).await;
             if let Some(needs_run_now) = outcome.needs_run_now() {
                 owner.set_needs_run_now(needs_run_now);
             }
-            owner.set(outcome.state);
+            owner.settle_without_run(outcome.state, last_run);
         }
         if report_tx
             .send(super::ProcessReport::TaskRunPrepared {
@@ -1364,6 +1372,26 @@ impl TaskPhaseOwner {
         self.publish();
     }
 
+    /// The phase a run that never spawned settled into, plus the record of the
+    /// attempt when there is one, in a single publication.
+    ///
+    /// Deliberately narrower than [`Self::fail`]: what the task owes its
+    /// dependents is the caller's answer, not this one's. The prepare path
+    /// takes it from `NoSpawnOutcome::needs_run_now`, and a failed build
+    /// leaves it as it was — a task whose build broke has the same run
+    /// history it had a moment ago.
+    fn settle_without_run(
+        &mut self,
+        phase: crate::process::TaskState,
+        last_run: Option<TaskRunInfo>,
+    ) {
+        if last_run.is_some() {
+            self.last_run = last_run;
+        }
+        self.phase = phase;
+        self.publish();
+    }
+
     /// Record that a run is outstanding (or no longer is). Also marks the
     /// startup evaluation as having happened — reaching this point *is* that
     /// evaluation.
@@ -1531,6 +1559,35 @@ impl NoSpawnOutcome {
             super::TaskState::Skipped => Some(false),
             _ => None,
         }
+    }
+
+    /// Persist this outcome as a run record, when it is one, and return what
+    /// was written so the phase can be published with it.
+    ///
+    /// A prepare failure is a run that was asked for and did not happen, so it
+    /// belongs in the record. Without it the record keeps describing the last
+    /// run that *spawned*: the task reads `failed` in the state column and
+    /// `ok` in the result column, and a restart — which starts every phase at
+    /// `Pending` and reads the record back off disk — loses the failure
+    /// entirely.
+    ///
+    /// Only the run record is written. The success marker and the
+    /// watched-input hashes are deliberately left alone, exactly as for a run
+    /// that spawned and failed, so this task still does not satisfy its
+    /// dependents and is still not skipped next time.
+    ///
+    /// `PendingRun` and `Skipped` record nothing: no run was attempted, so the
+    /// existing record still describes the last run there was.
+    pub(crate) async fn record(&self, base_dir: &Path, name: &str) -> Option<TaskRunInfo> {
+        if self.state != super::TaskState::Failed {
+            return None;
+        }
+        // No duration and no exit code: nothing ran, so there is nothing to
+        // report but when it was tried and why it wasn't.
+        let last_run = TaskRunInfo::finished_now(false, None, None, Some(self.message.clone()));
+        let task_state = TaskStateStore::new(base_dir.join(".don").join("task-state"));
+        let _ = task_state.record_run(name, &last_run).await;
+        Some(last_run)
     }
 
     /// Emit this outcome's message at its own level.
@@ -2080,6 +2137,96 @@ mod tests {
         }
     }
 
+    /// A run that was asked for and never happened is still a run, and the
+    /// record has to say so. Otherwise it keeps describing the last run that
+    /// spawned — the table reads `failed` in the state column and `ok` in the
+    /// result column — and a restart, which starts every phase at `Pending`
+    /// and reads the record off disk, loses the failure entirely.
+    #[tokio::test]
+    async fn a_run_that_never_spawned_records_what_it_can() {
+        struct Case {
+            label: &'static str,
+            outcome: NoSpawnOutcome,
+            /// Whether this attempt belongs in the run record at all.
+            want_record: bool,
+            /// What the record says afterwards. `true` for the outcomes that
+            /// write nothing: the previous successful run still stands.
+            want_stored_success: bool,
+        }
+
+        let cases = vec![
+            Case {
+                label: "prepare failed",
+                outcome: NoSpawnOutcome::failed("bad param".to_string()),
+                want_record: true,
+                want_stored_success: false,
+            },
+            Case {
+                label: "deferred",
+                outcome: NoSpawnOutcome::pending_run("waiting on deps".to_string()),
+                want_record: false,
+                want_stored_success: true,
+            },
+            Case {
+                label: "skipped",
+                outcome: NoSpawnOutcome::skipped("no changes".to_string()),
+                want_record: false,
+                want_stored_success: true,
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let state = TaskStateStore::new(temp.path().join(".don").join("task-state"));
+            // A task that has run, and worked, before this attempt.
+            state.record_success("build", &[], &[], None).await.unwrap();
+
+            let published = case.outcome.record(temp.path(), "build").await;
+            let stored = state.last_run("build").await.unwrap().unwrap();
+
+            assert_eq!(
+                published.is_some(),
+                case.want_record,
+                "{}: published a record",
+                case.label
+            );
+            assert_eq!(
+                stored.success, case.want_stored_success,
+                "{}: what the record says now",
+                case.label
+            );
+            if case.want_record {
+                assert_eq!(
+                    published.as_ref(),
+                    Some(&stored),
+                    "{}: what was published is what was stored",
+                    case.label
+                );
+                assert_eq!(
+                    stored.message.as_deref(),
+                    Some("bad param"),
+                    "{}: the record carries why",
+                    case.label
+                );
+                assert_eq!(
+                    (stored.duration_ms, stored.exit_code),
+                    (None, None),
+                    "{}: nothing ran, so nothing took time or exited",
+                    case.label
+                );
+            }
+            // The other half: recording the attempt must not touch the gates.
+            // A failure that never ran leaves the success marker alone, so the
+            // task still doesn't satisfy its dependents on the strength of it,
+            // and leaves the input hashes alone, so it isn't skipped next time.
+            assert!(
+                state.has_success("build").await.unwrap(),
+                "{}: success marker untouched",
+                case.label
+            );
+        }
+    }
+
     fn owner_for(task_toml: &str, has_success: bool) -> TaskPhaseOwner {
         let config: crate::config::Config = task_toml.parse().unwrap();
         let (name, task) = config.tasks.iter().next().unwrap();
@@ -2124,6 +2271,65 @@ mod tests {
             !owner.satisfied(),
             "an outstanding run must block dependents"
         );
+    }
+
+    /// Settling a run that never spawned records the attempt and decides
+    /// nothing else. What the task owes its dependents belongs to the caller —
+    /// the prepare path answers it from `NoSpawnOutcome::needs_run_now`, and a
+    /// failed build leaves it alone — so this must not quietly answer it too.
+    #[test]
+    fn settling_without_a_run_records_the_attempt_and_leaves_the_gates_alone() {
+        use crate::process::TaskState;
+
+        struct Case {
+            label: &'static str,
+            phase: TaskState,
+            last_run: Option<TaskRunInfo>,
+            want_message: Option<&'static str>,
+        }
+
+        let attempt =
+            |message: &str| TaskRunInfo::finished_now(false, None, None, Some(message.to_string()));
+
+        let cases = vec![
+            Case {
+                label: "a failure that never ran",
+                phase: TaskState::Failed,
+                last_run: Some(attempt("build failed: exit code 2")),
+                want_message: Some("build failed: exit code 2"),
+            },
+            Case {
+                label: "an outcome with nothing to record",
+                phase: TaskState::Skipped,
+                last_run: None,
+                // Nothing was attempted, so the previous record stands —
+                // here, no record at all.
+                want_message: None,
+            },
+        ];
+
+        for case in cases {
+            let mut owner = owner_for("[tasks.build]\ncmd = \"true\"\n", true);
+            owner.set_needs_run_now(true);
+
+            owner.settle_without_run(case.phase, case.last_run);
+
+            assert_eq!(owner.phase, case.phase, "{}: phase", case.label);
+            assert_eq!(
+                owner
+                    .last_run
+                    .as_ref()
+                    .and_then(|run| run.message.as_deref()),
+                case.want_message,
+                "{}: the record",
+                case.label
+            );
+            assert!(
+                owner.needs_run_now,
+                "{}: what the task owes its dependents is not this call's to change",
+                case.label
+            );
+        }
     }
 
     /// …but only for a task that would re-run on its own. A param'd task, or
