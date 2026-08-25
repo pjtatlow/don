@@ -770,7 +770,6 @@ mod tests {
         let height = 12u16;
         let mut hide_web = false;
         let mut next_id = 0u64;
-        let mut last_name = "api";
         let mut scroll = Scroll::Follow;
 
         for step in 0..300 {
@@ -782,24 +781,9 @@ mod tests {
             // A burst of output, sometimes long enough to wrap several times.
             for _ in 0..roll(4) {
                 let body = "x".repeat(1 + roll(90));
-                // A progress frame repaints the newest line in place, keeping
-                // its id — so nothing appends and nothing evicts, but the
-                // line's height moves and every row after it depends on that.
-                // It keeps the name too: the tap only supersedes a frame from
-                // the same process, so a repaint can never move a line across
-                // the filter.
-                let repaint = next_id > 0 && roll(4) == 0;
-                let name = if repaint {
-                    last_name
-                } else if roll(2) == 0 {
-                    "api"
-                } else {
-                    "web"
-                };
-                last_name = name;
-                let id = if repaint { next_id - 1 } else { next_id };
+                let name = if roll(2) == 0 { "api" } else { "web" };
                 store.push(
-                    LogId(id),
+                    LogId(next_id),
                     crate::output::FormattedLogLine {
                         name: name.to_string(),
                         is_lifecycle: false,
@@ -808,9 +792,7 @@ mod tests {
                         bytes: body.into_bytes(),
                     },
                 );
-                if !repaint {
-                    next_id += 1;
-                }
+                next_id += 1;
             }
             store.reflow(width);
             store.set_pin(scroll.anchor());

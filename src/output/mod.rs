@@ -810,15 +810,6 @@ impl std::fmt::Display for LogId {
 pub struct MergedLine {
     pub id: LogId,
     pub line: Arc<FormattedLogLine>,
-    /// This is a repaint of an id already broadcast, not a new line — see
-    /// [`MergedLogTap::publish_frame`].
-    ///
-    /// Consumers keyed on the id alone do not need this: they replace whatever
-    /// they hold under that id either way. A *cursor* does, because "an id at
-    /// or below the last one I handed out" is otherwise exactly how it
-    /// recognises the replay across a subscribe/snapshot overlap and skips it —
-    /// which would make a progress line freeze on its first frame.
-    pub supersedes: bool,
 }
 
 /// What the tap still holds from some point onward.
@@ -845,9 +836,6 @@ struct MergedHistory {
     entries: std::collections::VecDeque<MergedLine>,
     capacity: usize,
     next_id: LogId,
-    /// Whether the newest entry is a progress frame that a later frame from the
-    /// same process may still overwrite. See [`MergedLogTap::publish_frame`].
-    last_was_frame: bool,
 }
 
 impl MergedHistory {
@@ -858,11 +846,7 @@ impl MergedHistory {
     fn append(&mut self, line: Arc<FormattedLogLine>) -> MergedLine {
         let id = self.next_id;
         self.next_id = id.next();
-        let entry = MergedLine {
-            id,
-            line,
-            supersedes: false,
-        };
+        let entry = MergedLine { id, line };
         if self.capacity > 0 {
             while self.entries.len() >= self.capacity {
                 self.entries.pop_front();
@@ -900,7 +884,6 @@ impl MergedLogTap {
                 entries: std::collections::VecDeque::new(),
                 capacity,
                 next_id: LogId::ZERO,
-                last_was_frame: false,
             })),
         }
     }
@@ -909,59 +892,24 @@ impl MergedLogTap {
     ///
     /// The id is assigned under the history lock, so ids and history order can
     /// never disagree.
+    ///
+    /// Every line published here is a new line, including a frame of an
+    /// in-place progress redraw. A process that ends a line with a bare `\r`
+    /// is repainting it, and this used to model that by re-publishing the
+    /// existing id so the newest line was replaced in place. That made a
+    /// line's height change after it had been laid out, which dragged the
+    /// whole log pane up and down under a reader following the tail, and it
+    /// only ever collapsed a repaint whose frame happened to still be the
+    /// newest line in the *merged* stream — so two processes repainting at
+    /// once collapsed neither, and no single answer could be right for two
+    /// clients filtering differently. The terminal writer and the web UI
+    /// always did append every frame; the tap is now the same.
     async fn publish(&self, line: Arc<FormattedLogLine>) -> LogId {
         let entry = {
             let mut history = self.history.lock().await;
-            history.last_was_frame = false;
             history.append(line)
         };
         // Send on a receiver-less broadcast is a cheap no-op.
-        let id = entry.id;
-        let _ = self.tx.send(entry);
-        id
-    }
-
-    /// Record and fan out one frame of an in-place progress redraw.
-    ///
-    /// A process that ends a line with a bare `\r` is repainting it, not adding
-    /// to the log — bazel, npm and cargo all do it several times a second. don
-    /// strips the cursor control that would make that work in a shared terminal,
-    /// so keeping every frame turned a progress bar into thousands of lines.
-    ///
-    /// A frame therefore *supersedes* the newest line rather than following it,
-    /// but only while that line is this process's own frame. If anything else
-    /// has logged since, this frame appends instead, so concurrent services
-    /// still interleave in the order things actually happened rather than one
-    /// service's progress bar swallowing another's output.
-    ///
-    /// Replacement re-publishes the existing id. That is the whole protocol: an
-    /// id names a slot in the stream, so a consumer that receives an id it
-    /// already holds replaces its copy, and one that connects later just sees
-    /// the current contents. Only ever the newest line changes, so no consumer
-    /// has to look further back than the line it last appended.
-    async fn publish_frame(&self, line: Arc<FormattedLogLine>) -> LogId {
-        let entry = {
-            let mut history = self.history.lock().await;
-            let superseding = history.last_was_frame
-                && history
-                    .entries
-                    .back()
-                    .is_some_and(|entry| entry.line.name == line.name);
-            history.last_was_frame = true;
-            match history.entries.back_mut().filter(|_| superseding) {
-                Some(back) => {
-                    back.line = line;
-                    // Retained as a plain line — a client catching up later
-                    // wants the newest contents, not a repaint instruction.
-                    // Only the broadcast copy is marked.
-                    MergedLine {
-                        supersedes: true,
-                        ..back.clone()
-                    }
-                }
-                None => history.append(line),
-            }
-        };
         let id = entry.id;
         let _ = self.tx.send(entry);
         id
@@ -1089,10 +1037,10 @@ impl MergedLogCursor {
             match self.rx.recv().await {
                 Ok(entry) => {
                     // Already handed out — the subscribe/snapshot overlap. Ids
-                    // make this exact; it used to be pointer identity. A
-                    // repaint of the line we handed out last is the one thing
-                    // that legitimately arrives with an id we have seen.
-                    if entry.id < self.next && !self.is_repaint_of_last(&entry) {
+                    // make this exact; it used to be pointer identity. Every
+                    // id is published exactly once, so an id at or below the
+                    // last one handed out is always the replay.
+                    if entry.id < self.next {
                         continue;
                     }
                     self.next = entry.id.next();
@@ -1118,16 +1066,6 @@ impl MergedLogCursor {
 
     /// Whatever is already in hand, without waiting for more.
     ///
-    /// Whether this entry repaints the line this cursor handed out last.
-    ///
-    /// A progress frame supersedes the newest line in place, so it arrives with
-    /// an id already delivered. Without this the skip that de-duplicates the
-    /// subscribe/snapshot overlap would swallow every frame after the first and
-    /// the line would sit at its opening value until something else logged.
-    fn is_repaint_of_last(&self, entry: &MergedLine) -> bool {
-        entry.supersedes && entry.id.next() == self.next
-    }
-
     /// For draining at shutdown: the tap has published its last lines and they
     /// are sitting in this receiver, but nothing further is coming, so
     /// [`Self::recv`] would park forever. Healing a gap needs an await, so a
@@ -1141,7 +1079,7 @@ impl MergedLogCursor {
             }
             match self.rx.try_recv() {
                 Ok(entry) => {
-                    if entry.id < self.next && !self.is_repaint_of_last(&entry) {
+                    if entry.id < self.next {
                         continue;
                     }
                     self.next = entry.id.next();
@@ -2009,7 +1947,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 false,
                 &verbosity,
                 start,
-                false,
             )
             .await;
         }
@@ -2034,11 +1971,11 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             let held = accumulators.remove(&msg.prefix);
             // A \r still held at the end of the stream was a repaint that
             // nothing followed — the last frame a progress bar drew before the
-            // process exited. It supersedes, rather than landing beside the
-            // frame it was painting over.
-            let was_repaint = cr_pending.remove(&msg.prefix);
+            // process exited. It lands as its own line like every other frame;
+            // the carriage return itself is not part of what it painted.
+            let ended_on_repaint = cr_pending.remove(&msg.prefix);
             let held = held.map(|mut acc| {
-                if was_repaint && acc.last() == Some(&b'\r') {
+                if ended_on_repaint && acc.last() == Some(&b'\r') {
                     acc.truncate(acc.len() - 1);
                 }
                 acc
@@ -2066,7 +2003,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     msg.is_verbose,
                     &verbosity,
                     start,
-                    was_repaint,
                 )
                 .await;
             }
@@ -2122,7 +2058,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_verbose,
                         &verbosity,
                         start,
-                        true,
                     )
                     .await;
                 }
@@ -2149,7 +2084,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_verbose,
                         &verbosity,
                         start,
-                        false,
                     )
                     .await;
                 }
@@ -2169,7 +2103,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                     false,
                     &verbosity,
                     start,
-                    false,
                 )
                 .await;
                 alt_screen.insert(msg.prefix.clone());
@@ -2202,7 +2135,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_verbose,
                         &verbosity,
                         start,
-                        false,
                     )
                     .await;
                 }
@@ -2236,7 +2168,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                         msg.is_verbose,
                         &verbosity,
                         start,
-                        false,
                     )
                     .await;
                     acc.clear();
@@ -2274,7 +2205,6 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 false,
                 &verbosity,
                 start,
-                false,
             )
             .await;
         }
@@ -2319,7 +2249,6 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     is_verbose: bool,
     verbosity: &VerbosityControl,
     start: std::time::Instant,
-    is_frame: bool,
 ) {
     let bytes = build_formatted_bytes(prefix, line, verbosity, start);
     let formatted = Arc::new(FormattedLogLine {
@@ -2341,11 +2270,7 @@ async fn emit_line<W: tokio::io::AsyncWrite + Unpin + Send>(
     // narration about it still goes through, which is what keeps the log
     // saying "migrate: complete (2.4s)" while its window is open.
     if is_lifecycle || !mute.is_attached(name) {
-        if is_frame {
-            tap.publish_frame(formatted).await;
-        } else {
-            tap.publish(formatted).await;
-        }
+        tap.publish(formatted).await;
     }
     if is_verbose && !verbosity.is_enabled() {
         return;
@@ -3109,7 +3034,6 @@ mod tests {
                 false,
                 &VerbosityControl::new(false),
                 std::time::Instant::now(),
-                false,
             )
             .await;
 
@@ -3236,110 +3160,6 @@ mod tests {
         }
     }
 
-    /// A progress frame overwrites the newest line, but only while that line is
-    /// still its own — otherwise one service repainting a progress bar would
-    /// swallow whatever another service logged in between.
-    #[tokio::test]
-    async fn a_progress_frame_only_supersedes_its_own_last_line() {
-        /// `(name, text, is_frame)`
-        type Publish = (&'static str, &'static str, bool);
-
-        struct Case {
-            label: &'static str,
-            publish: &'static [Publish],
-            /// Retained history afterwards, as `(name, text)`.
-            want: &'static [(&'static str, &'static str)],
-        }
-
-        let cases = [
-            Case {
-                label: "consecutive frames from one process collapse to the last",
-                publish: &[
-                    ("bazel", "10%", true),
-                    ("bazel", "50%", true),
-                    ("bazel", "90%", true),
-                ],
-                want: &[("bazel", "90%")],
-            },
-            Case {
-                label: "another process logging in between breaks the run",
-                publish: &[
-                    ("bazel", "10%", true),
-                    ("api", "listening", false),
-                    ("bazel", "90%", true),
-                ],
-                want: &[("bazel", "10%"), ("api", "listening"), ("bazel", "90%")],
-            },
-            Case {
-                label: "another process's frame breaks it too",
-                publish: &[
-                    ("bazel", "10%", true),
-                    ("npm", "fetching", true),
-                    ("bazel", "90%", true),
-                ],
-                want: &[("bazel", "10%"), ("npm", "fetching"), ("bazel", "90%")],
-            },
-            Case {
-                label: "a real line from the same process is kept, not overwritten",
-                publish: &[("bazel", "90%", true), ("bazel", "build succeeded", false)],
-                want: &[("bazel", "90%"), ("bazel", "build succeeded")],
-            },
-            Case {
-                label: "a frame after a real line appends rather than eating it",
-                publish: &[("bazel", "starting", false), ("bazel", "10%", true)],
-                want: &[("bazel", "starting"), ("bazel", "10%")],
-            },
-            Case {
-                label: "ordinary lines never collapse",
-                publish: &[("api", "one", false), ("api", "two", false)],
-                want: &[("api", "one"), ("api", "two")],
-            },
-        ];
-
-        for case in cases {
-            let tap = MergedLogTap::with_capacity(100);
-            for (name, text, is_frame) in case.publish {
-                let line = Arc::new(FormattedLogLine {
-                    name: (*name).to_string(),
-                    is_lifecycle: false,
-                    is_verbose: false,
-                    prefix: Vec::new(),
-                    bytes: text.as_bytes().to_vec(),
-                });
-                if *is_frame {
-                    tap.publish_frame(line).await;
-                } else {
-                    tap.publish(line).await;
-                }
-            }
-
-            let got: Vec<(String, String)> = tap
-                .tail(100)
-                .await
-                .lines
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.line.name.clone(),
-                        String::from_utf8_lossy(&entry.line.bytes).into_owned(),
-                    )
-                })
-                .collect();
-            let want: Vec<(String, String)> = case
-                .want
-                .iter()
-                .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
-                .collect();
-            assert_eq!(got, want, "{}", case.label);
-
-            // A superseded frame reuses its id rather than burning one, so
-            // consumers can key off the id to know it is the same slot.
-            let ids: Vec<u64> = tap.tail(100).await.lines.iter().map(|e| e.id.0).collect();
-            let expected: Vec<u64> = (0..case.want.len() as u64).collect();
-            assert_eq!(ids, expected, "{}: ids stay contiguous", case.label);
-        }
-    }
-
     /// The name travels as a rendered column beside the message, not glued to
     /// the front of it. A consumer that wants the name as a column should not
     /// have to search the text for a separator to recover something the sink
@@ -3393,61 +3213,20 @@ mod tests {
         }
     }
 
-    /// A cursor is what `don tui` and the `/logs` route read through, and it
-    /// skips ids it has already handed out to de-duplicate the subscribe /
-    /// snapshot overlap. A repaint arrives with exactly such an id, so without
-    /// care every frame after the first is swallowed and the progress line sits
-    /// at its opening value.
+    /// What a process writes with `\r`, and what the merged stream makes of it.
+    ///
+    /// A frame of an in-place repaint is a line like any other. It used to
+    /// collapse onto the previous frame by re-publishing its id, which meant a
+    /// line already laid out could change height and drag the whole log pane
+    /// up and down under a reader following the tail. The terminal writer and
+    /// the web UI always appended every frame; the tap now agrees with them.
+    ///
+    /// The CRLF cases are the ones that must never move: a PTY translates
+    /// every newline the child writes into `\r\n`, so reading that CR as a
+    /// repaint collapsed a service's entire output onto one line — 2,000 lines
+    /// became 1.
     #[tokio::test]
-    async fn a_cursor_sees_every_repaint() {
-        let tap = MergedLogTap::with_capacity(100);
-        let mut cursor = tap.cursor(None, 0).await;
-
-        for text in ["10%", "50%", "90%"] {
-            tap.publish_frame(Arc::new(FormattedLogLine {
-                name: "bazel".to_string(),
-                is_lifecycle: false,
-                is_verbose: false,
-                prefix: Vec::new(),
-                bytes: text.as_bytes().to_vec(),
-            }))
-            .await;
-        }
-        tap.publish(Arc::new(FormattedLogLine {
-            name: "bazel".to_string(),
-            is_lifecycle: false,
-            is_verbose: false,
-            prefix: Vec::new(),
-            bytes: b"done".to_vec(),
-        }))
-        .await;
-        drop(tap); // so the cursor ends rather than parking
-
-        let mut seen = Vec::new();
-        while let Some(event) = cursor.recv().await {
-            if let MergedEvent::Line(entry) = event {
-                seen.push((
-                    entry.id.0,
-                    String::from_utf8_lossy(&entry.line.bytes).into_owned(),
-                ));
-            }
-        }
-        assert_eq!(
-            seen,
-            vec![
-                (0, "10%".to_string()),
-                (0, "50%".to_string()),
-                (0, "90%".to_string()),
-                (1, "done".to_string()),
-            ],
-            "every frame must reach the client, all under the id it repaints"
-        );
-    }
-
-    /// The same rule, driven from the bytes a process actually writes rather
-    /// than from the tap's own API — this is the path bazel takes.
-    #[tokio::test]
-    async fn carriage_return_progress_collapses_end_to_end() {
+    async fn carriage_return_frames_are_ordinary_lines() {
         struct Case {
             name: &'static str,
             /// Raw bytes, as the child writes them.
@@ -3457,31 +3236,31 @@ mod tests {
 
         let cases = [
             Case {
-                name: "a progress bar repainting itself is one line",
+                name: "every frame of a progress bar is its own line",
                 emit: &[("builder", b"10%\r50%\r90%\r")],
-                want: &["90%"],
+                want: &["10%", "50%", "90%"],
             },
             Case {
                 name: "the newline that ends it keeps the final frame",
                 emit: &[("builder", b"10%\r90%\rdone\n")],
-                want: &["90%", "done"],
+                want: &["10%", "90%", "done"],
             },
             Case {
-                // Every line a process writes on a PTY arrives as \r\n, the
-                // terminal discipline having translated the newline. Reading
-                // that CR as a repaint collapses a service's whole output onto
-                // one line: 2,000 lines of output became 1.
                 name: "CRLF is a line ending, not a repaint",
                 emit: &[("builder", b"line one\r\nline two\r\nline three\r\n")],
                 want: &["line one", "line two", "line three"],
             },
             Case {
-                name: "a repaint mixed in among CRLF lines still repaints",
+                name: "a repaint mixed in among CRLF lines is still a repaint",
                 emit: &[("builder", b"start\r\n10%\r90%\rdone\r\n")],
-                want: &["start", "90%", "done"],
+                want: &["start", "10%", "90%", "done"],
             },
             Case {
-                name: "a second process interleaves instead of being overwritten",
+                // The case that used to depend on who logged last: a frame
+                // only collapsed while it was still the newest line in the
+                // merged stream, so two processes repainting at once collapsed
+                // neither. Now there is nothing for the interleaving to change.
+                name: "a second process interleaves",
                 emit: &[
                     ("builder", b"10%\r"),
                     ("api", b"listening\n"),
@@ -3518,33 +3297,14 @@ mod tests {
                 .iter()
                 .map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned())
                 .collect();
-            for want in case.want {
-                assert!(
-                    got.iter().any(|line| line.contains(want)),
-                    "{}: expected a line containing {want:?}, got {got:?}",
-                    case.name
-                );
-            }
-            let frames = got.iter().filter(|line| line.contains('%')).count();
-            let want_frames = case.want.iter().filter(|w| w.contains('%')).count();
-            assert_eq!(
-                frames, want_frames,
-                "{}: intermediate frames should not survive. got {got:?}",
-                case.name
-            );
-            // Nothing may be swallowed either. A short count is the collapse
-            // this guards against: with CRLF misread as a repaint, a service's
-            // whole output lands on one line.
-            let from_processes = got
-                .iter()
-                .filter(|line| case.want.iter().any(|w| line.contains(w)))
-                .count();
-            assert_eq!(
-                from_processes,
-                case.want.len(),
-                "{}: every line must survive. got {got:?}",
-                case.name
-            );
+            assert_eq!(got, case.want, "{}", case.name);
+
+            // Every line burns its own id, so a consumer keyed on the id never
+            // sees one arrive twice and never has to revisit a line it has
+            // already laid out.
+            let ids: Vec<u64> = tap.tail(100).await.lines.iter().map(|e| e.id.0).collect();
+            let expected: Vec<u64> = (0..case.want.len() as u64).collect();
+            assert_eq!(ids, expected, "{}: one id per line, in order", case.name);
         }
     }
 

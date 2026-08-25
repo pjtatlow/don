@@ -1728,10 +1728,6 @@ async fn attach_tui_inner(
                                 prefix: prefix.into_bytes(),
                                 bytes: line.into_bytes(),
                             }),
-                            // The wire doesn't carry it and this side doesn't
-                            // need it: the flag exists for cursors, and the
-                            // store this feeds replaces on id equality alone.
-                            supersedes: false,
                         });
                         if log_tx.send(event).is_err() {
                             return;

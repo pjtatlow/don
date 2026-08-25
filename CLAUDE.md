@@ -141,11 +141,11 @@ line that scrolled away an hour ago is still in the byte stream. Grepping the
 bytes gives both false negatives and false positives. The tools below render
 the stream into a screen and assert on that.
 
-There are four tools in `tools/`:
+There are five tools in `tools/`:
 
 - **`tools/tui_emulator.py`** — the shared harness: a PTY session plus a
   terminal emulator (uses `pyte` when installed, falls back to a built-in
-  subset of CUP/ED/EL/SGR/alt-screen otherwise). The other three import it.
+  subset of CUP/ED/EL/SGR/alt-screen otherwise). The other drivers import it.
 - **`tools/tui_drive.py`** — runs `don start` under a real PTY, waits for
   "all services running" *on screen*, lingers, sends Ctrl+C, and checks that
   shutdown narrates itself, that don exits promptly, and that the alternate
@@ -165,6 +165,15 @@ There are four tools in `tools/`:
   That one invariant catches the whole family of index-vs-pane drift bugs:
   duplicated rows, skipped rows, a pane that positions itself by one set of row
   counts and paints another. Writes its own `don.toml` if the project has none.
+- **`tools/tui_drive_progress.py`** — fills the pane, stops the ordinary
+  output, and leaves a service repainting a progress bar with `\r` frames of
+  swinging length. Checks that no line on screen ever moves back *down*.
+  Following the tail is bottom-anchored, so anything that changes the total row
+  count moves everything above it: content arriving is supposed to (the log
+  scrolls up), a line already laid out changing height is not. Samples across
+  the repaint interval rather than in step with it — a probe that samples in
+  lockstep reports a clean run against a binary that is visibly jumping.
+  Writes its own `don.toml` if the project has none.
 - **`tools/gen_stress_config.py`** — generates a synthetic `don.toml` plus
   per-service scripts mirroring a busy monorepo: hidden infra services, TERM-trap
   floods, dozens of lazy `app-NN` services with `listenfd` proxies. This is the
@@ -187,6 +196,9 @@ python3 tools/tui_drive_resize.py target/release/don /tmp/don-stress
 
 rm -rf /tmp/don-logview
 python3 tools/tui_drive_logs.py target/release/don /tmp/don-logview
+
+rm -rf /tmp/don-progress
+python3 tools/tui_drive_progress.py target/release/don /tmp/don-progress
 ```
 
 The stress config's proxies start at port 18000, which collides with plenty of
