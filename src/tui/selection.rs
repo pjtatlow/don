@@ -126,31 +126,105 @@ impl Selection {
     }
 }
 
+/// Punctuation that always ends a word.
+///
+/// Given by exclusion — anything not listed here and not a joiner is part of a
+/// word — so letters outside ASCII are word characters without having to be
+/// enumerated, and so `-`, `_`, `/`, `@`, `+`, `~`, `#`, `$` and `%` keep
+/// holding together the identifiers, paths, flags and scoped names that a log
+/// is mostly made of.
+fn ends_word(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\''
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+                | '='
+                | '\\'
+                | '|'
+                | '&'
+                | '!'
+                | '?'
+                | '*'
+                | '^'
+        )
+}
+
+/// Punctuation that belongs to a word only when it sits *between* two word
+/// characters.
+///
+/// `.` and `:` are load-bearing in the middle of a thing and noise at the edge
+/// of one. In the middle they hold together `1.5s`, `v1.2.3`, `127.0.0.1:8080`
+/// and `//tools/nodejs:install`; at the edge they are the full stop ending
+/// "build completed." and the separator in `"key":42`, where taking them along
+/// hands the reader `completed.` and `:42`.
+fn joins_word(c: char) -> bool {
+    matches!(c, '.' | ':')
+}
+
+/// Whether the character at `at` is part of a word.
+fn is_word_char(chars: &[char], at: usize) -> bool {
+    let Some(&c) = chars.get(at) else {
+        return false;
+    };
+    if ends_word(c) {
+        return false;
+    }
+    if !joins_word(c) {
+        return true;
+    }
+    // A joiner needs something on both sides to join. Another joiner does not
+    // count, so `a..b` is two words rather than one.
+    let solid = |index: Option<usize>| {
+        index
+            .and_then(|index| chars.get(index))
+            .is_some_and(|&c| !ends_word(c) && !joins_word(c))
+    };
+    solid(at.checked_sub(1)) && solid(Some(at + 1))
+}
+
 /// The half-open character range of the word under `offset`, if there is one.
 ///
-/// Whitespace-delimited, which is what a log wants: paths, ids, durations and
-/// bracketed levels all come out whole, and the alternative — a table of
-/// "word characters" — argues with itself over `/`, `-`, `:` and `.`, every
-/// one of which appears inside something a reader means to grab as a unit.
+/// Two rules: a small set of punctuation always ends a word, and `.`/`:` end
+/// one unless they sit between two word characters. Everything else — letters,
+/// digits, `-`, `_`, `/`, `@` and the rest — holds a word together.
 ///
-/// `None` when the offset is on whitespace or past the end, so a double-click
-/// on empty space selects nothing rather than something arbitrary.
+/// This was whitespace-delimited once, on the reasoning that a log's paths,
+/// ids and durations should come out whole and a table of word characters
+/// argues with itself over `/`, `-`, `:` and `.`. It does, and the rules above
+/// are what settle those four. What the old rule could not survive was
+/// structured output: JSON has no spaces to speak of, so a double-click
+/// anywhere inside `{"name":"api","count":42}` selected the whole object.
+///
+/// `None` when the offset is past the end or on punctuation — whitespace or
+/// otherwise — so a double-click that lands between words selects nothing
+/// rather than something arbitrary.
 ///
 /// Runs over the whole message rather than one rendered row, so a word the
 /// pane wrapped in the middle still comes out whole.
 pub(crate) fn word_at(message: &str, offset: usize) -> Option<(usize, usize)> {
     let chars: Vec<char> = message.chars().collect();
-    if offset >= chars.len() || chars[offset].is_whitespace() {
+    if !is_word_char(&chars, offset) {
         return None;
     }
-    let start = chars[..offset]
-        .iter()
-        .rposition(|c| c.is_whitespace())
-        .map_or(0, |idx| idx + 1);
-    let end = chars[offset..]
-        .iter()
-        .position(|c| c.is_whitespace())
-        .map_or(chars.len(), |idx| offset + idx);
+    let mut start = offset;
+    while start > 0 && is_word_char(&chars, start - 1) {
+        start -= 1;
+    }
+    let mut end = offset + 1;
+    while is_word_char(&chars, end) {
+        end += 1;
+    }
     Some((start, end))
 }
 
@@ -248,7 +322,7 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -531,45 +605,120 @@ mod tests {
     }
 
     /// A double-click finds the word in the message, so one the pane wrapped
-    /// still comes out whole.
+    /// still comes out whole — and finds a *word*, not everything between two
+    /// spaces, which in structured output is the whole line.
     #[test]
     fn word_at_takes_whole_words_out_of_the_message() {
         struct Case {
             name: &'static str,
-            offset: usize,
+            message: &'static str,
+            /// Clicked on the first character of this substring.
+            at: &'static str,
             want: Option<&'static str>,
         }
 
-        let message = "GET /api/v1/users 200 14ms";
+        let json =
+            r#"level=info msg={"name":"redo-analytics","count":42,"path":"/foo/bar"} took=14ms"#;
+
         for case in [
+            // The reason this changed: every one of these used to select the
+            // entire `msg={...}` blob, because JSON has no spaces in it.
+            Case {
+                name: "a json key",
+                message: json,
+                at: "name",
+                want: Some("name"),
+            },
+            Case {
+                name: "a json string value keeps its hyphen",
+                message: json,
+                at: "redo-analytics",
+                want: Some("redo-analytics"),
+            },
+            Case {
+                name: "an unquoted json value leaves the colon behind",
+                message: json,
+                at: "42",
+                want: Some("42"),
+            },
+            Case {
+                name: "a path inside json is still one word",
+                message: json,
+                at: "/foo/bar",
+                want: Some("/foo/bar"),
+            },
+            Case {
+                name: "an equals splits a key from its value",
+                message: json,
+                at: "info",
+                want: Some("info"),
+            },
+            Case {
+                name: "a duration keeps its unit",
+                message: json,
+                at: "14ms",
+                want: Some("14ms"),
+            },
+            // What the whitespace rule got right, and still does.
             Case {
                 name: "a path is one word",
-                offset: 6,
+                message: "GET /api/v1/users 200 14ms",
+                at: "/api/v1/users",
                 want: Some("/api/v1/users"),
             },
             Case {
                 name: "from the first character of one",
-                offset: 0,
+                message: "GET /api/v1/users 200 14ms",
+                at: "GET",
                 want: Some("GET"),
             },
             Case {
-                name: "a duration keeps its unit",
-                offset: 23,
-                want: Some("14ms"),
+                name: "a bazel label keeps its colon",
+                message: "building //tools/nodejs:install now",
+                at: "//tools",
+                want: Some("//tools/nodejs:install"),
+            },
+            Case {
+                name: "a host and port stay together",
+                message: "listening on 127.0.0.1:8080",
+                at: "127",
+                want: Some("127.0.0.1:8080"),
+            },
+            Case {
+                name: "a version keeps its dots",
+                message: "don v1.2.3-rc.1 starting",
+                at: "v1",
+                want: Some("v1.2.3-rc.1"),
+            },
+            Case {
+                name: "a full stop is not part of the word it follows",
+                message: "build completed.",
+                at: "completed",
+                want: Some("completed"),
+            },
+            Case {
+                name: "a bracketed level comes out without its brackets",
+                message: "[INFO] ready",
+                at: "INFO",
+                want: Some("INFO"),
             },
             Case {
                 name: "whitespace selects nothing",
-                offset: 3,
+                message: "GET /api/v1/users",
+                at: " /api",
                 want: None,
             },
             Case {
-                name: "and so does past the end",
-                offset: 500,
+                name: "and so does punctuation",
+                message: r#"{"a":1}"#,
+                at: r#"{"#,
                 want: None,
             },
         ] {
-            let got = word_at(message, case.offset).map(|(start, end)| {
-                message
+            let byte = case.message.find(case.at).expect(case.name);
+            let offset = case.message[..byte].chars().count();
+            let got = word_at(case.message, offset).map(|(start, end)| {
+                case.message
                     .chars()
                     .skip(start)
                     .take(end - start)
@@ -577,5 +726,12 @@ mod tests {
             });
             assert_eq!(got.as_deref(), case.want, "{}", case.name);
         }
+    }
+
+    /// Past the end is not a word, however far past.
+    #[test]
+    fn word_at_past_the_end_selects_nothing() {
+        assert_eq!(word_at("GET /api", 500), None);
+        assert_eq!(word_at("", 0), None);
     }
 }
