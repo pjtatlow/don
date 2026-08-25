@@ -26,8 +26,8 @@ pub use self::service::{
 };
 pub use self::task::{Task, TaskAutoRun, TaskHeadless};
 pub use self::types::{
-    BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ProxyMode, ReadyCheck,
-    ShutdownConfig,
+    BazelConfig, BazelDefaults, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry,
+    ProxyMode, ReadyCheck, ShutdownConfig,
 };
 pub use profile::resolve_profile_processes;
 
@@ -37,6 +37,17 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+/// Whether `name` is usable as a `--config=<name>` argument.
+///
+/// Bazel resolves the name against the `build:<name>` lines in the `.rc`
+/// files and fails the build if it finds none, so a name that could never
+/// match one is worth catching while we can still say which service it came
+/// from. Anything past that — whether the config is actually defined — only
+/// Bazel can answer, and it does.
+fn is_usable_bazel_config(name: &str) -> bool {
+    !name.trim().is_empty() && !name.starts_with('-') && !name.contains(char::is_whitespace)
+}
 
 fn default_true() -> bool {
     true
@@ -85,6 +96,10 @@ pub struct Config {
     /// own `auto_filter_on_failure` setting. Defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_filter_on_failure: bool,
+    /// Workspace-wide Bazel settings. Services and tasks that build with
+    /// Bazel take their defaults from here.
+    #[serde(default)]
+    pub bazel: BazelDefaults,
 }
 
 impl std::str::FromStr for Config {
@@ -396,6 +411,18 @@ impl Config {
                 ));
             }
         }
+        // Bazel rejects `--config=` with an undefined or empty name outright,
+        // and it does it after the build has been asked for — so catch it here
+        // rather than letting every bazel service fail at startup.
+        if let Some(name) = &self.bazel.config
+            && !is_usable_bazel_config(name)
+        {
+            errors.push(format!(
+                "global bazel: invalid config name '{name}' — \
+                 name a configuration defined in .bazelrc, like 'build:{}'",
+                name.trim()
+            ));
+        }
         if let Err(e) = crate::duration::parse_duration(&self.shutdown.timeout) {
             errors.push(format!("global shutdown: invalid timeout: {e}"));
         }
@@ -619,6 +646,16 @@ impl Config {
         let mut proxy_addrs: HashMap<&str, &str> = HashMap::new(); // addr -> service name
         for (name, svc) in &self.services {
             let resolved = svc.resolve(platform);
+            if let Some(bazel) = resolved.bazel_config()
+                && let Some(config) = &bazel.config
+                && !is_usable_bazel_config(config)
+            {
+                errors.push(format!(
+                    "service '{name}': invalid bazel config name '{config}' — \
+                     name a configuration defined in .bazelrc, like 'build:{}'",
+                    config.trim()
+                ));
+            }
             // lazy needs at least one proxy entry to trigger on.
             if resolved.lazy && resolved.proxy.is_empty() {
                 errors.push(format!(
@@ -670,6 +707,16 @@ impl Config {
 
         // Validate tasks
         for (name, task) in &self.tasks {
+            if let Some(bazel) = &task.bazel
+                && let Some(config) = &bazel.config
+                && !is_usable_bazel_config(config)
+            {
+                errors.push(format!(
+                    "task '{name}': invalid bazel config name '{config}' — \
+                     name a configuration defined in .bazelrc, like 'build:{}'",
+                    config.trim()
+                ));
+            }
             for dep in &task.depends_on {
                 if !dependency_reference_names.contains(dep.name.as_str()) {
                     let suggestion = suggest_typo(&dep.name, &dependency_reference_names);
@@ -1240,6 +1287,172 @@ mod tests {
     use super::*;
 
     const TEST_PLATFORM: Platform = Platform::LinuxX86_64;
+
+    /// Which `.bazelrc` configuration a target builds under: its own if it
+    /// names one, else the workspace's, else none at all. Resolved once, where
+    /// the build request is built, so nothing downstream has to know a
+    /// workspace default exists.
+    #[test]
+    fn a_bazel_target_takes_its_configuration_from_itself_then_the_workspace() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            want_service: Option<&'static str>,
+            want_task: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "nothing named anywhere",
+                toml: "[services.api]\nbazel.target = \"//api\"\n\
+                       [tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\n",
+                want_service: None,
+                want_task: None,
+            },
+            Case {
+                name: "the workspace names one and both inherit it",
+                toml: "[bazel]\nconfig = \"don\"\n\
+                       [services.api]\nbazel.target = \"//api\"\n\
+                       [tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\n",
+                want_service: Some("don"),
+                want_task: Some("don"),
+            },
+            Case {
+                name: "an item that names its own overrides the workspace",
+                toml: "[bazel]\nconfig = \"don\"\n\
+                       [services.api]\nbazel.target = \"//api\"\nbazel.config = \"api-dev\"\n\
+                       [tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\nbazel.config = \"gen\"\n",
+                want_service: Some("api-dev"),
+                want_task: Some("gen"),
+            },
+            Case {
+                name: "an item may name one where the workspace does not",
+                toml: "[services.api]\nbazel.target = \"//api\"\nbazel.config = \"api-dev\"\n\
+                       [tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\n",
+                want_service: Some("api-dev"),
+                want_task: None,
+            },
+        ];
+
+        for case in cases {
+            let config: Config = case.toml.parse().unwrap();
+            let workspace = config.bazel.config.as_deref();
+
+            let service = config.services.get("api").unwrap().resolve(TEST_PLATFORM);
+            let resolved = service
+                .bazel_config()
+                .cloned()
+                .unwrap()
+                .with_workspace_default(workspace);
+            assert_eq!(
+                resolved.config.as_deref(),
+                case.want_service,
+                "{}: service",
+                case.name
+            );
+
+            let task = config.tasks.get("gen").unwrap();
+            let resolved = task
+                .bazel
+                .clone()
+                .unwrap()
+                .with_workspace_default(workspace);
+            assert_eq!(
+                resolved.config.as_deref(),
+                case.want_task,
+                "{}: task",
+                case.name
+            );
+        }
+    }
+
+    /// Naming a configuration bazel could never resolve fails the config
+    /// rather than every bazel build in it. Whether the name is actually
+    /// defined is bazel's to answer, and it does — loudly.
+    #[test]
+    fn an_unusable_bazel_configuration_name_is_rejected() {
+        struct Case {
+            name: &'static str,
+            config: &'static str,
+            want_err: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "an ordinary name",
+                config: "don",
+                want_err: false,
+            },
+            Case {
+                name: "names with punctuation bazel allows",
+                config: "don-dev_2",
+                want_err: false,
+            },
+            Case {
+                name: "empty",
+                config: "",
+                want_err: true,
+            },
+            Case {
+                name: "blank",
+                config: "   ",
+                want_err: true,
+            },
+            Case {
+                name: "a flag, not a name",
+                config: "--noshow_progress",
+                want_err: true,
+            },
+            Case {
+                name: "several flags crammed in",
+                config: "don --noshow_progress",
+                want_err: true,
+            },
+        ];
+
+        for case in cases {
+            for (label, toml) in [
+                (
+                    "global",
+                    format!(
+                        "[bazel]\nconfig = \"{}\"\n[services.api]\nbazel.target = \"//api\"\n",
+                        case.config
+                    ),
+                ),
+                (
+                    "service",
+                    format!(
+                        "[services.api]\nbazel.target = \"//api\"\nbazel.config = \"{}\"\n",
+                        case.config
+                    ),
+                ),
+                (
+                    "task",
+                    format!(
+                        "[tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\nbazel.config = \"{}\"\n",
+                        case.config
+                    ),
+                ),
+            ] {
+                let config: Config = toml.parse().unwrap();
+                let result = config.validate(TEST_PLATFORM);
+                assert_eq!(
+                    result.is_err(),
+                    case.want_err,
+                    "{} ({label}): {result:?}",
+                    case.name
+                );
+                if case.want_err {
+                    let message = format!("{}", result.unwrap_err());
+                    assert!(
+                        message.contains(".bazelrc"),
+                        "{} ({label}): the error should say where a config comes from: {message}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_validate_platform_download() {

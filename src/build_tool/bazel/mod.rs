@@ -45,6 +45,32 @@ pub(crate) struct BazelResolver {
     emitter: Option<crate::output::LifecycleEmitter>,
 }
 
+/// The full `bazel` argument list for building `targets`.
+///
+/// `--curses=no` forces line-buffered progress output. Without it, bazel
+/// detects the piped stderr and *may* still emit progress with \r-only
+/// updates (or buffer for seconds), so our line-reader sees nothing for long
+/// stretches of analysis/loading. With curses off, each progress tick is a
+/// separate \n-terminated line we can stream.
+///
+/// `--color=auto` suppresses ANSI when stderr isn't a TTY (our case — we pipe
+/// it). Forcing colors on keeps INFO/WARN/ERROR visually distinct in the
+/// bazel-prefixed stream; the sanitize pass keeps SGR and strips only
+/// cursor/screen codes.
+///
+/// A configured `--config` goes *after* both, so a workspace that deliberately
+/// sets either of them in its `.bazelrc` wins. That includes winning in ways
+/// that stop don reading this output as lines, which is the workspace's call
+/// to make.
+fn build_args(targets: &[String], config: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["build".into(), "--curses=no".into(), "--color=yes".into()];
+    if let Some(config) = config {
+        args.push(format!("--config={config}"));
+    }
+    args.extend(targets.iter().cloned());
+    args
+}
+
 impl BazelResolver {
     /// Create a new resolver.
     ///
@@ -157,6 +183,7 @@ impl BazelResolver {
         &self,
         targets: &[String],
         working_dir: &Path,
+        config: Option<&str>,
         mut on_line: F,
         emitter: Option<&crate::output::LifecycleEmitter>,
     ) -> Result<super::BatchBuildResult, BuildToolError>
@@ -172,20 +199,11 @@ impl BazelResolver {
 
         self.check_installed().await?;
 
+        // Built once and used for both the spawn and the debug line, so the
+        // two cannot describe different commands.
+        let args = build_args(targets, config);
         let mut cmd = tokio::process::Command::new("bazel");
-        cmd.arg("build");
-        // `--curses=no` forces line-buffered progress output. Without it,
-        // bazel detects the piped stderr and *may* still emit progress with
-        // \r-only updates (or buffer for seconds), so our line-reader sees
-        // nothing for long stretches of analysis/loading. With curses off,
-        // each progress tick is a separate \n-terminated line we can stream.
-        cmd.arg("--curses=no");
-        // Bazel's `--color=auto` suppresses ANSI when stderr isn't a TTY
-        // (our case — we pipe it). Force colors on so INFO/WARN/ERROR are
-        // visually distinct in the bazel-prefixed stream. Our sanitize pass
-        // keeps SGR sequences, strips only cursor/screen codes.
-        cmd.arg("--color=yes");
-        cmd.args(targets);
+        cmd.args(&args);
         cmd.current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -195,9 +213,6 @@ impl BazelResolver {
             .kill_on_drop(true);
 
         if let Some(em) = emitter {
-            let mut args: Vec<String> =
-                vec!["build".into(), "--curses=no".into(), "--color=yes".into()];
-            args.extend(targets.iter().cloned());
             em.debug_spawn("bazel", "bazel", &args);
         }
 
@@ -331,6 +346,7 @@ impl BazelResolver {
         &self,
         targets: &[String],
         working_dir: &Path,
+        config: Option<&str>,
     ) -> Result<bool, BuildToolError> {
         if targets.is_empty() {
             return Ok(true);
@@ -339,6 +355,11 @@ impl BazelResolver {
         let mut cmd = tokio::process::Command::new("bazel");
         cmd.arg("build");
         cmd.arg("--check_up_to_date");
+        // The same configuration the build would use. Asking about a
+        // different one answers about artifacts the build will not produce.
+        if let Some(config) = config {
+            cmd.arg(format!("--config={config}"));
+        }
         cmd.args(targets);
         cmd.current_dir(working_dir)
             .stdout(std::process::Stdio::null())
@@ -573,6 +594,47 @@ fn is_lock_wait_notice(line: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The whole command line, in order. `--config` has to come after don's
+    /// own flags — that ordering is what lets a workspace override them from
+    /// its `.bazelrc` — and before the targets, because bazel reads
+    /// everything after the first target as a target.
+    #[test]
+    fn build_args_places_the_configuration_after_dons_own_flags() {
+        struct Case {
+            name: &'static str,
+            targets: &'static [&'static str],
+            config: Option<&'static str>,
+            want: &'static [&'static str],
+        }
+
+        let cases = vec![
+            Case {
+                name: "no configuration named",
+                targets: &["//a", "//b"],
+                config: None,
+                want: &["build", "--curses=no", "--color=yes", "//a", "//b"],
+            },
+            Case {
+                name: "a configuration is the last flag before the targets",
+                targets: &["//a"],
+                config: Some("don"),
+                want: &["build", "--curses=no", "--color=yes", "--config=don", "//a"],
+            },
+            Case {
+                name: "no targets is still a well-formed command",
+                targets: &[],
+                config: Some("don"),
+                want: &["build", "--curses=no", "--color=yes", "--config=don"],
+            },
+        ];
+
+        for case in cases {
+            let targets: Vec<String> = case.targets.iter().map(|t| (*t).to_string()).collect();
+            let got = build_args(&targets, case.config);
+            assert_eq!(got, case.want, "{}", case.name);
+        }
+    }
 
     #[test]
     fn test_should_emit_stderr_line() {

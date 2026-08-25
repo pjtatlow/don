@@ -502,6 +502,39 @@ Don will:
 
 Multiple services sharing the same source files are batched into one `bazel build` invocation.
 
+#### Build flags: use `.bazelrc`
+
+Don passes `--curses=no` and `--color=yes` so it can read build output as
+lines, and otherwise leaves the command alone — a plain `build --flag` line in
+your workspace `.bazelrc` already applies to the builds Don runs.
+
+When you want a flag only when *Don* builds, and not when you run `bazel build`
+yourself, name a configuration and point Don at it:
+
+```
+# .bazelrc
+build:don --noshow_progress
+```
+
+```toml
+[bazel]
+config = "don"          # every Bazel build Don runs
+```
+
+Individual services and tasks may name a different one, and targets built under
+different configurations are built separately — one `bazel build` takes one
+`--config`:
+
+```toml
+[services.api]
+bazel.target = "//services/api:api"
+bazel.config = "api-dev"
+```
+
+Don passes `--config` after its own two flags, so a configuration that sets
+`--curses` or `--color` wins. Naming a configuration that no `.rc` file defines
+is a hard Bazel error, which is why there is no default.
+
 Set `bazel.watch = false` to keep Bazel startup builds/runs but skip Bazel-derived watch paths. This is useful when Bazel queries are too broad or too expensive and you want explicit watch globs instead:
 
 ```toml
@@ -861,6 +894,8 @@ See [`examples/`](examples/) for complete working configs.
 | `lazy` | bool | Delay start until first proxy connection |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
 | `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
+| `bazel.config` | string | `.bazelrc` configuration to build this target under, as `--config=<name>` |
+| `bazel.config` (top-level `[bazel]`) | string | Same, for every Bazel build Don runs; per-service/task settings override it |
 | `download.platform.<platform>` | table | Per-platform download config |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
 | `fallback_ports` | bool | Top-level: use an OS-assigned proxy/Docker host port when the preferred port is in use |

@@ -39,6 +39,9 @@ pub(crate) struct TaskWorkerContext {
     pub(crate) platform: Platform,
     pub(crate) emitter: crate::output::LifecycleEmitter,
     pub(crate) global_watch_ignore: Vec<String>,
+    /// Workspace-wide `.bazelrc` configuration name, for a task that builds
+    /// with Bazel and names none of its own.
+    pub(crate) bazel_config: Option<String>,
     /// Where every service can be reached, for rendering this task's
     /// `$(service.KEY)` env references at the moment it runs.
     pub(crate) endpoints: crate::endpoints::EndpointReader,
@@ -200,6 +203,8 @@ pub(crate) async fn run_task_worker(
         platform,
         emitter,
         global_watch_ignore,
+        // Read where the build request is built, not here.
+        bazel_config: _,
         endpoints,
     } = ctx;
     // Resolve `$(service.KEY)` here rather than at request time, so a run

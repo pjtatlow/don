@@ -212,6 +212,9 @@ pub(crate) struct StartEnv {
     /// Project-wide watch-ignore patterns, for the build spec this supervisor
     /// hands the build manager.
     pub(crate) global_watch_ignore: Vec<String>,
+    /// Workspace-wide `.bazelrc` configuration name, for a service that builds
+    /// with Bazel and names none of its own.
+    pub(crate) bazel_config: Option<String>,
     /// What every process says about itself. This supervisor computes its own
     /// permission from its dependencies' entries — see [`crate::gate::level`].
     pub(crate) facts: crate::facts::FactsReader,
@@ -1818,7 +1821,10 @@ fn request_artifact(
             item: Box::new(crate::build_tool::batch::BatchBuildItem {
                 name: name.to_string(),
                 kind: super::ProcessKind::Service,
-                bazel: resolved.bazel_config().cloned(),
+                bazel: resolved
+                    .bazel_config()
+                    .cloned()
+                    .map(|b| b.with_workspace_default(env.bazel_config.as_deref())),
                 watch_enabled: resolved.build_tool_watch_enabled(),
                 working_dir,
                 ignore,
@@ -1877,6 +1883,7 @@ fn rebuild_spec_for(
                 name: name.to_string(),
                 target: bazel.target.clone(),
                 working_dir: super::paths::working_dir_for(&env.base_dir, resolved.dir.as_deref()),
+                config: bazel.config.clone().or_else(|| env.bazel_config.clone()),
             })
         }
         _ => RebuildSpec::Plain {
@@ -2615,6 +2622,7 @@ mod tests {
         let (batcher_tx, batcher_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let env = StartEnv {
+            bazel_config: None,
             batcher_tx,
             base_dir: std::env::temp_dir(),
             pid_dir: std::env::temp_dir(),

@@ -247,7 +247,10 @@ fn request_artifact(
             item: Box::new(crate::build_tool::batch::BatchBuildItem {
                 name: name.to_string(),
                 kind: super::ProcessKind::Task,
-                bazel: task_cfg.bazel.clone(),
+                bazel: task_cfg
+                    .bazel
+                    .clone()
+                    .map(|b| b.with_workspace_default(ctx.bazel_config.as_deref())),
                 watch_enabled: task_cfg.build_tool_watch_enabled(),
                 working_dir,
                 ignore,
@@ -2368,6 +2371,7 @@ mod tests {
             .await
             .unwrap();
         let ctx = super::super::task_worker::TaskWorkerContext {
+            bazel_config: None,
             base_dir: temp.path().to_path_buf(),
             platform: crate::config::Platform::LinuxX86_64,
             emitter: output.clone_lifecycle_emitter(),

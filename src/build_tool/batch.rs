@@ -13,10 +13,23 @@ pub(crate) struct RebuildBatchRequest {
     pub(crate) force: bool,
 }
 
+/// What makes two targets shareable in one `bazel build`: the directory the
+/// labels belong to, and the `.bazelrc` configuration to build them under.
+/// A single invocation takes one `--config`, so both have to match.
+type BazelBatchKey = (PathBuf, Option<String>);
+
+/// Prepare-side groups: the items in each batch, paired with their labels.
+type BazelPrepareGroups = HashMap<BazelBatchKey, Vec<(BatchBuildItem, String)>>;
+
 pub(crate) struct BazelRebuildItem {
     pub(crate) name: String,
     pub(crate) target: String,
     pub(crate) working_dir: PathBuf,
+    /// `.bazelrc` configuration to build under, already resolved against the
+    /// workspace default. Part of the batching key: targets built under
+    /// different configurations are different builds and cannot share one
+    /// `bazel build`.
+    pub(crate) config: Option<String>,
 }
 
 pub(crate) struct RebuildBatchOutcome {
@@ -118,10 +131,16 @@ pub(crate) async fn run_rebuild_batch_worker(
     let mut up_to_date: HashSet<String> = HashSet::new();
     let mut failed: Vec<(String, String)> = Vec::new();
 
-    let mut bazel_by_dir: HashMap<PathBuf, Vec<BazelRebuildItem>> = HashMap::new();
+    // Keyed on the configuration as well as the directory: `bazel build`
+    // takes one `--config`, so targets wanting different ones are different
+    // builds however close together they were asked for.
+    let mut bazel_by_dir: HashMap<BazelBatchKey, Vec<BazelRebuildItem>> = HashMap::new();
     for item in request.bazel_items {
         bazel_by_dir
-            .entry(bazel_graph_requery_group_dir(&item.working_dir))
+            .entry((
+                bazel_graph_requery_group_dir(&item.working_dir),
+                item.config.clone(),
+            ))
             .or_default()
             .push(item);
     }
@@ -129,7 +148,7 @@ pub(crate) async fn run_rebuild_batch_worker(
     if !bazel_by_dir.is_empty() {
         let _guard = bazel_build_mutex.lock().await;
 
-        for (working_dir, items) in bazel_by_dir {
+        for ((working_dir, config), items) in bazel_by_dir {
             let targets: Vec<String> = items.iter().map(|item| item.target.clone()).collect();
             let target_to_names: HashMap<String, Vec<String>> = {
                 let mut names: HashMap<String, Vec<String>> = HashMap::new();
@@ -148,7 +167,7 @@ pub(crate) async fn run_rebuild_batch_worker(
                 false
             } else {
                 resolver
-                    .check_up_to_date(&targets, &working_dir)
+                    .check_up_to_date(&targets, &working_dir, config.as_deref())
                     .await
                     .unwrap_or_default()
             };
@@ -172,6 +191,7 @@ pub(crate) async fn run_rebuild_batch_worker(
                     .build_targets(
                         &targets,
                         &working_dir,
+                        config.as_deref(),
                         move |line| {
                             line_emitter.bazel_event(line);
                         },
@@ -542,12 +562,15 @@ pub(crate) async fn run_batch_build_chain(
 
     // Step 2: batch builds. Bazel groups run concurrently, but each group
     // stays inside the working directory its labels belong to.
-    let mut bazel_by_dir: HashMap<PathBuf, Vec<(BatchBuildItem, String)>> = HashMap::new();
+    let mut bazel_by_dir: BazelPrepareGroups = HashMap::new();
 
     for item in &items {
         if let Some(ref bazel) = item.bazel {
             bazel_by_dir
-                .entry(bazel_graph_requery_group_dir(&item.working_dir))
+                .entry((
+                    bazel_graph_requery_group_dir(&item.working_dir),
+                    bazel.config.clone(),
+                ))
                 .or_default()
                 .push((item.clone(), bazel.target.clone()));
         }
@@ -555,7 +578,7 @@ pub(crate) async fn run_batch_build_chain(
 
     let mut build_set: JoinSet<crate::build_tool::BatchBuildResult> = JoinSet::new();
 
-    for (working_dir, bazel_items) in bazel_by_dir {
+    for ((working_dir, config), bazel_items) in bazel_by_dir {
         let targets: Vec<String> = bazel_items.iter().map(|(_, t)| t.clone()).collect();
         let target_to_names: HashMap<String, Vec<String>> = {
             let mut m: HashMap<String, Vec<String>> = HashMap::new();
@@ -577,6 +600,7 @@ pub(crate) async fn run_batch_build_chain(
                 .build_targets(
                     &targets,
                     &working_dir,
+                    config.as_deref(),
                     move |line| {
                         em.bazel_event(line);
                     },
@@ -849,6 +873,7 @@ mod tests {
             kind: ProcessKind::Service,
             bazel: Some(BazelConfig {
                 target: format!("//services/{name}:{name}"),
+                config: None,
                 watch: watch_enabled,
             }),
             watch_enabled,
@@ -883,6 +908,7 @@ mod tests {
                 kind: ProcessKind::Service,
                 bazel: Some(BazelConfig {
                     target: "//services/api:api".to_string(),
+                    config: None,
                     watch: false,
                 }),
                 watch_enabled: false,

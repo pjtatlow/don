@@ -17,6 +17,54 @@ pub struct BazelConfig {
     /// Whether Don should auto-watch source packages resolved from the Bazel graph.
     #[serde(default = "default_true")]
     pub watch: bool,
+    /// Name of a `.bazelrc` configuration to build this target under, passed
+    /// as `--config=<name>`. Falls back to the workspace-wide
+    /// [`BazelDefaults::config`] when unset.
+    ///
+    /// See that field for why this is a name rather than a list of flags.
+    #[serde(default)]
+    pub config: Option<String>,
+}
+
+impl BazelConfig {
+    /// This config with the workspace-wide `--config` name filled in where it
+    /// named none of its own.
+    ///
+    /// Applied once, where the build request is built, so everything
+    /// downstream reads a single resolved name and no part of the build
+    /// pipeline has to know a workspace default exists.
+    pub fn with_workspace_default(mut self, workspace: Option<&str>) -> Self {
+        if self.config.is_none() {
+            self.config = workspace.map(str::to_string);
+        }
+        self
+    }
+}
+
+/// Workspace-wide Bazel settings, from the top-level `[bazel]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BazelDefaults {
+    /// Name of a `.bazelrc` configuration every `bazel build` Don runs should
+    /// use, passed as `--config=<name>`. Individual services and tasks may
+    /// name a different one.
+    ///
+    /// A name rather than a list of flags, because `.bazelrc` is where Bazel
+    /// already keeps this and it says everything a flag list could and more —
+    /// inheritance between configs, platform-specific variants, comments:
+    ///
+    /// ```text
+    /// # .bazelrc
+    /// build:don --noshow_progress
+    /// ```
+    ///
+    /// Naming a config that no `.rc` file defines is a hard Bazel error, not a
+    /// warning, which is why this is opt-in and has no default. Don's own
+    /// `--curses=no` and `--color=yes` are passed *before* it, so a config
+    /// that sets them wins — including in the ways that stop Don reading the
+    /// output as lines.
+    #[serde(default)]
+    pub config: Option<String>,
 }
 
 /// A single proxy entry. Don binds `listen` once at startup and holds the
