@@ -1986,12 +1986,8 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             if let Some(acc) = held
                 && !acc.is_empty()
                 && !owned_screen
+                && let Some(sanitized) = visible_line(&msg.prefix, &acc)
             {
-                let sanitized = if msg.prefix.is_empty() {
-                    acc.to_vec()
-                } else {
-                    sanitize::sanitize_terminal_output(&acc)
-                };
                 emit_line(
                     &mut target,
                     &tap,
@@ -2041,12 +2037,9 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 if acc.last() == Some(&b'\r') {
                     acc.truncate(acc.len() - 1);
                 }
-                if !acc.is_empty() {
-                    let sanitized = if msg.prefix.is_empty() {
-                        acc.to_vec()
-                    } else {
-                        sanitize::sanitize_terminal_output(acc)
-                    };
+                if !acc.is_empty()
+                    && let Some(sanitized) = visible_line(&msg.prefix, acc)
+                {
                     emit_line(
                         &mut target,
                         &tap,
@@ -2071,8 +2064,9 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             {
                 acc.truncate(acc.len() - len);
                 // Whatever preceded the switch is a real partial line.
-                if !acc.is_empty() {
-                    let sanitized = sanitize::sanitize_terminal_output(acc);
+                if !acc.is_empty()
+                    && let Some(sanitized) = visible_line(&msg.prefix, acc)
+                {
                     emit_line(
                         &mut target,
                         &tap,
@@ -2118,12 +2112,10 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 }
                 // The \r of a \r\n was a line ending, not a repaint.
                 cr_pending.remove(&msg.prefix);
-                {
-                    let sanitized = if msg.prefix.is_empty() {
-                        acc.to_vec()
-                    } else {
-                        sanitize::sanitize_terminal_output(acc)
-                    };
+                // No emptiness guard: a line the process left blank is real
+                // output and keeps its row. `visible_line` drops only the
+                // chunks that held nothing but control.
+                if let Some(sanitized) = visible_line(&msg.prefix, acc) {
                     emit_line(
                         &mut target,
                         &tap,
@@ -2142,34 +2134,33 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             } else if byte == b'\r' {
                 // Might be a repaint, might be the CR of a CRLF. A process on a
                 // PTY has every newline it writes translated to \r\n by the
-                // terminal discipline, so calling it here would make every line
-                // of ordinary output a progress frame — and, now that frames
-                // supersede one another, collapse a service's entire output
-                // onto a single line. Hold it; the next byte says which it was.
+                // terminal discipline, so treating this one as a repaint would
+                // end a line here on every line of ordinary output — and the
+                // \n that follows would then start another. Hold it; the next
+                // byte says which it was.
                 cr_pending.insert(msg.prefix.clone());
             } else {
                 // Non-control byte — any pending \r suppression is stale.
                 cr_pending.remove(&msg.prefix);
                 if acc.len() >= MAX_LINE {
-                    // Overflow — flush without stripping.
-                    let sanitized = if msg.prefix.is_empty() {
-                        acc.to_vec()
-                    } else {
-                        sanitize::sanitize_terminal_output(acc)
-                    };
-                    emit_line(
-                        &mut target,
-                        &tap,
-                        &mute,
-                        &msg.name,
-                        &msg.prefix,
-                        &sanitized,
-                        msg.is_lifecycle,
-                        msg.is_verbose,
-                        &verbosity,
-                        start,
-                    )
-                    .await;
+                    // Overflow — flush without stripping. Cleared whether or
+                    // not there was a line in it: an accumulator this big
+                    // holding nothing but control still has to be released.
+                    if let Some(sanitized) = visible_line(&msg.prefix, acc) {
+                        emit_line(
+                            &mut target,
+                            &tap,
+                            &mute,
+                            &msg.name,
+                            &msg.prefix,
+                            &sanitized,
+                            msg.is_lifecycle,
+                            msg.is_verbose,
+                            &verbosity,
+                            start,
+                        )
+                        .await;
+                    }
                     acc.clear();
                 }
             }
@@ -2183,12 +2174,10 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     for (prefix, acc) in &accumulators {
         // A process still holding the alternate screen has escape fragments
         // in hand, not a line.
-        if !acc.is_empty() && !alt_screen.contains(prefix) {
-            let sanitized = if prefix.is_empty() {
-                acc.to_vec()
-            } else {
-                sanitize::sanitize_terminal_output(acc)
-            };
+        if !acc.is_empty()
+            && !alt_screen.contains(prefix)
+            && let Some(sanitized) = visible_line(prefix, acc)
+        {
             // End-of-stream partial line: lifecycle vs not is unknowable at
             // this point (the accumulator key is the prefix, not the source
             // flag). Defaulting to false is correct — these are usually
@@ -2210,6 +2199,34 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
         }
     }
     target.flush().await;
+}
+
+/// What to show for an accumulated chunk, or `None` when there is no line in
+/// it.
+///
+/// don strips the cursor moves and erases a process uses to repaint, because
+/// it cannot honour them in a pane shared with every other process. When that
+/// was *all* a chunk held, what is left is not a blank line — it is no line.
+/// A curses progress display clears the block it drew last with a run of
+/// cursor-up/erase-line sequences several times a second, and emitting one row
+/// per sequence fills the pane with prefixes and separators and no text.
+///
+/// A line the process actually left blank is a different thing and is kept: it
+/// wrote nothing before its newline, so nothing was stripped and nothing is
+/// being hidden. The distinction is bytes that all turned out to be control
+/// versus no bytes at all — which is why this is decided here, on both sides
+/// of the sanitize, rather than by the callers testing the raw accumulator and
+/// never seeing what sanitizing left.
+fn visible_line(prefix: &[u8], acc: &[u8]) -> Option<Vec<u8>> {
+    // No prefix is don speaking, not a process: never control, never stripped.
+    if prefix.is_empty() {
+        return Some(acc.to_vec());
+    }
+    let sanitized = sanitize::sanitize_terminal_output(acc);
+    if sanitized.is_empty() && !acc.is_empty() {
+        return None;
+    }
+    Some(sanitized)
 }
 
 /// Build the formatted line bytes (optional verbose timestamp + prefix + content).
@@ -3305,6 +3322,85 @@ mod tests {
             let ids: Vec<u64> = tap.tail(100).await.lines.iter().map(|e| e.id.0).collect();
             let expected: Vec<u64> = (0..case.want.len() as u64).collect();
             assert_eq!(ids, expected, "{}: one id per line, in order", case.name);
+        }
+    }
+
+    /// A chunk that was nothing but terminal control has no line in it.
+    ///
+    /// don strips the cursor moves and erases a process uses to repaint, since
+    /// it cannot honour them in a shared, multiplexed pane. When that is *all*
+    /// a chunk held, what is left is not a blank line — it is no line, and
+    /// emitting one fills the pane with prefixes and separators and no text.
+    /// bazel clears its progress block that way, several times a second.
+    ///
+    /// A line the process actually left blank is a different thing and stays:
+    /// it wrote no bytes before its newline, so nothing was stripped and
+    /// nothing is being hidden. That is the whole test — bytes that all turned
+    /// out to be control, versus no bytes at all.
+    #[tokio::test]
+    async fn a_chunk_of_pure_control_is_not_a_line() {
+        struct Case {
+            name: &'static str,
+            /// Raw bytes, as the child writes them.
+            emit: &'static [u8],
+            want: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                name: "a blank line the process printed survives",
+                emit: b"one\n\ntwo\n",
+                want: &["one", "", "two"],
+            },
+            Case {
+                name: "a line holding only an erase does not",
+                emit: b"one\n\x1b[2K\ntwo\n",
+                want: &["one", "two"],
+            },
+            Case {
+                // Shaped like a curses progress display clearing the block it
+                // drew last: one cursor-up/erase per line it is taking back.
+                // This is the run of empty rows that turns up between every
+                // pair of real progress lines.
+                name: "clearing a progress block leaves no rows behind",
+                emit:
+                    b"Analyzing: x\n\x1b[1A\x1b[2K\n\x1b[1A\x1b[2K\n\x1b[1A\x1b[2K\nAnalyzing: y\n",
+                want: &["Analyzing: x", "Analyzing: y"],
+            },
+            Case {
+                name: "control in front of real text keeps the text",
+                emit: b"\x1b[2KAnalyzing: z\n",
+                want: &["Analyzing: z"],
+            },
+            Case {
+                name: "a repaint that painted only control is not a frame",
+                emit: b"10%\r\x1b[2K\r90%\r",
+                want: &["10%", "90%"],
+            },
+        ];
+
+        for case in cases {
+            let (writer, _buf) = TestBuffer::new();
+            let config = crate::config::LogConfig::Stdout;
+            let mgr = OutputManager::new(&[("builder", &config)], writer)
+                .await
+                .unwrap();
+            let service = mgr.service_writer("builder").unwrap();
+            service
+                .process_stream(std::io::Cursor::new(case.emit))
+                .await
+                .unwrap();
+            let tap = mgr.log_stream_sender().clone();
+            mgr.shutdown().await;
+
+            let got: Vec<String> = tap
+                .tail(100)
+                .await
+                .lines
+                .iter()
+                .map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned())
+                .collect();
+            assert_eq!(got, case.want, "{}", case.name);
         }
     }
 
