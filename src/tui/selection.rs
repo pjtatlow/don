@@ -193,11 +193,42 @@ fn is_word_char(chars: &[char], at: usize) -> bool {
     solid(at.checked_sub(1)) && solid(Some(at + 1))
 }
 
-/// The half-open character range of the word under `offset`, if there is one.
+/// What kind of thing a character is, for the purpose of a double-click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Space,
+    Word,
+    Punct,
+}
+
+/// The class of the character at `at`, or `None` past the end.
 ///
-/// Two rules: a small set of punctuation always ends a word, and `.`/`:` end
-/// one unless they sit between two word characters. Everything else — letters,
-/// digits, `-`, `_`, `/`, `@` and the rest — holds a word together.
+/// Position-aware, because a joiner's class depends on what surrounds it: the
+/// `:` in `//pkg:target` is [`Class::Word`] and the one in `"key":42` is
+/// [`Class::Punct`]. That is what lets a run be grown by comparing classes
+/// alone, with the joiner rule falling out rather than being re-stated.
+fn class_at(chars: &[char], at: usize) -> Option<Class> {
+    let &c = chars.get(at)?;
+    if c.is_whitespace() {
+        return Some(Class::Space);
+    }
+    Some(if is_word_char(chars, at) {
+        Class::Word
+    } else {
+        Class::Punct
+    })
+}
+
+/// The half-open character range of the thing under `offset`, if there is one.
+///
+/// A double-click takes a maximal run of one class. On a word that is the
+/// word; on punctuation it is the punctuation, which is what terminals do and
+/// what makes `":` in `{"key":42}` selectable as a unit.
+///
+/// Two rules decide where a word ends: a small set of punctuation always ends
+/// one, and `.`/`:` end one unless they sit between two word characters.
+/// Everything else — letters, digits, `-`, `_`, `/`, `@` and the rest — holds
+/// a word together.
 ///
 /// This was whitespace-delimited once, on the reasoning that a log's paths,
 /// ids and durations should come out whole and a table of word characters
@@ -206,23 +237,24 @@ fn is_word_char(chars: &[char], at: usize) -> bool {
 /// structured output: JSON has no spaces to speak of, so a double-click
 /// anywhere inside `{"name":"api","count":42}` selected the whole object.
 ///
-/// `None` when the offset is past the end or on punctuation — whitespace or
-/// otherwise — so a double-click that lands between words selects nothing
-/// rather than something arbitrary.
+/// `None` past the end or on whitespace, so a double-click on empty space
+/// selects nothing rather than something arbitrary. Punctuation is not empty
+/// space — there is something under the pointer, and it comes back.
 ///
 /// Runs over the whole message rather than one rendered row, so a word the
 /// pane wrapped in the middle still comes out whole.
 pub(crate) fn word_at(message: &str, offset: usize) -> Option<(usize, usize)> {
     let chars: Vec<char> = message.chars().collect();
-    if !is_word_char(&chars, offset) {
+    let class = class_at(&chars, offset)?;
+    if class == Class::Space {
         return None;
     }
     let mut start = offset;
-    while start > 0 && is_word_char(&chars, start - 1) {
+    while start > 0 && class_at(&chars, start - 1) == Some(class) {
         start -= 1;
     }
     let mut end = offset + 1;
-    while is_word_char(&chars, end) {
+    while class_at(&chars, end) == Some(class) {
         end += 1;
     }
     Some((start, end))
@@ -708,11 +740,31 @@ mod tests {
                 at: " /api",
                 want: None,
             },
+            // Punctuation is a run of its own — what terminals do, and what
+            // makes the separator in a JSON object selectable as a unit.
             Case {
-                name: "and so does punctuation",
+                name: "punctuation comes back as its own run",
                 message: r#"{"a":1}"#,
                 at: r#"{"#,
-                want: None,
+                want: Some(r#"{""#),
+            },
+            Case {
+                name: "a quote and the colon beside it are one run",
+                message: r#"{"key":42}"#,
+                at: r#"":4"#,
+                want: Some(r#"":"#),
+            },
+            Case {
+                name: "a full stop on its own is punctuation, not a word",
+                message: "build completed.",
+                at: ".",
+                want: Some("."),
+            },
+            Case {
+                name: "an opening bracket is one character wide",
+                message: "[INFO] ready",
+                at: "[",
+                want: Some("["),
             },
         ] {
             let byte = case.message.find(case.at).expect(case.name);
