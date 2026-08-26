@@ -332,7 +332,7 @@ fn highlight_matches(
     if !search.is_active() {
         return None;
     }
-    let ranges = search.match_ranges(&entry.message_text());
+    let ranges = search.match_ranges(entry.message_text());
     if ranges.is_empty() {
         return None;
     }

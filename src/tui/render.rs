@@ -372,7 +372,7 @@ fn draw_log_pane(
         // decides whose output this is, `/` decides whether it says the thing
         // being looked for.
         app.should_render_log(&entry.line.name, entry.line.is_lifecycle)
-            && app.log_search.admits(&entry.message_text())
+            && app.log_search.admits(entry.message_text())
     });
     // The one place scroll position is decided, now that the index is current
     // and the pane's height is known.

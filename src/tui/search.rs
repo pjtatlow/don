@@ -16,6 +16,12 @@
 //! capital, which is the `rg` and vim convention and the one people already
 //! have in their fingers.
 //!
+//! Both modes are the same matcher: a substring is its query escaped and
+//! handed to `regex`, which folds case properly, reports the span it matched,
+//! and never allocates against the line it is testing. That last one is not a
+//! nicety — a changed query rebuilds the whole row index, so every line in the
+//! store is asked on every keystroke.
+//!
 //! Regex is a keystroke away (Ctrl+R) for the times a substring will not do.
 //! It brings the thing substring matching avoids — a pattern that does not
 //! compile, which is *most* patterns while they are being typed — so an
@@ -112,27 +118,47 @@ impl LogSearch {
         self.recompile();
     }
 
+    /// Rebuild the pattern.
+    ///
+    /// Both modes compile to a regex, and a substring is just its query
+    /// escaped. That is not a shortcut: it means one matcher, one way of
+    /// getting ranges, and — the reason it changed — no allocation per line.
+    /// The hand-rolled substring search folded case by lowercasing the
+    /// haystack, which is a fresh `String` for every line in the store, on
+    /// every keystroke, since a changed query rebuilds the whole row index.
+    ///
+    /// It also could not always say *where* it matched: when folding changed
+    /// the byte length the offsets no longer mapped back, so those lines were
+    /// admitted with nothing highlighted. `regex` folds properly and hands
+    /// back the span it matched.
+    ///
+    /// An escaped literal always compiles, so substring mode keeps the
+    /// property the prompt depends on: every half-typed query is a valid one.
     fn recompile(&mut self) {
-        self.compiled = match self.mode {
-            Mode::Substring => None,
-            Mode::Regex if self.query.is_empty() => None,
-            Mode::Regex => Some(
-                regex::RegexBuilder::new(&self.query)
-                    .case_insensitive(!has_uppercase(&self.query))
-                    .build()
-                    .map_err(|e| {
-                        // The last line of a regex error is the useful one;
-                        // the rest is the pattern echoed back with a caret,
-                        // which does not fit in a prompt.
-                        e.to_string()
-                            .lines()
-                            .next_back()
-                            .unwrap_or("invalid pattern")
-                            .trim()
-                            .to_string()
-                    }),
-            ),
+        if self.query.is_empty() {
+            self.compiled = None;
+            return;
+        }
+        let pattern = match self.mode {
+            Mode::Substring => regex::escape(&self.query),
+            Mode::Regex => self.query.clone(),
         };
+        self.compiled = Some(
+            regex::RegexBuilder::new(&pattern)
+                .case_insensitive(!has_uppercase(&self.query))
+                .build()
+                .map_err(|e| {
+                    // The last line of a regex error is the useful one; the
+                    // rest is the pattern echoed back with a caret, which does
+                    // not fit in a prompt.
+                    e.to_string()
+                        .lines()
+                        .next_back()
+                        .unwrap_or("invalid pattern")
+                        .trim()
+                        .to_string()
+                }),
+        );
     }
 
     /// Whether `message` should be shown.
@@ -141,13 +167,9 @@ impl LogSearch {
     /// matches when the pattern cannot compile — an empty pane is the one
     /// answer that cannot be told apart from "your query is wrong".
     pub(crate) fn admits(&self, message: &str) -> bool {
-        if !self.is_active() {
-            return true;
-        }
         match self.compiled.as_ref() {
             Some(Ok(re)) => re.is_match(message),
-            Some(Err(_)) => true,
-            None => contains_smart_case(message, &self.query),
+            _ => true,
         }
     }
 
@@ -157,18 +179,14 @@ impl LogSearch {
     /// and wraps in characters — a byte range would land in the wrong column
     /// the moment a line contains anything outside ASCII.
     pub(crate) fn match_ranges(&self, message: &str) -> Vec<(usize, usize)> {
-        if !self.is_active() {
+        let Some(Ok(re)) = self.compiled.as_ref() else {
             return Vec::new();
-        }
-        let byte_ranges: Vec<(usize, usize)> = match self.compiled.as_ref() {
-            Some(Ok(re)) => re
-                .find_iter(message)
-                .filter(|m| !m.is_empty())
-                .map(|m| (m.start(), m.end()))
-                .collect(),
-            Some(Err(_)) => Vec::new(),
-            None => substring_ranges(message, &self.query),
         };
+        let byte_ranges: Vec<(usize, usize)> = re
+            .find_iter(message)
+            .filter(|m| !m.is_empty())
+            .map(|m| (m.start(), m.end()))
+            .collect();
         to_char_ranges(message, &byte_ranges)
     }
 
@@ -189,40 +207,6 @@ impl LogSearch {
 
 fn has_uppercase(query: &str) -> bool {
     query.chars().any(char::is_uppercase)
-}
-
-/// Substring search, case-insensitive until the query contains a capital.
-fn contains_smart_case(haystack: &str, needle: &str) -> bool {
-    if has_uppercase(needle) {
-        haystack.contains(needle)
-    } else {
-        haystack.to_lowercase().contains(&needle.to_lowercase())
-    }
-}
-
-/// Byte ranges of every occurrence of `needle`, under the same case rule.
-fn substring_ranges(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let (hay, pin) = if has_uppercase(needle) {
-        (haystack.to_string(), needle.to_string())
-    } else {
-        (haystack.to_lowercase(), needle.to_lowercase())
-    };
-    // Lowercasing can change byte lengths, so offsets from the folded string
-    // are only usable when it is the same length as what the pane will draw.
-    if hay.len() != haystack.len() {
-        return Vec::new();
-    }
-    let mut found = Vec::new();
-    let mut from = 0;
-    while let Some(at) = hay[from..].find(&pin) {
-        let start = from + at;
-        found.push((start, start + pin.len()));
-        from = start + pin.len();
-    }
-    found
 }
 
 /// Byte ranges to character ranges, in one pass over the string.
@@ -319,6 +303,18 @@ mod tests {
                 message: "héllo wörld",
                 want_admitted: true,
                 want_ranges: &[(6, 11)],
+            },
+            Case {
+                // Case folding this changes its byte length, which the
+                // hand-rolled matcher could not map back to a column — so it
+                // admitted the line and highlighted nothing, the one thing
+                // this module promises never to do.
+                name: "a fold that changes length still says where it matched",
+                query: "d",
+                regex: false,
+                message: "İD",
+                want_admitted: true,
+                want_ranges: &[(1, 2)],
             },
             Case {
                 name: "regex alternation",

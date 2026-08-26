@@ -1383,7 +1383,7 @@ fn select_word(app: &mut App, store: &LogStore, column: u16, row: u16) {
     let Some(message) = store.get(at.id).map(|entry| entry.message_text()) else {
         return;
     };
-    let Some((start, end)) = selection::word_at(&message, at.offset) else {
+    let Some((start, end)) = selection::word_at(message, at.offset) else {
         clear_selection(app);
         return;
     };

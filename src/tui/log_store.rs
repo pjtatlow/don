@@ -88,6 +88,11 @@ pub(crate) struct StoredLogLine {
     /// own column and indent what wraps underneath it. Measured from the
     /// prefix the sink sent, not recovered from the text.
     prefix_cols: usize,
+    /// The message as plain text, built once here for the same reason the
+    /// parse and the row count are: `/` asks every line in the store whether
+    /// it matches on every keystroke, and building this per question meant an
+    /// allocation per line per character typed.
+    message: String,
 }
 
 impl StoredLogLine {
@@ -107,13 +112,8 @@ impl StoredLogLine {
     /// yields are the ones the pane laid out — the raw bytes still carry the
     /// escape sequences that became styles, and counting through those would
     /// put every offset past the first colour in the wrong place.
-    pub(crate) fn message_text(&self) -> String {
-        self.parsed
-            .spans
-            .iter()
-            .flat_map(|span| span.content.chars())
-            .skip(self.prefix_cols)
-            .collect()
+    pub(crate) fn message_text(&self) -> &str {
+        &self.message
     }
 }
 
@@ -185,12 +185,19 @@ impl LogStore {
             }
             self.entries.pop_front();
         }
+        let message = parsed
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .skip(prefix_cols)
+            .collect();
         self.entries.push_back(StoredLogLine {
             id,
             line,
             parsed,
             wrapped_rows,
             prefix_cols,
+            message,
         });
     }
 
