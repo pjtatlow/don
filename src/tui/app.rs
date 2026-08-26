@@ -859,6 +859,11 @@ impl App {
         pid: Option<i32>,
         failed_dependencies: Vec<String>,
     ) -> bool {
+        // Every process this client hears about passes through here, whenever
+        // it first arrived — so this is where the filter finds out a name
+        // exists at all. Without it a service added by a config reload has no
+        // filter row and cannot be narrowed to.
+        self.filter.learn_name(&name);
         let filter_changed = state == ServiceState::Failed
             && self.auto_filter_on_failure_names.contains(&name)
             && self.filter.select_name(&name);
@@ -947,6 +952,9 @@ impl App {
         last_run: Option<TaskRunInfo>,
         failed_dependencies: Vec<String>,
     ) -> bool {
+        // See `apply_service_runtime`: this is where the filter learns a task
+        // exists.
+        self.filter.learn_name(&name);
         let filter_changed = state == TaskState::Failed
             && self.auto_filter_on_failure_names.contains(&name)
             && self.filter.select_name(&name);
@@ -1030,6 +1038,57 @@ impl App {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A process the filter did not know at startup can still be narrowed to.
+    ///
+    /// The name list is built once, from the config the TUI came up with. A
+    /// service that arrives later — a config reload, a client that attached
+    /// before the daemon had reported everything — used to be absent from it,
+    /// which meant no row in the filter panel and `l` on its table row doing
+    /// nothing whatsoever, silently.
+    #[test]
+    fn a_process_that_arrives_after_startup_becomes_filterable() {
+        let mut app = app_with_names(vec!["api".to_string()], vec![]);
+        assert!(!app.narrow_log_to("latecomer"), "unknown before it arrives");
+
+        app.apply_service_runtime(
+            "latecomer".to_string(),
+            ServiceState::Running,
+            None,
+            Vec::new(),
+        );
+
+        assert!(
+            app.should_render_log("latecomer", false),
+            "a newcomer shows by default"
+        );
+        assert!(app.narrow_log_to("latecomer"), "and can be narrowed to");
+        assert_eq!(app.narrowed_to(), Some("latecomer"));
+        assert!(!app.should_render_log("api", false), "which hides the rest");
+    }
+
+    /// ...but it does not barge into a narrow already in place.
+    #[test]
+    fn a_newcomer_does_not_widen_an_active_narrow() {
+        let mut app = app_with_names(vec!["api".to_string(), "web".to_string()], vec![]);
+        assert!(app.narrow_log_to("api"));
+
+        app.apply_service_runtime(
+            "latecomer".to_string(),
+            ServiceState::Running,
+            None,
+            Vec::new(),
+        );
+
+        assert!(
+            !app.should_render_log("latecomer", false),
+            "a reader narrowed to one process did not ask for whatever turned up next"
+        );
+        assert!(
+            app.should_render_log("api", false),
+            "the narrow still holds"
+        );
+    }
 
     fn services(entries: &[(&str, ServiceState)]) -> HashMap<String, ServiceState> {
         entries.iter().map(|(n, s)| (n.to_string(), *s)).collect()

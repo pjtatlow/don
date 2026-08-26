@@ -179,6 +179,33 @@ impl FilterState {
         self.active_selected.contains(name)
     }
 
+    /// Take note of a process the filter has not seen before.
+    ///
+    /// The name list is built once, from the config the TUI started with, and
+    /// a process that turns up later — a config reload adding a service, a
+    /// client attaching before the daemon has reported everything — was
+    /// invisible to it. It had no row in the filter panel and could not be
+    /// narrowed to, so `l` on its table row did nothing at all and said
+    /// nothing about why.
+    ///
+    /// A newcomer belongs in the defaults, so "reset" shows it. It joins the
+    /// *active* selection only when the filter was showing everything: a
+    /// reader who has narrowed to one process did not ask for whatever turned
+    /// up next, and a narrow that quietly widened would be worse than a
+    /// process that waits to be selected.
+    pub(crate) fn learn_name(&mut self, name: &str) {
+        if name.is_empty() || self.all_names.iter().any(|n| n == name) {
+            return;
+        }
+        let was_showing_everything = !self.is_active();
+        self.all_names.push(name.to_string());
+        self.all_names.sort();
+        self.default_selected.insert(name.to_string());
+        if was_showing_everything {
+            self.active_selected.insert(name.to_string());
+        }
+    }
+
     /// Show only `name`, returning the selection it replaced.
     ///
     /// This is what `l` on a table row does: the log pane beside the panel is
