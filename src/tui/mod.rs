@@ -61,6 +61,7 @@ mod render;
 mod selection;
 mod status_table;
 mod view_index;
+mod writer;
 
 use ansi_to_tui::IntoText;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -95,18 +96,29 @@ pub enum TuiError {
 /// Raw mode and the alternate screen go up together and come down together in
 /// reverse order, from `Drop` — so a `?` anywhere in the loop still gives the
 /// user their terminal back, and so does a panic unwinding through it.
-struct TerminalGuard;
+struct TerminalGuard {
+    /// The writer thread, so that giving the screen back always waits for the
+    /// frames already queued for it. Held here rather than beside the terminal
+    /// because `Drop` is the only path every exit shares — including a `?` in
+    /// the loop and a panic unwinding through it.
+    writer: writer::Writer,
+}
 
 impl TerminalGuard {
-    fn enter() -> Result<Self, TuiError> {
+    fn enter(writer: writer::Writer) -> Result<Self, TuiError> {
         crossterm::terminal::enable_raw_mode()?;
         execute!(std::io::stdout(), EnterAlternateScreen, Print(MOUSE_ON))?;
-        Ok(Self)
+        Ok(Self { writer })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Before the restore, not after. These sequences go straight to the
+        // fd, so one written while the writer still had a frame in hand would
+        // interleave with it and leave the user looking at a screen assembled
+        // from both — which reads as don having eaten their scrollback.
+        self.writer.finish();
         let _ = execute!(std::io::stdout(), Print(MOUSE_OFF), LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -131,7 +143,7 @@ const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 /// The same modes, reset in reverse.
 const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
-type TuiTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
+type TuiTerminal = Terminal<CrosstermBackend<writer::FrameSink>>;
 
 /// Shortest gap between full repaints.
 ///
@@ -164,6 +176,9 @@ pub enum TuiMode {
 struct TuiControls {
     lifecycle_emitter: LifecycleEmitter,
     mode: TuiMode,
+    /// The writer's queue, for the one thing that is a request to the terminal
+    /// rather than a cell to paint: an OSC 52 clipboard write.
+    terminal_out: writer::TerminalOut,
 }
 
 /// Flatten one merged-stream event into the batch the render loop consumes.
@@ -218,9 +233,18 @@ pub async fn run_tui(
     auto_filter_on_failure_names: std::collections::HashSet<String>,
     cli_log_filter: Option<std::collections::HashSet<String>>,
 ) -> Result<(), TuiError> {
+    // The writer thread starts here rather than beside the terminal because
+    // `controls` carries the handle to it, and a clipboard request has to go
+    // down the same queue as the frames to stay in order with them.
+    //
+    // One completion per frame the writer lands, counted against the frames
+    // rendered so the loop can tell whether the terminal is keeping up.
+    let (frame_done_tx, mut frame_done_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (sink, terminal_out, writer) = writer::spawn(frame_done_tx)?;
     let controls = TuiControls {
         lifecycle_emitter,
         mode,
+        terminal_out,
     };
     let client = std::sync::Arc::new(client);
 
@@ -274,8 +298,8 @@ pub async fn run_tui(
     // The terminal, owned for as long as the TUI runs — and so is the input
     // task. Attaching used to interrupt both; now the window draws on don's
     // own screen and its input comes off this same event stream.
-    let _guard = TerminalGuard::enter()?;
-    let mut terminal = build_terminal()?;
+    let _guard = TerminalGuard::enter(writer)?;
+    let mut terminal = build_terminal(sink)?;
     let input_handle = tokio::spawn(input::run(input_tx.clone()));
     // The live attach session, when there is one. Owned here rather than on
     // `App` because it is tasks and a socket, not view state.
@@ -291,6 +315,16 @@ pub async fn run_tui(
     // the TUI's cost by frame rate rather than by log rate, and what stops
     // each arm having to know what any other arm would have wanted redrawn.
     let mut dirty = true;
+    // Frames rendered but not yet reported written. The frame arm will not
+    // produce another while this is non-zero, so frames are paced by what the
+    // terminal can take rather than by a timer that assumes writes are free.
+    //
+    // The saving is not in rendering less — that costs about one percent of a
+    // core — it is that the state a frame is rendered from is whatever is true
+    // when the writer comes free. Ten scroll steps arriving during one slow
+    // write become one repaint of where the scroll ended up rather than ten,
+    // and a frame costs what the pane costs however far it moved.
+    let mut in_flight = 0usize;
     // One timer, reset after each frame — not a fresh `sleep_until` per loop
     // iteration. `select!` builds every branch's future each time round, so a
     // new sleep meant registering and cancelling a timer entry per iteration,
@@ -437,10 +471,18 @@ pub async fn run_tui(
                 }
                 dirty = true;
             }
-            () = &mut frame, if dirty => {
+            Some(written) = frame_done_rx.recv() => {
+                // A terminal that cannot be written to ends the TUI, exactly as
+                // it did when the write came straight out of `draw`. Carrying
+                // on would mean don running against a screen nobody can see.
+                written?;
+                in_flight = in_flight.saturating_sub(1);
+            }
+            () = &mut frame, if dirty && in_flight == 0 => {
                 let showing = app.debug_view;
                 draw(&mut terminal, &mut app, stores.active_mut(showing))?;
                 dirty = false;
+                in_flight += 1;
                 frame
                     .as_mut()
                     .reset(tokio::time::Instant::now() + FRAME_INTERVAL);
@@ -463,8 +505,8 @@ pub async fn run_tui(
 /// response to race the input task's stdin reader for — the whole reason the
 /// old inline viewport needed a backend wrapper around
 /// `get_cursor_position`.
-fn build_terminal() -> Result<TuiTerminal, TuiError> {
-    let backend = CrosstermBackend::new(std::io::stdout());
+fn build_terminal(sink: writer::FrameSink) -> Result<TuiTerminal, TuiError> {
+    let backend = CrosstermBackend::new(sink);
     let terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -615,7 +657,7 @@ fn handle_app_event(
             // anchor is a line id, so it means the same thing at any size.
         }
         AppEvent::Key(key) => handle_key(key, app, store, client, controls)?,
-        AppEvent::Mouse(mouse) => handle_mouse(mouse, app, store),
+        AppEvent::Mouse(mouse, at) => handle_mouse(mouse, at, app, store),
         // Handled by the loop, which owns the live session; by the time an
         // event reaches here the loop has already dealt with it.
         AppEvent::Attach(_) => {}
@@ -779,11 +821,11 @@ fn handle_key(
     // away either: focus decides. The log side keeps its whole vocabulary —
     // scrolling, selection, verbose, even opening a different panel.
     if app.panel_open() && app.focus == panes::Focus::Logs {
-        return handle_normal_key(key, app, store);
+        return handle_normal_key(key, app, store, &controls.terminal_out);
     }
 
     match app.view_mode {
-        ViewMode::Normal => handle_normal_key(key, app, store)?,
+        ViewMode::Normal => handle_normal_key(key, app, store, &controls.terminal_out)?,
         ViewMode::Filter => handle_filter_key(key, app, store)?,
         ViewMode::Tasks => handle_tasks_key(key, app, store, client)?,
         ViewMode::Services => {
@@ -795,7 +837,12 @@ fn handle_key(
     Ok(())
 }
 
-fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Result<(), TuiError> {
+fn handle_normal_key(
+    key: KeyEvent,
+    app: &mut App,
+    store: &mut LogStore,
+    out: &writer::TerminalOut,
+) -> Result<(), TuiError> {
     // The half-finished `gg` chord: taken here so any key other than the
     // second `g` clears it just by arriving.
     let awaiting_second_g = std::mem::take(&mut app.pending_g);
@@ -870,7 +917,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         }
         // Ctrl+C is shutdown and cannot double as copy, so the keyboard route
         // to the clipboard is `y` — vi's yank, over the current selection.
-        KeyCode::Char('y') => copy_selection(app, store),
+        KeyCode::Char('y') => copy_selection(app, store, out),
         // With a panel open but the log focused, Esc means "done with the
         // panel" — it is the dismiss key every panel view already answers to,
         // and it should not need a focus switch first.
@@ -934,7 +981,7 @@ async fn dispatch_event(
         // A click inside the window would select text in the log underneath
         // it, where nobody can see it. Outside, the log is visible and the
         // mouse still belongs to it.
-        AppEvent::Mouse(mouse)
+        AppEvent::Mouse(mouse, _)
             if app
                 .attach
                 .as_ref()
@@ -1194,7 +1241,7 @@ const WHEEL_ROWS: isize = 3;
 /// Wheel scrolling works in every mode: a full-screen table on top does not
 /// mean the user has stopped caring where the log is, and moving it costs
 /// nothing while it is hidden.
-fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
+fn handle_mouse(mouse: MouseEvent, at: std::time::Instant, app: &mut App, store: &LogStore) {
     match mouse.kind {
         // The wheel works on whatever is under the pointer — scrolling the log
         // that is hidden *behind* the panel you are pointing at is the kind of
@@ -1231,7 +1278,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App, store: &LogStore) {
             {
                 return;
             }
-            match click_count(app, mouse.column, mouse.row) {
+            match click_count(app, mouse.column, mouse.row, at) {
                 // A drag is about to start, or a plain click clearing what was
                 // selected before.
                 1 => {
@@ -1288,12 +1335,16 @@ const COPY_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 ///
 /// Terminals report a double click as two ordinary presses; only the gap and
 /// the position tell them apart, so the counting has to happen here.
-fn click_count(app: &mut App, column: u16, row: u16) -> u8 {
+fn click_count(app: &mut App, column: u16, row: u16, at: std::time::Instant) -> u8 {
     let count = match app.last_click {
-        Some((last_col, last_row, at, count))
+        Some((last_col, last_row, last_at, count))
             if last_row == row
                 && last_col.abs_diff(column) <= 1
-                && at.elapsed() <= MULTI_CLICK_WINDOW =>
+                // Arrival to arrival. Measuring from when *this* loop reached
+                // the two clicks folds in however long it spent elsewhere —
+                // and on a slow link that is a full frame's write, which is
+                // enough to push a real double click outside the window.
+                && at.duration_since(last_at) <= MULTI_CLICK_WINDOW =>
         {
             // Past a triple, start over rather than inventing a quadruple
             // click nothing has a meaning for.
@@ -1301,7 +1352,7 @@ fn click_count(app: &mut App, column: u16, row: u16) -> u8 {
         }
         _ => 1,
     };
-    app.last_click = Some((column, row, std::time::Instant::now(), count));
+    app.last_click = Some((column, row, at, count));
     count
 }
 
@@ -1414,13 +1465,13 @@ fn at_tail(app: &App) -> bool {
 }
 
 /// Put the current selection on the clipboard, and say so.
-fn copy_selection(app: &mut App, store: &LogStore) {
+fn copy_selection(app: &mut App, store: &LogStore, out: &writer::TerminalOut) {
     let Some(text) = selection::selected_text(&app.log_selection, &app.view_index, store) else {
         return;
     };
     let lines = text.lines().count();
     let now = std::time::Instant::now();
-    app.copy_notice = Some(match selection::copy_to_clipboard(&text) {
+    app.copy_notice = Some(match selection::copy_to_clipboard(out, &text) {
         // OSC 52 is a request with no reply: a terminal that has it turned off
         // discards it silently. Reporting what was sent is the only honest
         // thing available — "copied" here means "asked the terminal to".
@@ -2268,7 +2319,13 @@ mod tests {
         for case in cases {
             let mut app = app_with_service_state(ServiceState::Ready);
             let mut store = LogStore::with_capacity(10);
-            handle_normal_key(case.key, &mut app, &mut store).unwrap();
+            handle_normal_key(
+                case.key,
+                &mut app,
+                &mut store,
+                &writer::TerminalOut::discarding(),
+            )
+            .unwrap();
             assert_eq!(
                 app.repaint_requested, case.want_repaint,
                 "{}: repaint requested",
@@ -2397,6 +2454,7 @@ mod tests {
             let mut store = LogStore::with_capacity(10);
             let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
             let controls = TuiControls {
+                terminal_out: writer::TerminalOut::discarding(),
                 lifecycle_emitter: LifecycleEmitter::discarding(),
                 mode: TuiMode::InProcess,
             };
@@ -2535,16 +2593,19 @@ mod tests {
             let store = LogStore::with_capacity(4);
             handle_mouse(
                 mouse(MouseEventKind::Down(MouseButton::Left), 10),
+                std::time::Instant::now(),
                 &mut app,
                 &store,
             );
             handle_mouse(
                 mouse(MouseEventKind::Drag(MouseButton::Left), 30),
+                std::time::Instant::now(),
                 &mut app,
                 &store,
             );
             handle_mouse(
                 mouse(MouseEventKind::Up(MouseButton::Left), 30),
+                std::time::Instant::now(),
                 &mut app,
                 &store,
             );
@@ -2662,6 +2723,7 @@ mod tests {
             let mut store = LogStore::with_capacity(10);
             let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
             let controls = TuiControls {
+                terminal_out: writer::TerminalOut::discarding(),
                 lifecycle_emitter: LifecycleEmitter::discarding(),
                 mode: TuiMode::InProcess,
             };
@@ -2953,6 +3015,7 @@ mod tests {
             let mut store = LogStore::with_capacity(10);
             let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
             let controls = TuiControls {
+                terminal_out: writer::TerminalOut::discarding(),
                 lifecycle_emitter: LifecycleEmitter::discarding(),
                 mode: TuiMode::InProcess,
             };
@@ -3028,6 +3091,7 @@ mod tests {
             let mut store = LogStore::with_capacity(10);
             let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
             let controls = TuiControls {
+                terminal_out: writer::TerminalOut::discarding(),
                 lifecycle_emitter: LifecycleEmitter::discarding(),
                 mode: TuiMode::InProcess,
             };
@@ -3104,6 +3168,7 @@ mod tests {
             let mut store = LogStore::with_capacity(10);
             let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
             let controls = TuiControls {
+                terminal_out: writer::TerminalOut::discarding(),
                 lifecycle_emitter: LifecycleEmitter::discarding(),
                 mode: TuiMode::InProcess,
             };
@@ -3212,6 +3277,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
                 &mut app,
                 &mut store,
+                &writer::TerminalOut::discarding(),
             )
             .unwrap();
 
@@ -3311,6 +3377,7 @@ mod tests {
                     KeyEvent::new(KeyCode::Char(*key), KeyModifiers::NONE),
                     &mut app,
                     &mut store,
+                    &writer::TerminalOut::discarding(),
                 )
                 .unwrap();
             }

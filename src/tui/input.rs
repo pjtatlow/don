@@ -39,7 +39,7 @@ fn translate(event: Event) -> Option<AppEvent> {
         // deliberately off, see MOUSE_ON — but a terminal that sends it
         // anyway must not wake the loop for events nothing acts on.
         Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => None,
-        Event::Mouse(mouse) => Some(AppEvent::Mouse(mouse)),
+        Event::Mouse(mouse) => Some(AppEvent::Mouse(mouse, std::time::Instant::now())),
         _ => None,
     }
 }

@@ -35,8 +35,6 @@
 //! which is why the copy is also reported in the status bar — a silent no-op
 //! would be indistinguishable from success.
 
-use std::io::Write;
-
 use super::log_store::LogStore;
 use super::logs::RowSource;
 use super::view_index::ViewIndex;
@@ -316,13 +314,16 @@ pub(crate) fn selected_text(
 
 /// Ask the terminal to put `text` on the system clipboard, via OSC 52.
 ///
-/// Written straight to stdout rather than through ratatui: it is a request to
-/// the terminal, not a cell to paint, and it must not be diffed away.
-pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+/// Not written through ratatui — it is a request to the terminal, not a cell
+/// to paint, and it must not be diffed away — but through the same queue the
+/// frames go down. Writing it to the fd directly would land it in the middle
+/// of whatever frame the writer thread is part-way through, splitting both.
+pub(crate) fn copy_to_clipboard(
+    out: &super::writer::TerminalOut,
+    text: &str,
+) -> std::io::Result<()> {
     let encoded = base64_encode(text.as_bytes());
-    let mut stdout = std::io::stdout();
-    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
-    stdout.flush()
+    out.send(format!("\x1b]52;c;{encoded}\x07").into_bytes())
 }
 
 /// Base64, standard alphabet with padding.

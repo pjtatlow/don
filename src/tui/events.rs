@@ -16,7 +16,13 @@ pub(crate) enum AppEvent {
     /// A mouse click, drag, release or wheel tick. Bare motion is filtered out
     /// upstream; its column and row are screen coordinates, which only the
     /// renderer's layout can turn into "which pane, which row".
-    Mouse(MouseEvent),
+    ///
+    /// Stamped by the input task when it read the event, not by the loop when
+    /// it got to it. Multi-click is a question about the gap between two
+    /// presses, and on a slow link the loop can be several hundred
+    /// milliseconds behind the terminal — long enough for a real double click
+    /// to be handled far enough apart to read as two single ones.
+    Mouse(MouseEvent, std::time::Instant),
     /// Terminal was resized. Ratatui picks up the new size on the next draw;
     /// this event just triggers an immediate repaint.
     Resize,
