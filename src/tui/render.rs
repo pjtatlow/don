@@ -253,6 +253,25 @@ fn draw_attach_window(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
+/// A table's title, which depends on whether `l` has narrowed the log.
+///
+/// `l` is pressed while looking at a table, so the table is where the state it
+/// produced has to be legible — the log pane names the process it is showing,
+/// but the eye that pressed the key is over here.
+///
+/// While narrowed the way out leads, and `[l] logs` gives up its slot. Both
+/// are forced by width: the services title is already sixty-six columns
+/// against a panel half a screen wide, so whatever sits at the end is what
+/// ratatui truncates — which would have hidden this hint in exactly the state
+/// that needs it. `l` still narrows to another row while narrowed; it is the
+/// less useful of the two things to say.
+fn table_title(app: &App, table: &str, keys: &str) -> String {
+    match app.narrowed_to() {
+        Some(_) => format!(" {table} — [esc] all logs  {keys} "),
+        None => format!(" {table} — {keys}  [l] logs "),
+    }
+}
+
 /// What the log pane calls itself.
 ///
 /// A pane narrowed by `l` is showing a fraction of the log, and nothing else
@@ -584,7 +603,7 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: " tasks — [enter] run  [a] attach  [l] logs  [/] filter ".to_string(),
+            title: table_title(app, "tasks", "[enter] run  [a] attach  [/] filter"),
             border_style: panel_border_style(app),
             header,
             rows,
@@ -745,7 +764,11 @@ fn draw_services_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: " services — [enter] start/stop  [r] restart  [a] attach  [l] logs ".to_string(),
+            title: table_title(
+                app,
+                "services",
+                "[enter] start/stop  [r] restart  [a] attach",
+            ),
             border_style: panel_border_style(app),
             header,
             rows,
@@ -1565,6 +1588,44 @@ fn field_render_rows(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The tables say it too, because that is where `l` was pressed.
+    ///
+    /// The log pane names the process it is showing, but a reader who has just
+    /// pressed `l` is looking at the table — and `l` is advertised there, so
+    /// the key that undoes it belongs in the same line.
+    #[test]
+    fn a_table_title_offers_the_way_out_of_a_narrow() {
+        let mut app = super::super::app::App::new(super::super::app::AppInit {
+            service_names: vec!["api".to_string(), "web".to_string()],
+            task_names: Vec::new(),
+            build_tool_names: Vec::new(),
+            task_configs: std::collections::HashMap::new(),
+            task_last_runs: std::collections::HashMap::new(),
+            hidden_names: std::collections::HashSet::new(),
+            auto_filter_on_failure_names: std::collections::HashSet::new(),
+            cli_log_filter: None,
+        });
+        assert_eq!(
+            table_title(&app, "services", "[enter] start/stop"),
+            " services — [enter] start/stop  [l] logs "
+        );
+
+        assert!(app.narrow_log_to("api"));
+        let narrowed = table_title(&app, "services", "[enter] start/stop");
+        assert_eq!(narrowed, " services — [esc] all logs  [enter] start/stop ");
+        assert!(
+            narrowed.find("[esc]").unwrap() < narrowed.find("[enter]").unwrap(),
+            "the way out leads, so a truncated title still carries it: {narrowed}"
+        );
+
+        assert!(app.widen_log_from_narrow());
+        assert_eq!(
+            table_title(&app, "services", "[enter] start/stop"),
+            " services — [enter] start/stop  [l] logs ",
+            "and back again"
+        );
+    }
 
     /// A narrowed pane says so, and says how to undo it.
     ///
