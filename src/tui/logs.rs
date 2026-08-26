@@ -18,7 +18,7 @@
 //! last line" — a distinction that matters when new lines arrive, since the
 //! anchor would otherwise need rewriting on every push.
 
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
 use super::log_store::LogStore;
 use crate::output::LogId;
@@ -244,6 +244,7 @@ pub(crate) fn build_view<'a>(
     scroll: Scroll,
     width: u16,
     height: u16,
+    search: &super::search::LogSearch,
 ) -> LogView<'a> {
     let height = height.max(1) as usize;
     let total_rows = index.total_rows();
@@ -268,7 +269,13 @@ pub(crate) fn build_view<'a>(
     if let Some((first_id, skip_within)) = index.line_at(rows_above) {
         let mut skip = usize::from(skip_within);
         for entry in index.ids_from(first_id).filter_map(|id| store.get(id)) {
-            let mut line_rows = wrap_line(&entry.parsed, entry.prefix_cols(), width);
+            // Highlighting rebuilds the line, so it is done only when there
+            // is a search — and only for the handful of lines on screen, which
+            // are the ones already being wrapped. The cached parse is used
+            // untouched the rest of the time.
+            let highlighted = highlight_matches(entry, search);
+            let parsed = highlighted.as_ref().unwrap_or(&entry.parsed);
+            let mut line_rows = wrap_line(parsed, entry.prefix_cols(), width);
             let (per_row, indent) = row_metrics(entry.prefix_cols(), width);
             let wrapped_rows = line_rows.len();
             // The blank the reader asked for belongs to this line, so it scrolls
@@ -306,6 +313,65 @@ pub(crate) fn build_view<'a>(
         rows_above,
         total_rows,
     }
+}
+
+/// The line with every `/` match lit up, or `None` when there is nothing to
+/// light.
+///
+/// Matches are found on the message and the ranges shifted past the `name │`
+/// column, so a search cannot match don's own column — and are applied before
+/// wrapping, so a match that straddles a row boundary is highlighted on both
+/// rows rather than dropped at the seam.
+///
+/// The result owns its text (`Line<'static>`), which is what lets it be handed
+/// back beside lines borrowed from the store.
+fn highlight_matches(
+    entry: &super::log_store::StoredLogLine,
+    search: &super::search::LogSearch,
+) -> Option<Line<'static>> {
+    if !search.is_active() {
+        return None;
+    }
+    let ranges = search.match_ranges(&entry.message_text());
+    if ranges.is_empty() {
+        return None;
+    }
+    let offset = entry.prefix_cols();
+    let lit = ratatui::style::Style::default()
+        .bg(ratatui::style::Color::Yellow)
+        .fg(ratatui::style::Color::Black);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Column of the first character of the span being walked.
+    let mut at = 0usize;
+    for span in &entry.parsed.spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let mut cut = 0usize;
+        for index in 0..=chars.len() {
+            let inside = |i: usize| {
+                ranges
+                    .iter()
+                    .any(|(start, end)| at + i >= start + offset && at + i < end + offset)
+            };
+            // Split wherever the lit/unlit answer changes, and at the end.
+            let changed = index == chars.len()
+                || (index > 0 && inside(index) != inside(index - 1))
+                || (index == 0 && false);
+            if !changed || index == cut {
+                continue;
+            }
+            let text: String = chars[cut..index].iter().collect();
+            let style = if inside(cut) {
+                span.style.patch(lit)
+            } else {
+                span.style
+            };
+            spans.push(Span::styled(text, style));
+            cut = index;
+        }
+        at += chars.len();
+    }
+    Some(Line::from(spans))
 }
 
 /// The anchor for whichever line currently owns row `rows_above`.
@@ -430,7 +496,15 @@ mod tests {
             |entry: &super::super::log_store::StoredLogLine| entry.line.name == "api",
         );
 
-        let view = build_view(&store, &index, &no_marks(), Scroll::Follow, 40, 10);
+        let view = build_view(
+            &store,
+            &index,
+            &no_marks(),
+            Scroll::Follow,
+            40,
+            10,
+            &super::super::search::LogSearch::default(),
+        );
         let text: Vec<String> = view.rows.iter().map(row_text).collect();
         assert_eq!(
             text,
@@ -488,7 +562,15 @@ mod tests {
 
         // One row above the tail of the *current* view: 300 rows, 20 visible,
         // so the tail sits at 280 and one up is 279.
-        let view = build_view(&store, &index, &no_marks(), scroll, 40, height);
+        let view = build_view(
+            &store,
+            &index,
+            &no_marks(),
+            scroll,
+            40,
+            height,
+            &super::super::search::LogSearch::default(),
+        );
         assert_eq!(
             view.rows_above, 279,
             "one arrow key moves one row in the view that exists now"
@@ -832,7 +914,15 @@ mod tests {
                 "step {step}: index total vs walking the store"
             );
 
-            let view = build_view(&store, &index, &blanks, scroll, width, height);
+            let view = build_view(
+                &store,
+                &index,
+                &blanks,
+                scroll,
+                width,
+                height,
+                &super::super::search::LogSearch::default(),
+            );
             assert_eq!(
                 view.total_rows, naive,
                 "step {step}: the view reports the index's total"

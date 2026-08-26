@@ -280,13 +280,54 @@ fn table_title(app: &App, table: &str, keys: &str) -> String {
 /// shown and the key that gives the rest back, in the same shape the tables
 /// announce their keys.
 fn log_pane_title(app: &App) -> String {
-    if app.debug_view {
-        return " don's log ".to_string();
+    let base = if app.debug_view {
+        "don's log".to_string()
+    } else {
+        match app.narrowed_to() {
+            Some(name) => format!("logs — {name}  [esc] all"),
+            None => "logs".to_string(),
+        }
+    };
+    match search_hint(app) {
+        Some(hint) => format!(" {base}  {hint} "),
+        None => format!(" {base} "),
     }
-    match app.narrowed_to() {
-        Some(name) => format!(" logs — {name}  [esc] all "),
-        None => " logs ".to_string(),
+}
+
+/// The `/` prompt, or what it left behind.
+///
+/// In the title rather than a line of its own: a prompt row would change the
+/// pane's height the moment it appeared, moving every line under it at the
+/// exact moment the reader is trying to read them.
+///
+/// While typing it carries a cursor, because a query the pane is refiltering
+/// on with every keystroke should look like something being typed. Once
+/// confirmed it stays, because the search is still in force and the pane is
+/// still hiding things — with the key that ends it, since Esc means something
+/// else once the prompt is closed.
+fn search_hint(app: &App) -> Option<String> {
+    let search = &app.log_search;
+    if !search.editing() && !search.is_active() {
+        return None;
     }
+    let mode = match search.mode() {
+        super::search::Mode::Regex => "re",
+        super::search::Mode::Substring => "",
+    };
+    let label = if mode.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{mode}:")
+    };
+    if search.editing() {
+        return Some(match search.error() {
+            // Every second keystroke of a real pattern is invalid, so this is
+            // a normal state to be in, not an error to be alarmed by.
+            Some(why) => format!("{label}{}▌ ({why})", search.query()),
+            None => format!("{label}{}▌ [ctrl+r] regex", search.query()),
+        });
+    }
+    Some(format!("{label}{}  [esc] clear", search.query()))
 }
 
 /// Render the visible slice of the log, plus a scroll indicator when the view
@@ -327,7 +368,11 @@ fn draw_log_pane(
     };
     let mut index = std::mem::take(&mut app.view_index);
     index.sync(store, key, &app.blank_after, |entry| {
+        // Two narrowings, and a line has to survive both: the name filter
+        // decides whose output this is, `/` decides whether it says the thing
+        // being looked for.
         app.should_render_log(&entry.line.name, entry.line.is_lifecycle)
+            && app.log_search.admits(&entry.message_text())
     });
     // The one place scroll position is decided, now that the index is current
     // and the pane's height is known.
@@ -341,6 +386,7 @@ fn draw_log_pane(
         app.log_scroll,
         area.width,
         area.height,
+        &app.log_search,
     );
     app.view_index = index;
     // Remembered for the input layer: scrolling needs to know how far it can

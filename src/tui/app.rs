@@ -317,6 +317,9 @@ pub(crate) struct App {
     /// field rather than two so the name in the pane's title cannot disagree
     /// with what Esc would restore.
     pub(crate) filter_narrowed_from: Option<(String, std::collections::HashSet<String>)>,
+    /// The log pane's `/` search. Narrows by content the way the filter
+    /// narrows by name, and lights up what it matched.
+    pub(crate) log_search: super::search::LogSearch,
     /// Where the panes ended up in the last frame. Written by the renderer and
     /// read by mouse handling, so a click resolves against the rectangles that
     /// were actually drawn rather than a second computation of them.
@@ -506,6 +509,7 @@ impl App {
             auto_filter_on_failure_names,
             form: None,
             filter_narrowed_from: None,
+            log_search: super::search::LogSearch::default(),
             panes: super::panes::Panes::empty(),
             panel: super::panes::Panel::default(),
             panel_extent_customized: false,
@@ -611,6 +615,9 @@ impl App {
         // Blank marks change how tall a line is, so they belong to the same key
         // the row index is built against.
         self.blank_epoch.hash(&mut hasher);
+        // `/` decides admission line by line, so it belongs to the same key
+        // the row index is built against.
+        self.log_search.fingerprint(&mut hasher);
         hasher.finish()
     }
 

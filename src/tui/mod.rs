@@ -58,6 +58,7 @@ mod log_store;
 mod logs;
 mod panes;
 mod render;
+mod search;
 mod selection;
 mod status_table;
 mod view_index;
@@ -696,6 +697,9 @@ fn handle_key(
             // right-docked panel that is also "grow the pane you are in" from
             // both sides — Ctrl+Right grows a focused log and shrinks a
             // focused panel, which are the same motion.
+            // Swap the open search prompt between substring and regex. Taken
+            // here because this block answers every Ctrl chord and returns.
+            KeyCode::Char('r') if app.log_search.editing() => app.log_search.toggle_mode(),
             KeyCode::Left if app.panel_open() && app.panel.side == panes::PaneSide::Right => {
                 nudge_panel(app, RESIZE_STEP_COLUMNS);
             }
@@ -722,12 +726,13 @@ fn handle_key(
     // search box is being typed into (the filter's, or a table's `/` query),
     // every character belongs to the query, and while the filter's query is
     // up Tab already means "back to the list" there.
-    let typing = match app.view_mode {
-        ViewMode::Filter => app.filter.focus() == filter::FilterFocus::Query,
-        ViewMode::Services => app.services_table.filtering,
-        ViewMode::Tasks => app.tasks_table.filtering,
-        _ => false,
-    };
+    let typing = app.log_search.editing()
+        || match app.view_mode {
+            ViewMode::Filter => app.filter.focus() == filter::FilterFocus::Query,
+            ViewMode::Services => app.services_table.filtering,
+            ViewMode::Tasks => app.tasks_table.filtering,
+            _ => false,
+        };
     if app.panel_open() && !typing {
         match key.code {
             // Tab moves the keys between the log and the panel.
@@ -798,7 +803,20 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
     // The half-finished `gg` chord: taken here so any key other than the
     // second `g` clears it just by arriving.
     let awaiting_second_g = std::mem::take(&mut app.pending_g);
+    // The search prompt takes the keyboard while it is open: every printable
+    // key is part of the query, so none of them can also be a command.
+    if app.log_search.editing() {
+        handle_search_key(key, app);
+        return Ok(());
+    }
     match key.code {
+        // `/` searches the pane's contents, as it does in the tables — there
+        // by name, here by what a line says.
+        KeyCode::Char('/') => app.log_search.begin(),
+        // Esc undoes the innermost thing first, and a confirmed search is
+        // inside a narrow: it was applied last and the title is advertising
+        // this key for it. A second Esc reaches whatever is underneath.
+        KeyCode::Esc if app.log_search.is_active() => app.log_search.cancel(),
         // Held above the tail, Enter is the way back down — the gesture
         // everyone tries first. Above means *actually* above: a view merely
         // pinned at the tail (a selection does that) looks identical to
@@ -1268,6 +1286,33 @@ fn handle_mouse(mouse: MouseEvent, at: std::time::Instant, app: &mut App, store:
         MouseEventKind::Up(MouseButton::Left) => {
             app.dragging_divider = false;
             app.log_selection.finish();
+        }
+        _ => {}
+    }
+}
+
+/// Keys while the `/` prompt is open.
+///
+/// Enter leaves the search in force and Esc ends it, the same pair the tables
+/// use for their own `/`. Ctrl+R — taken with the other Ctrl chords, upstream
+/// — swaps the query between substring and regex without retyping it, which is
+/// the point of having a toggle at all.
+///
+/// Backspace on an empty query closes the prompt: there is nothing left to
+/// delete, and pressing it again should not be a dead key.
+fn handle_search_key(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Enter => app.log_search.confirm(),
+        KeyCode::Esc => app.log_search.cancel(),
+        KeyCode::Backspace => {
+            if !app.log_search.backspace() {
+                app.log_search.cancel();
+            }
+        }
+        // Ctrl-chords are commands, not text: a stray Ctrl+C while typing a
+        // query should still be the shutdown it is everywhere else.
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.log_search.push(c);
         }
         _ => {}
     }
