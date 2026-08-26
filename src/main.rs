@@ -174,14 +174,15 @@ enum Commands {
         #[arg(short, long)]
         follow: bool,
     },
-    /// Interactively attach stdin/stdout to a running service
+    /// Attach to an already-running project.
+    ///
+    /// With no name, brings up the full TUI over the running stack: Ctrl+D
+    /// detaches and leaves it running, Ctrl+C requests a graceful shutdown.
+    /// With a name, connects stdin/stdout straight to that one service's PTY.
     Attach {
-        /// Name of the service to attach to
-        name: String,
+        /// Service to attach to. Omit for the whole project's TUI.
+        name: Option<String>,
     },
-    /// Attach the full TUI to an already-running project. Ctrl+D detaches
-    /// (the stack keeps running); Ctrl+C requests a graceful shutdown.
-    Tui,
     /// Clean up stale state from a previous run
     Cleanup {
         /// Kill a running daemon first, then clean up
@@ -377,8 +378,10 @@ async fn run(config_path: PathBuf, verbose: bool, command: Commands) -> i32 {
         Commands::Ports { json } => run_ports(&config_path, json),
         Commands::Watch { json } => run_watch(&config_path, json).await,
         Commands::Logs { name, last, follow } => run_logs(&config_path, &name, last, follow).await,
-        Commands::Attach { name } => run_attach(&config_path, &name).await,
-        Commands::Tui => run_attach_tui(&config_path).await,
+        Commands::Attach { name } => match name {
+            Some(name) => run_attach(&config_path, &name).await,
+            None => run_attach_tui(&config_path).await,
+        },
         Commands::Cleanup { force } => run_cleanup_command(&config_path, force).await,
         Commands::Run {
             name,
@@ -1397,7 +1400,7 @@ async fn run_logs(config_path: &Path, name: &str, last: usize, follow: bool) -> 
 /// the TUI as a client — the fork model.
 ///
 /// The runner never has a terminal; the thing in your terminal is an
-/// ordinary client of the socket API, identical to `don tui`. Ctrl+C keeps
+/// ordinary client of the socket API, identical to `don attach`. Ctrl+C keeps
 /// its contract (graceful stack shutdown — the TUI requests it over the
 /// API; a terminal-delivered SIGINT is forwarded to the child, so a second
 /// one still reaches the runner's force-kill escalation). Ctrl+D detaches,
@@ -1538,7 +1541,7 @@ fn should_auto_attach(config_path: &Path, no_tui: bool) -> bool {
     config.validate(platform).is_ok()
 }
 
-/// `don tui` — attach the full TUI to an already-running project.
+/// `don attach` with no name — the full TUI over an already-running project.
 ///
 /// A pure client of the socket API: the process set comes from `GET /status`
 /// (which doubles as the "is anything running?" check, answered before the
@@ -1567,7 +1570,7 @@ async fn attach_tui_inner(
         use std::io::IsTerminal;
         if !std::io::stdout().is_terminal() {
             return Err(
-                "don tui needs a terminal — use `don status` or `don logs` in scripts".into(),
+                "don attach needs a terminal — use `don status` or `don logs` in scripts".into(),
             );
         }
     }
@@ -1789,7 +1792,7 @@ async fn attach_tui_inner(
     let probe = Client::new(&base);
     if probe.ready().await.is_ok() {
         println!(
-            "detached — the stack is still running (`don tui` to reattach, `don stop` to stop)"
+            "detached — the stack is still running (`don attach` to reattach, `don stop` to stop)"
         );
     }
     Ok(())

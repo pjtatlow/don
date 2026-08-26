@@ -102,7 +102,7 @@ nothing is lost by opening an overlay.
 | `a` | In a table: attach to the highlighted process, in a window |
 | `enter` `r` `R` | In a table: run or start/stop, restart, hard restart |
 | Ctrl+L | Repaint, if something else has scribbled on the screen |
-| Ctrl+D | Detach, leaving the stack running (`don tui` only) |
+| Ctrl+D | Detach, leaving the stack running (`don attach` only) |
 | Ctrl+C | Graceful shutdown (second press force-kills) |
 
 A selection is a place in the log rather than a place on the screen — a line
@@ -735,7 +735,8 @@ don ports --json             # print the .don/ports.json manifest
 don logs <name>              # view recent output
 don logs <name> --follow     # stream output
 don logs <name> --last 50    # last N lines
-don attach <name>            # attach stdin/stdout to a running service
+don attach                   # bring up the TUI over a running stack
+don attach <name>            # attach stdin/stdout to one service
 don run <name>               # run a specific task (bypasses auto_run)
 don run <name> --wait        # run a task and wait for it to finish
 don run <name> --timeout 30s # wait up to 30s without stopping the task

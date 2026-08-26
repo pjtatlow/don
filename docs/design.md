@@ -1014,7 +1014,7 @@ Commands:
   logs <name>               Tail the logs for a specific service
   run <name>                Run a specific task (bypasses auto_run)
   exec <cmd> [args...]      Run a command with .don/bin on PATH
-  attach <name>             Interactively attach stdin/stdout to a running service
+  attach [name]             Attach the TUI to a running project, or one service's PTY
   cleanup                   Kill orphaned processes, remove stale sockets/containers
   validate                  Check the config for errors without running anything
   completions <shell>       Print a shell completion script (bash/zsh/fish/...)

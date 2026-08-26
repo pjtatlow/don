@@ -3,7 +3,7 @@
 
 Usage: tui_attach_drive.py <don-binary> <project-dir> <ctrl-d|ctrl-c> <linger-s> [subcommand]
 
-Spawns `don <subcommand>` (default `tui`; pass `start` for the fork model)
+Spawns `don <subcommand>` (default `attach`; pass `start` for the fork model)
 under a PTY, answers DSR cursor queries, sets a real window size, sends the
 requested control key after <linger-s> seconds, and reports what it saw:
 
@@ -18,7 +18,7 @@ the confusing way).
 import os, pty, sys, time, select, signal, re, fcntl, termios, struct
 
 binary, cwd, keys, linger = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3], float(sys.argv[4])
-subcmd = sys.argv[5] if len(sys.argv) > 5 else "tui"
+subcmd = sys.argv[5] if len(sys.argv) > 5 else "attach"
 KEYMAP = {"ctrl-d": b"\x04", "ctrl-c": b"\x03"}
 
 pid, master = pty.fork()

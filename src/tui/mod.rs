@@ -168,7 +168,7 @@ const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16)
 pub enum TuiMode {
     /// The TUI shares a process with the runner (`don start` today).
     InProcess,
-    /// The TUI attached to a running project over the socket (`don tui`).
+    /// The TUI attached to a running project over the socket (`don attach`).
     Remote,
 }
 

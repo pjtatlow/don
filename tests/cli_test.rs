@@ -116,7 +116,7 @@ fn cli_tui_without_runner_errors_actionably() {
         // No runner: the error must point at `don start` (or, headless, at
         // the terminal requirement) *before* the terminal is touched.
         let (code, _stdout, stderr) =
-            tokio::task::spawn_blocking(move || run_cli(&config_path, &["tui"]))
+            tokio::task::spawn_blocking(move || run_cli(&config_path, &["attach"]))
                 .await
                 .unwrap();
         assert_ne!(code, 0, "attaching with no runner must fail");
