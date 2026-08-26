@@ -253,6 +253,23 @@ fn draw_attach_window(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
+/// What the log pane calls itself.
+///
+/// A pane narrowed by `l` is showing a fraction of the log, and nothing else
+/// on screen says so — the filter panel need not be open, and rows that are
+/// missing cannot advertise their absence. The title names the process being
+/// shown and the key that gives the rest back, in the same shape the tables
+/// announce their keys.
+fn log_pane_title(app: &App) -> String {
+    if app.debug_view {
+        return " don's log ".to_string();
+    }
+    match app.narrowed_to() {
+        Some(name) => format!(" logs — {name}  [esc] all "),
+        None => " logs ".to_string(),
+    }
+}
+
 /// Render the visible slice of the log, plus a scroll indicator when the view
 /// is not pinned to the newest line.
 fn draw_log_pane(
@@ -276,11 +293,7 @@ fn draw_log_pane(
         } else {
             Color::DarkGray
         }))
-        .title(if app.debug_view {
-            " don's log "
-        } else {
-            " logs "
-        });
+        .title(log_pane_title(app));
     let text_area = block.inner(area);
     frame.render_widget(block, area);
     if text_area.height == 0 || text_area.width == 0 {
@@ -1552,6 +1565,61 @@ fn field_render_rows(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A narrowed pane says so, and says how to undo it.
+    ///
+    /// `l` hides most of the log, and the rows it hides cannot announce their
+    /// own absence — without this the pane looks like a project that has gone
+    /// quiet.
+    #[test]
+    fn the_log_pane_title_says_when_it_is_narrowed() {
+        struct Case {
+            name: &'static str,
+            narrow_to: Option<&'static str>,
+            debug_view: bool,
+            want: &'static str,
+        }
+
+        for case in [
+            Case {
+                name: "showing everything",
+                narrow_to: None,
+                debug_view: false,
+                want: " logs ",
+            },
+            Case {
+                name: "narrowed to one process",
+                narrow_to: Some("api"),
+                debug_view: false,
+                want: " logs — api  [esc] all ",
+            },
+            Case {
+                // The diagnostics record is its own store with its own
+                // filter; `l` does not narrow it and must not claim to.
+                name: "don's own log is never the narrowed one",
+                narrow_to: Some("api"),
+                debug_view: true,
+                want: " don's log ",
+            },
+        ] {
+            let mut app = super::super::app::App::new(super::super::app::AppInit {
+                service_names: vec!["api".to_string(), "web".to_string()],
+                task_names: Vec::new(),
+                build_tool_names: Vec::new(),
+                task_configs: std::collections::HashMap::new(),
+                task_last_runs: std::collections::HashMap::new(),
+                hidden_names: std::collections::HashSet::new(),
+                auto_filter_on_failure_names: std::collections::HashSet::new(),
+                cli_log_filter: None,
+            });
+            if let Some(name) = case.narrow_to {
+                assert!(app.narrow_log_to(name), "{}: narrowing", case.name);
+            }
+            app.debug_view = case.debug_view;
+            assert_eq!(log_pane_title(&app), case.want, "{}", case.name);
+        }
+    }
+
     use crate::config::ParamKind;
     use crate::tui::app::AppInit;
     use crate::tui::form::{CandidateState, Field};

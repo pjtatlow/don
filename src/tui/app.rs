@@ -309,12 +309,14 @@ pub(crate) struct App {
     /// Active form modal, or `None` when not in [`ViewMode::Form`].
     pub(crate) form: Option<FormState>,
     /// Active service/task log popup shown over the services/tasks table.
-    /// The selection `l` replaced, so Esc can put it back.
+    /// What `l` narrowed to, and the selection it replaced.
     ///
     /// Narrowing to one process is a look, not a decision — the filter you
     /// had built is what you want back afterwards, and rebuilding it by hand
-    /// is the reason a modal felt necessary in the first place.
-    pub(crate) filter_narrowed_from: Option<std::collections::HashSet<String>>,
+    /// is the reason a modal felt necessary in the first place. Held as one
+    /// field rather than two so the name in the pane's title cannot disagree
+    /// with what Esc would restore.
+    pub(crate) filter_narrowed_from: Option<(String, std::collections::HashSet<String>)>,
     /// Where the panes ended up in the last frame. Written by the renderer and
     /// read by mouse handling, so a click resolves against the rectangles that
     /// were actually drawn rather than a second computation of them.
@@ -648,15 +650,28 @@ impl App {
         let Some(previous) = self.filter.narrow_to(name) else {
             return false;
         };
-        // Only the first narrowing records a restore point: `l` on one row
-        // then another should still go back to what you had before either.
-        self.filter_narrowed_from.get_or_insert(previous);
+        match self.filter_narrowed_from.as_mut() {
+            // `l` on one row then another still goes back to what you had
+            // before either — only the name being shown moves.
+            Some(held) => held.0 = name.to_string(),
+            None => self.filter_narrowed_from = Some((name.to_string(), previous)),
+        }
         true
+    }
+
+    /// The process the log pane is narrowed to, when `l` narrowed it.
+    ///
+    /// Drives the pane's title: a filter that hides most of the log is worth
+    /// saying out loud, and so is the key that undoes it.
+    pub(crate) fn narrowed_to(&self) -> Option<&str> {
+        self.filter_narrowed_from
+            .as_ref()
+            .map(|(name, _)| name.as_str())
     }
 
     /// Put back the selection `l` replaced, if it replaced one.
     pub(crate) fn widen_log_from_narrow(&mut self) -> bool {
-        let Some(previous) = self.filter_narrowed_from.take() else {
+        let Some((_, previous)) = self.filter_narrowed_from.take() else {
             return false;
         };
         self.filter.restore(previous);
