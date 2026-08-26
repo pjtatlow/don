@@ -78,7 +78,7 @@ use tokio::sync::mpsc;
 use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot};
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter};
-use app::{App, AppInit, ViewMode, line_matches_log_popup};
+use app::{App, AppInit, ViewMode};
 use events::AppEvent;
 use log_store::{DEBUG_CAPACITY, DEFAULT_CAPACITY, LogStore};
 use status_table::StatusTableKeyOutcome;
@@ -356,7 +356,6 @@ pub async fn run_tui(
                             if is_shutdown_start_line(&line) && !app.shutdown_started {
                                 app.begin_shutdown();
                             }
-                            app.append_log_popup_line(&line);
                             stores.route(id, line);
                         }
                         dirty = true;
@@ -829,7 +828,7 @@ fn handle_key(
         ViewMode::Filter => handle_filter_key(key, app, store)?,
         ViewMode::Tasks => handle_tasks_key(key, app, store, client)?,
         ViewMode::Services => {
-            handle_services_key(key, app, store, client, controls)?;
+            handle_services_key(key, app, client, controls)?;
         }
         ViewMode::Failures => handle_failure_summary_key(key, app, store)?,
         ViewMode::Form => handle_form_key(key, app, store, client)?,
@@ -1585,8 +1584,7 @@ fn handle_tasks_key(
     client: &std::sync::Arc<Client>,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
-    if app.log_popup.is_some() {
-        handle_log_popup_key(key, app);
+    if key.code == KeyCode::Esc && app.widen_log_from_narrow() {
         return Ok(());
     }
     match app.tasks_table.handle_key(key, total) {
@@ -1618,7 +1616,7 @@ fn handle_tasks_key(
         let Some(item) = highlighted_task_item(app) else {
             return Ok(());
         };
-        open_log_popup_for_name(app, store, item.name);
+        app.narrow_log_to(&item.name);
     } else if key.code == KeyCode::Char('a') {
         // Bridge into the highlighted task's PTY — the interactive-task flow.
         if let Some(item) = highlighted_task_item(app) {
@@ -1631,13 +1629,11 @@ fn handle_tasks_key(
 fn handle_services_key(
     key: KeyEvent,
     app: &mut App,
-    store: &mut LogStore,
     client: &std::sync::Arc<Client>,
     controls: &TuiControls,
 ) -> Result<(), TuiError> {
     let total = app.service_items().len();
-    if app.log_popup.is_some() {
-        handle_log_popup_key(key, app);
+    if key.code == KeyCode::Esc && app.widen_log_from_narrow() {
         return Ok(());
     }
     match app.services_table.handle_key(key, total) {
@@ -1676,7 +1672,7 @@ fn handle_services_key(
             let Some(item) = highlighted_service_item(app) else {
                 return Ok(());
             };
-            open_log_popup_for_name(app, store, item.name);
+            app.narrow_log_to(&item.name);
         }
         KeyCode::Char('a') => {
             // Bridge into the highlighted service's PTY.
@@ -1687,28 +1683,6 @@ fn handle_services_key(
         _ => {}
     }
     Ok(())
-}
-
-fn handle_log_popup_key(key: KeyEvent, app: &mut App) {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.close_log_popup(),
-        KeyCode::Up | KeyCode::Char('k') => app.scroll_log_popup_by(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.scroll_log_popup_by(1),
-        KeyCode::PageUp => app.scroll_log_popup_by(-10),
-        KeyCode::PageDown => app.scroll_log_popup_by(10),
-        KeyCode::Home | KeyCode::Char('g') => app.scroll_log_popup_to_top(),
-        KeyCode::End | KeyCode::Char('G') => app.scroll_log_popup_to_bottom(),
-        _ => {}
-    }
-}
-
-fn open_log_popup_for_name(app: &mut App, store: &LogStore, name: String) {
-    let lines = store
-        .iter()
-        .filter(|entry| line_matches_log_popup(&name, &entry.line))
-        .map(|entry| entry.line.bytes.clone())
-        .collect();
-    app.open_log_popup(name, lines);
 }
 
 fn highlighted_task_item(app: &App) -> Option<app::TaskStatusItem> {
@@ -1891,7 +1865,6 @@ fn after_task_run(task_name: &str, app: &mut App, _store: &LogStore) -> Result<(
     // Make sure the task's own output is admitted, so pressing enter is
     // followed by seeing something happen.
     let filter_changed = app.filter.select_name(task_name);
-    app.log_popup = None;
 
     // The panel stays open. This used to close it — right when the tasks
     // table was full-screen and running something had to hand the logs back,
@@ -2265,7 +2238,10 @@ mod tests {
     fn app_with_service_state(state: ServiceState) -> App {
         let mut app = App::new(AppInit {
             service_names: vec!["api".to_string()],
-            task_names: Vec::new(),
+            // Registered here and not only via `apply_task_state`: the filter
+            // takes its names at construction, and a task it has never heard
+            // of cannot be narrowed to.
+            task_names: vec!["migrate".to_string()],
             build_tool_names: Vec::new(),
             task_configs: HashMap::new(),
             task_last_runs: HashMap::new(),
@@ -2961,7 +2937,8 @@ mod tests {
             from: ViewMode,
             key: KeyCode,
             want_mode: ViewMode,
-            want_popup: bool,
+            /// Whether `l` narrowed the log pane to the highlighted row.
+            want_narrowed: bool,
         }
 
         let cases = [
@@ -2970,35 +2947,37 @@ mod tests {
                 from: ViewMode::Services,
                 key: KeyCode::Char('f'),
                 want_mode: ViewMode::Filter,
-                want_popup: false,
+                want_narrowed: false,
             },
             Case {
                 name: "and from the tasks table",
                 from: ViewMode::Tasks,
                 key: KeyCode::Char('f'),
                 want_mode: ViewMode::Filter,
-                want_popup: false,
+                want_narrowed: false,
             },
             Case {
                 name: "and is its own toggle",
                 from: ViewMode::Filter,
                 key: KeyCode::Char('f'),
                 want_mode: ViewMode::Normal,
-                want_popup: false,
+                want_narrowed: false,
             },
             Case {
-                name: "l opens the highlighted service's log",
+                name: "l narrows the log to the highlighted service",
                 from: ViewMode::Services,
                 key: KeyCode::Char('l'),
+                // The panel stays: the pane beside it is the log, so
+                // narrowing it is showing the row's log.
                 want_mode: ViewMode::Services,
-                want_popup: true,
+                want_narrowed: true,
             },
             Case {
-                name: "and the highlighted task's",
+                name: "and to the highlighted task",
                 from: ViewMode::Tasks,
                 key: KeyCode::Char('l'),
                 want_mode: ViewMode::Tasks,
-                want_popup: true,
+                want_narrowed: true,
             },
         ];
 
@@ -3031,82 +3010,9 @@ mod tests {
 
             assert_eq!(app.view_mode, case.want_mode, "{}", case.name);
             assert_eq!(
-                app.log_popup.is_some(),
-                case.want_popup,
-                "{}: popup?",
-                case.name
-            );
-        }
-    }
-
-    /// The log popup cannot outlive the table it is a row of.
-    ///
-    /// `s` and `t` close or switch their panel from anywhere, but the only key
-    /// that dismissed the popup lived inside the table handlers — so a popup
-    /// left behind was one nothing could close.
-    #[test]
-    fn changing_the_view_takes_the_log_popup_with_it() {
-        struct Case {
-            name: &'static str,
-            from: ViewMode,
-            key: KeyCode,
-        }
-
-        let cases = [
-            Case {
-                name: "closing the panel it was opened from",
-                from: ViewMode::Services,
-                key: KeyCode::Char('s'),
-            },
-            Case {
-                name: "switching to the other panel",
-                from: ViewMode::Services,
-                key: KeyCode::Char('t'),
-            },
-            Case {
-                name: "closing the tasks panel",
-                from: ViewMode::Tasks,
-                key: KeyCode::Char('t'),
-            },
-            Case {
-                name: "switching from tasks to services",
-                from: ViewMode::Tasks,
-                key: KeyCode::Char('s'),
-            },
-        ];
-
-        for case in cases {
-            let mut app = app_with_service_state(ServiceState::Ready);
-            app.apply_task_state(
-                "migrate".to_string(),
-                crate::client::TaskState::Pending,
-                None,
-                Vec::new(),
-            );
-            app.view_mode = case.from;
-            app.focus = panes::Focus::Panel;
-            app.open_log_popup("api".to_string(), vec![b"a line".to_vec()]);
-            assert!(app.log_popup.is_some(), "{}: opened", case.name);
-
-            let mut store = LogStore::with_capacity(10);
-            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
-            let controls = TuiControls {
-                terminal_out: writer::TerminalOut::discarding(),
-                lifecycle_emitter: LifecycleEmitter::discarding(),
-                mode: TuiMode::InProcess,
-            };
-            handle_key(
-                KeyEvent::new(case.key, KeyModifiers::NONE),
-                &mut app,
-                &mut store,
-                &client,
-                &controls,
-            )
-            .unwrap();
-
-            assert!(
-                app.log_popup.is_none(),
-                "{}: the popup went with the table",
+                app.filter_narrowed_from.is_some(),
+                case.want_narrowed,
+                "{}: narrowed?",
                 case.name
             );
         }

@@ -98,7 +98,7 @@ nothing is lost by opening an overlay.
 | `Tab` | Move focus between the log and the panel |
 | `P` | Move the panel between right and bottom |
 | Ctrl+`←` `→` | Resize the split. Grows whichever pane has focus |
-| `l` | In a table: the highlighted service's or task's log |
+| `l` | In a table: narrow the log to the highlighted process (`Esc` restores the filter) |
 | `a` | In a table: attach to the highlighted process, in a window |
 | `enter` `r` `R` | In a table: run or start/stop, restart, hard restart |
 | Ctrl+L | Repaint, if something else has scribbled on the screen |

@@ -179,6 +179,33 @@ impl FilterState {
         self.active_selected.contains(name)
     }
 
+    /// Show only `name`, returning the selection it replaced.
+    ///
+    /// This is what `l` on a table row does: the log pane beside the panel is
+    /// the log view, so narrowing it *is* showing that row's log — there is no
+    /// second pane to open, no second history to fill, and everything the log
+    /// pane can do it can still do while narrowed.
+    ///
+    /// `None` when `name` is not filterable or the selection is already
+    /// exactly it, so the caller does not record a restore point for a
+    /// narrowing that did not happen.
+    pub(crate) fn narrow_to(&mut self, name: &str) -> Option<HashSet<String>> {
+        if !self.all_names.iter().any(|n| n == name) {
+            return None;
+        }
+        if self.active_selected.len() == 1 && self.active_selected.contains(name) {
+            return None;
+        }
+        let previous = std::mem::take(&mut self.active_selected);
+        self.active_selected.insert(name.to_string());
+        Some(previous)
+    }
+
+    /// Put back a selection [`Self::narrow_to`] replaced.
+    pub(crate) fn restore(&mut self, previous: HashSet<String>) {
+        self.active_selected = previous;
+    }
+
     /// Add a name to the selection. Returns `true` when this made the active
     /// filter more permissive.
     pub(crate) fn select_name(&mut self, name: &str) -> bool {
@@ -419,6 +446,97 @@ fn build_rows(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// `l` narrows the pane to one process and Esc gives back what was there.
+    ///
+    /// The pane beside the panel *is* the log view, so narrowing it is how a
+    /// row's log gets shown — which only works if getting back is one key,
+    /// since rebuilding a filter by hand is the reason a modal looked
+    /// necessary in the first place.
+    #[test]
+    fn narrowing_to_one_name_is_reversible() {
+        struct Case {
+            name: &'static str,
+            /// Selected before the narrow.
+            before: &'static [&'static str],
+            narrow_to: &'static str,
+            /// `None` when nothing was narrowed and there is nothing to undo.
+            want_narrow: Option<&'static [&'static str]>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "from everything",
+                before: &["api", "web", "worker"],
+                narrow_to: "web",
+                want_narrow: Some(&["web"]),
+            },
+            Case {
+                name: "from an already-narrowed selection",
+                before: &["api", "web"],
+                narrow_to: "api",
+                want_narrow: Some(&["api"]),
+            },
+            Case {
+                name: "already showing exactly that one changes nothing",
+                before: &["web"],
+                narrow_to: "web",
+                want_narrow: None,
+            },
+            Case {
+                name: "a name the filter has never heard of changes nothing",
+                before: &["api", "web"],
+                narrow_to: "nosuch",
+                want_narrow: None,
+            },
+        ];
+
+        for case in cases {
+            let all: Vec<String> = ["api", "web", "worker"]
+                .iter()
+                .map(|n| (*n).to_string())
+                .collect();
+            let mut filter = FilterState::new(all, &HashSet::new(), None);
+            let before: HashSet<String> = case.before.iter().map(|n| (*n).to_string()).collect();
+            filter.restore(before.clone());
+
+            let previous = filter.narrow_to(case.narrow_to);
+
+            match case.want_narrow {
+                Some(want) => {
+                    let got: HashSet<String> = want.iter().map(|n| (*n).to_string()).collect();
+                    assert!(
+                        want.iter().all(|n| filter.passes(n)),
+                        "{}: the narrowed name shows",
+                        case.name
+                    );
+                    for other in ["api", "web", "worker"] {
+                        assert_eq!(
+                            filter.passes(other),
+                            got.contains(other),
+                            "{}: only the narrowed name shows ({other})",
+                            case.name
+                        );
+                    }
+                    filter.restore(previous.expect("a narrowing records its restore point"));
+                }
+                None => assert!(
+                    previous.is_none(),
+                    "{}: nothing changed, so there is nothing to undo",
+                    case.name
+                ),
+            }
+
+            for name in ["api", "web", "worker"] {
+                assert_eq!(
+                    filter.passes(name),
+                    before.contains(name),
+                    "{}: back to what it was ({name})",
+                    case.name
+                );
+            }
+        }
+    }
 
     fn state(names: &[&str]) -> FilterState {
         FilterState::new(

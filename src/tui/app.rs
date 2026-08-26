@@ -15,11 +15,8 @@ use super::form::FormState;
 use super::status_table::{StatusTableState, retain_fuzzy_matches};
 use crate::client::{ServiceState, TaskState};
 use crate::config::Task;
-use crate::output::{FormattedLogLine, LIFECYCLE_EVENT_NAME};
+use crate::output::LIFECYCLE_EVENT_NAME;
 use crate::task_state::TaskRunInfo;
-
-const LOG_POPUP_MAX_LINES: usize = 500;
-const LOG_POPUP_DEFAULT_VISIBLE_LINES: usize = 30;
 
 /// Top-level view mode. Determines how keys are interpreted and how the
 /// inline viewport is laid out.
@@ -65,15 +62,6 @@ pub(crate) struct TaskStatusItem {
     pub(crate) failed_dependencies: Vec<String>,
     pub(crate) last_run: Option<TaskRunInfo>,
     pub(crate) has_params: bool,
-}
-
-/// In-table popup showing recent logs for the highlighted service/task.
-#[derive(Debug, Clone)]
-pub(crate) struct LogPopup {
-    pub(crate) name: String,
-    pub(crate) lines: Vec<Vec<u8>>,
-    pub(crate) scroll: usize,
-    pub(crate) follow_tail: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,7 +309,12 @@ pub(crate) struct App {
     /// Active form modal, or `None` when not in [`ViewMode::Form`].
     pub(crate) form: Option<FormState>,
     /// Active service/task log popup shown over the services/tasks table.
-    pub(crate) log_popup: Option<LogPopup>,
+    /// The selection `l` replaced, so Esc can put it back.
+    ///
+    /// Narrowing to one process is a look, not a decision — the filter you
+    /// had built is what you want back afterwards, and rebuilding it by hand
+    /// is the reason a modal felt necessary in the first place.
+    pub(crate) filter_narrowed_from: Option<std::collections::HashSet<String>>,
     /// Where the panes ended up in the last frame. Written by the renderer and
     /// read by mouse handling, so a click resolves against the rectangles that
     /// were actually drawn rather than a second computation of them.
@@ -510,7 +503,7 @@ impl App {
             task_configs,
             auto_filter_on_failure_names,
             form: None,
-            log_popup: None,
+            filter_narrowed_from: None,
             panes: super::panes::Panes::empty(),
             panel: super::panes::Panel::default(),
             panel_extent_customized: false,
@@ -647,6 +640,29 @@ impl App {
     /// Verbose is not an admission question: it decided which *store* the line
     /// went into, and a store holds only its own kind. What is left is the
     /// name filter, and the shutdown override.
+    /// Show only `name` in the log pane, remembering what to go back to.
+    ///
+    /// Returns whether anything changed, so the caller can leave the keypress
+    /// alone when it did not.
+    pub(crate) fn narrow_log_to(&mut self, name: &str) -> bool {
+        let Some(previous) = self.filter.narrow_to(name) else {
+            return false;
+        };
+        // Only the first narrowing records a restore point: `l` on one row
+        // then another should still go back to what you had before either.
+        self.filter_narrowed_from.get_or_insert(previous);
+        true
+    }
+
+    /// Put back the selection `l` replaced, if it replaced one.
+    pub(crate) fn widen_log_from_narrow(&mut self) -> bool {
+        let Some(previous) = self.filter_narrowed_from.take() else {
+            return false;
+        };
+        self.filter.restore(previous);
+        true
+    }
+
     pub(crate) fn should_render_log(&self, name: &str, _is_lifecycle: bool) -> bool {
         // During shutdown, every line bypasses the filter — the user wants
         // to see what's happening as each service tears down, including
@@ -793,7 +809,6 @@ impl App {
     /// popup that outlived its table could not be dismissed at all.
     pub(crate) fn set_view_mode(&mut self, mode: ViewMode) {
         self.view_mode = mode;
-        self.log_popup = None;
     }
 
     pub(crate) fn scroll_failure_summary_by(&mut self, delta: isize) {
@@ -994,108 +1009,6 @@ impl App {
             self.failed_dependencies.insert(name, dependencies);
         }
     }
-
-    pub(crate) fn open_log_popup(&mut self, name: String, mut lines: Vec<Vec<u8>>) {
-        if lines.len() > LOG_POPUP_MAX_LINES {
-            lines.drain(0..lines.len() - LOG_POPUP_MAX_LINES);
-        }
-        let scroll = lines.len().saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
-        self.log_popup = Some(LogPopup {
-            name,
-            lines,
-            scroll,
-            follow_tail: true,
-        });
-    }
-
-    pub(crate) fn close_log_popup(&mut self) {
-        self.log_popup = None;
-    }
-
-    pub(crate) fn append_log_popup_line(&mut self, line: &FormattedLogLine) -> bool {
-        let Some(popup) = self.log_popup.as_mut() else {
-            return false;
-        };
-        if !line_matches_log_popup(&popup.name, line) {
-            return false;
-        }
-        popup.lines.push(line.bytes.clone());
-        if popup.lines.len() > LOG_POPUP_MAX_LINES {
-            popup.lines.remove(0);
-            if !popup.follow_tail {
-                popup.scroll = popup.scroll.saturating_sub(1);
-            }
-        }
-        if popup.follow_tail {
-            popup.scroll = popup
-                .lines
-                .len()
-                .saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
-        }
-        true
-    }
-
-    pub(crate) fn scroll_log_popup_by(&mut self, delta: isize) {
-        let Some(popup) = self.log_popup.as_mut() else {
-            return;
-        };
-        popup.follow_tail = false;
-        if delta < 0 {
-            popup.scroll = popup.scroll.saturating_sub(delta.unsigned_abs());
-        } else {
-            popup.scroll = popup
-                .scroll
-                .saturating_add(delta as usize)
-                .min(popup.lines.len().saturating_sub(1));
-        }
-    }
-
-    pub(crate) fn scroll_log_popup_to_top(&mut self) {
-        if let Some(popup) = self.log_popup.as_mut() {
-            popup.scroll = 0;
-            popup.follow_tail = false;
-        }
-    }
-
-    pub(crate) fn scroll_log_popup_to_bottom(&mut self) {
-        if let Some(popup) = self.log_popup.as_mut() {
-            popup.scroll = popup
-                .lines
-                .len()
-                .saturating_sub(LOG_POPUP_DEFAULT_VISIBLE_LINES);
-            popup.follow_tail = true;
-        }
-    }
-
-    pub(crate) fn sync_log_popup_scroll(&mut self, visible_rows: usize) {
-        let Some(popup) = self.log_popup.as_mut() else {
-            return;
-        };
-        let max_scroll = log_popup_max_scroll(popup.lines.len(), visible_rows);
-        if popup.follow_tail {
-            popup.scroll = max_scroll;
-        } else {
-            popup.scroll = popup.scroll.min(max_scroll);
-        }
-    }
-}
-
-fn log_popup_max_scroll(line_count: usize, visible_rows: usize) -> usize {
-    if visible_rows == 0 {
-        0
-    } else {
-        line_count.saturating_sub(visible_rows)
-    }
-}
-
-pub(crate) fn line_matches_log_popup(name: &str, line: &FormattedLogLine) -> bool {
-    if line.name == name {
-        return true;
-    }
-    if line.name != LIFECYCLE_EVENT_NAME {
-        return false;
-    }
-    String::from_utf8_lossy(&line.bytes).contains(&format!("{name}:"))
 }
 
 #[cfg(test)]
@@ -1491,110 +1404,6 @@ mod tests {
         assert!(changed);
         assert!(app.should_render_log("lint", false));
         assert!(!app.should_render_log("build", false));
-    }
-
-    #[test]
-    fn log_popup_matches_source_and_named_lifecycle_lines() {
-        let direct = FormattedLogLine {
-            name: "api".to_string(),
-            is_lifecycle: false,
-            is_verbose: false,
-            prefix: Vec::new(),
-            bytes: b"api output".to_vec(),
-        };
-        let lifecycle = FormattedLogLine {
-            name: LIFECYCLE_EVENT_NAME.to_string(),
-            is_lifecycle: true,
-            is_verbose: false,
-            prefix: Vec::new(),
-            bytes: b"[don] api: started".to_vec(),
-        };
-        let other = FormattedLogLine {
-            name: LIFECYCLE_EVENT_NAME.to_string(),
-            is_lifecycle: true,
-            is_verbose: false,
-            prefix: Vec::new(),
-            bytes: b"[don] worker: started".to_vec(),
-        };
-
-        assert!(line_matches_log_popup("api", &direct));
-        assert!(line_matches_log_popup("api", &lifecycle));
-        assert!(!line_matches_log_popup("api", &other));
-    }
-
-    #[test]
-    fn log_popup_sync_clamps_to_actual_visible_rows() {
-        struct Case {
-            name: &'static str,
-            line_count: usize,
-            follow_tail: bool,
-            initial_scroll: usize,
-            visible_rows: usize,
-            want_scroll: usize,
-        }
-
-        let cases = vec![
-            Case {
-                name: "tail uses real taller viewport",
-                line_count: 100,
-                follow_tail: true,
-                initial_scroll: 70,
-                visible_rows: 40,
-                want_scroll: 60,
-            },
-            Case {
-                name: "tail uses real shorter viewport",
-                line_count: 100,
-                follow_tail: true,
-                initial_scroll: 70,
-                visible_rows: 10,
-                want_scroll: 90,
-            },
-            Case {
-                name: "manual over-scroll clamps to last full page",
-                line_count: 100,
-                follow_tail: false,
-                initial_scroll: 99,
-                visible_rows: 40,
-                want_scroll: 60,
-            },
-            Case {
-                name: "hidden popup area cannot accumulate scroll debt",
-                line_count: 100,
-                follow_tail: false,
-                initial_scroll: 99,
-                visible_rows: 0,
-                want_scroll: 0,
-            },
-            Case {
-                name: "viewport larger than content",
-                line_count: 5,
-                follow_tail: false,
-                initial_scroll: 4,
-                visible_rows: 40,
-                want_scroll: 0,
-            },
-        ];
-
-        for case in cases {
-            let mut app = app_with_names(vec!["api".to_string()], vec![]);
-            let lines = (0..case.line_count)
-                .map(|i| format!("line {i}").into_bytes())
-                .collect();
-            app.open_log_popup("api".to_string(), lines);
-            let popup = app.log_popup.as_mut().unwrap();
-            popup.follow_tail = case.follow_tail;
-            popup.scroll = case.initial_scroll;
-
-            app.sync_log_popup_scroll(case.visible_rows);
-
-            assert_eq!(
-                app.log_popup.as_ref().unwrap().scroll,
-                case.want_scroll,
-                "{}",
-                case.name
-            );
-        }
     }
 
     #[test]
