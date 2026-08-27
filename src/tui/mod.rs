@@ -1719,44 +1719,42 @@ fn overlay_toggle_command(app: &App) -> Option<OverlayCommand> {
         } else {
             overlay_start_command(item.name.clone())
         }),
-        ServiceState::Pending
-        | ServiceState::Building
-        | ServiceState::Starting
-        | ServiceState::Stopping => None,
+        // Something is in flight and the reader has decided it is not
+        // arriving. Stop is the only direction that means anything: there is a
+        // live process under `Starting`, a build to abandon under `Building`,
+        // and a stop already going that this simply repeats. A key that does
+        // nothing here is the worst answer — it is exactly the state someone
+        // is staring at when they want out of it.
+        ServiceState::Starting | ServiceState::Building | ServiceState::Stopping => {
+            Some(overlay_stop_command(item.name.clone()))
+        }
+        // Waiting on dependencies, with nothing running. Start is the override
+        // for that wait — the supervisor says so itself, refusing to treat
+        // `Pending` as busy for exactly this reason.
+        ServiceState::Pending => Some(overlay_start_command(item.name.clone())),
     }
 }
 
-/// Restart command for `r` — only services in a restartable state.
+/// Restart command for `r`.
 fn highlighted_service_restart_command(app: &App) -> Option<OverlayCommand> {
     let items = app.service_items();
     let idx = app.services_table.selected_index(items.len())?;
     let item = items.get(idx)?;
-    match item.state {
-        ServiceState::Ready
-        | ServiceState::Running
-        | ServiceState::Unhealthy
-        | ServiceState::Failed
-        | ServiceState::DependencyFailed
-        | ServiceState::Stopped => Some(overlay_restart_command(item.name.clone())),
-        _ => None,
-    }
+    // Every state. Restart means "whatever you are doing, stop and come up
+    // again", which is as meaningful mid-start as it is when running — and a
+    // service wedged in `Starting` is the one people most want to say it to.
+    // Where a phase genuinely cannot take it the supervisor refuses and says
+    // why, which is an answer; a dead key is not.
+    Some(overlay_restart_command(item.name.clone()))
 }
 
-/// Hard restart command for `R` — only services in a restartable state.
+/// Hard restart command for `R`.
 fn highlighted_service_hard_restart_command(app: &App) -> Option<OverlayCommand> {
     let items = app.service_items();
     let idx = app.services_table.selected_index(items.len())?;
     let item = items.get(idx)?;
-    match item.state {
-        ServiceState::Ready
-        | ServiceState::Running
-        | ServiceState::Unhealthy
-        | ServiceState::Failed
-        | ServiceState::DependencyFailed
-        | ServiceState::Stopped
-        | ServiceState::Lazy => Some(overlay_hard_restart_command(item.name.clone())),
-        _ => None,
-    }
+    // As with `r`: no state is exempt.
+    Some(overlay_hard_restart_command(item.name.clone()))
 }
 
 /// Which control endpoint an overlay action maps to.
@@ -2215,6 +2213,48 @@ pub(crate) fn parse_ansi_line(bytes: &[u8]) -> ratatui::text::Line<'static> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Every state answers every key.
+    ///
+    /// A service wedged in `Starting` with a ready check that never settles is
+    /// the state people most need out of, and it was the one state where
+    /// enter, `r` and `R` were all dead — three keys advertised in the table's
+    /// own title doing nothing, with no way to tell that from a key that had
+    /// been missed.
+    #[test]
+    fn no_service_state_leaves_the_table_keys_dead() {
+        use crate::client::ServiceState::*;
+
+        for state in [
+            Pending,
+            Building,
+            Starting,
+            Running,
+            Ready,
+            Unhealthy,
+            Stopping,
+            Stopped,
+            Failed,
+            DependencyFailed,
+            Lazy,
+        ] {
+            let mut app = app_with_service_state(state);
+            app.services_table.highlight = 0;
+            assert!(
+                overlay_toggle_command(&app).is_some(),
+                "{state:?}: enter does nothing"
+            );
+            assert!(
+                highlighted_service_restart_command(&app).is_some(),
+                "{state:?}: r does nothing"
+            );
+            assert!(
+                highlighted_service_hard_restart_command(&app).is_some(),
+                "{state:?}: R does nothing"
+            );
+        }
+    }
+
     use std::collections::{HashMap, HashSet};
 
     /// An app that knows about one task, interactive or not.
