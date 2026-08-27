@@ -1119,7 +1119,12 @@ fn normal_bar_line(
         spans.push(dim("  [esc] clear"));
         spans.push(separator());
     }
-    spans.push(dim("[f] filter"));
+    // `/` leads the group: both it and the filter narrow the log, and of the
+    // two, searching what the lines *say* is the one a reader reaches for
+    // without having been told it exists — which is the argument for spending
+    // a slot on it.
+    spans.push(dim("[/] search"));
+    spans.push(dim("  [f] filter"));
     if filter.is_active() {
         spans.push(dim(format!(" ({visible_services}/{total_services})")));
         spans.push(dim("  [R] reset"));
@@ -1829,9 +1834,31 @@ mod tests {
     fn shutdown_bar_hides_interactive_controls() {
         let text = line_text(shutdown_bar_line(&StatusCounts::default(), 0));
         assert!(text.contains("shutting down"));
-        assert!(!text.contains("[/] logs"));
+        assert!(!text.contains("[/] search"));
         assert!(!text.contains("[t] tasks"));
         assert!(!text.contains("[s] services"));
+    }
+
+    /// `/` is worth a slot because it is the one narrowing a reader reaches
+    /// for without having been told it exists — and unadvertised, it is the
+    /// one they never find.
+    #[test]
+    fn the_bar_says_slash_searches() {
+        let text = line_text(normal_bar_line(
+            &StatusCounts::default(),
+            &FilterState::new(Vec::new(), &std::collections::HashSet::new(), None),
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+        ));
+        assert!(text.contains("[/] search"), "got: {text}");
+        assert!(
+            text.find("[/] search").unwrap() < text.find("[f] filter").unwrap(),
+            "the two narrowings sit together, search first: {text}"
+        );
     }
 
     #[test]
