@@ -100,21 +100,18 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut App, store: &super::log_stor
             ViewMode::Services => draw_services_table(frame, app, panel_area),
             ViewMode::Tasks => draw_tasks_table(frame, app, panel_area),
             ViewMode::Filter => draw_filter_modal(frame, app, panel_area),
+            ViewMode::Form => draw_form_panel(frame, app, panel_area),
             _ => {}
         }
     }
     draw_bar(frame, app, panes.bar);
 
-    // The failure summary and the param form stay full-screen: both demand a
-    // decision, where a panel is for acting while still watching output. They
-    // wipe what is under them first — the widgets only paint their own cells.
-    if matches!(app.view_mode, ViewMode::Failures | ViewMode::Form) {
+    // The failure summary stays full-screen: it demands a decision, where a
+    // panel is for acting while still watching output. It wipes what is under
+    // it first — the widgets only paint their own cells.
+    if app.view_mode == ViewMode::Failures {
         frame.render_widget(Clear, area);
-    }
-    match app.view_mode {
-        ViewMode::Failures => draw_failure_summary(frame, app),
-        ViewMode::Form => draw_form_modal(frame, app),
-        _ => {}
+        draw_failure_summary(frame, app);
     }
     // The attached process floats above everything: it owns the keyboard
     // while it is open, so it should look like it does.
@@ -1444,35 +1441,46 @@ fn dim<S: Into<String>>(text: S) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(Color::DarkGray))
 }
 
-/// Render the param-entry form. Each declared param occupies one row
-/// (prompt + input + inline hint); the focused field optionally renders a
-/// candidate dropdown beneath itself.
-fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
+/// Render the param-entry form into the side panel. Each declared param gets
+/// its prompt and input, wrapped to the panel's width; the focused field
+/// optionally renders a candidate dropdown beneath itself.
+///
+/// A panel rather than the full screen it used to take: filling in a task's
+/// params is something you do *about* a task, and the answer is often in the
+/// log — the branch a build just tagged, the id a seed script printed.
+/// Covering that up to ask for it made the reader dismiss the form to go and
+/// look, then reopen it and start again.
+fn draw_form_panel(frame: &mut Frame<'_>, app: &App, area: Rect) {
     use super::form::{CandidateState, FormState};
     use crate::config::ParamKind;
 
-    let area = frame.area();
-    if area.height < 3 || area.width == 0 {
+    if area.height < 4 || area.width == 0 {
         return;
     }
     let Some(form): Option<&FormState> = app.form.as_ref() else {
         return;
     };
 
-    let title = format!(
-        " Run {}  — [tab] next/refresh  [↑↓] move  [enter] accept/next/submit  [ctrl-enter] submit  [esc] cancel ",
-        form.task
-    );
-    let outer = Block::default().borders(Borders::ALL).title(title);
+    // The keys go on a footer line rather than in the title: the panel is
+    // narrow, and a title long enough to list them is a title truncated to
+    // list none of them.
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(panel_border_style(app))
+        .title(format!(" run {} — [esc] back ", form.task));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    if inner.height < 2 {
+    if inner.height < 3 {
         return;
     }
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     // One paragraph with a Line per field, stacked vertically. The field
@@ -1485,7 +1493,7 @@ fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
         let is_focused = idx == form.focus;
         let remaining_fields = form.fields.len().saturating_sub(idx + 1);
         let max_rows_for_field = available.saturating_sub(used + remaining_fields);
-        let field_rows = field_render_rows(field, is_focused, max_rows_for_field);
+        let field_rows = field_render_rows(field, is_focused, max_rows_for_field, rows.width);
         if used + field_rows.len() > available {
             break;
         }
@@ -1524,16 +1532,21 @@ fn draw_form_modal(frame: &mut Frame<'_>, app: &App) {
         }
     };
     frame.render_widget(Paragraph::new(footer), layout[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(dim("[tab] next field · [enter] next/run"))),
+        layout[2],
+    );
     // Borrow to satisfy the unused-import lint on variants we don't reach.
     let _ = CandidateState::None;
 }
 
-/// Build the lines for one field — at least one row for the input itself,
-/// plus optional dropdown rows when the field is focused and has candidates.
+/// Build the lines for one field — however many rows the prompt and value
+/// wrap to, plus optional banner and dropdown rows when the field is focused.
 fn field_render_rows(
     field: &super::form::Field,
     is_focused: bool,
     max_total_rows: usize,
+    width: u16,
 ) -> Vec<Line<'static>> {
     use super::form::CandidateState;
     use crate::config::ParamKind;
@@ -1565,32 +1578,43 @@ fn field_render_rows(
         ""
     };
 
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
+    // Prompt and value wrap rather than clip. In the panel a prompt written
+    // to be read ("Test name filter (blank runs everything)") is already wider
+    // than the pane, and clipping either half loses something the reader
+    // needs: the question, or the answer they are part-way through typing.
+    // Continuations carry the log pane's gutter bar, which is what makes a
+    // wrapped row read as more of the same field rather than as the next one.
+    let input = Line::from(vec![
         Span::styled(prompt, prompt_style),
         Span::styled(value_str, Style::default().fg(Color::White)),
         Span::styled(cursor, Style::default().fg(Color::DarkGray)),
-    ]));
+    ]);
+    let mut lines = super::logs::wrap_line(&input, 2, width);
+    lines.truncate(max_total_rows.max(1));
     if lines.len() >= max_total_rows {
         return lines;
     }
 
-    // Error / status banner.
-    match &field.candidates {
-        CandidateState::Loading if is_focused => {
-            lines.push(Line::from(dim("  loading completions…")));
-        }
+    // Error / status banner — wrapped for the same reason, and it matters
+    // more here: the message ends in the path of the log that explains it.
+    let banner = match &field.candidates {
+        CandidateState::Loading if is_focused => Some(Line::from(dim("  loading completions…"))),
         CandidateState::Failed { message, log_path } if is_focused => {
             let hint = match log_path {
                 Some(p) => format!("  ⚠ {message} (log: {})", p.display()),
                 None => format!("  ⚠ {message}"),
             };
-            lines.push(Line::from(Span::styled(
+            Some(Line::from(Span::styled(
                 hint,
                 Style::default().fg(Color::Red),
-            )));
+            )))
         }
-        _ => {}
+        _ => None,
+    };
+    if let Some(banner) = banner {
+        let mut rows = super::logs::wrap_line(&banner, 4, width);
+        rows.truncate(max_total_rows - lines.len());
+        lines.extend(rows);
     }
     if lines.len() >= max_total_rows {
         return lines;
@@ -2328,12 +2352,102 @@ mod tests {
             int_max: None,
         };
 
-        let rows = field_render_rows(&field, true, 8);
+        let rows = field_render_rows(&field, true, 8, 40);
         let texts: Vec<String> = rows.into_iter().map(line_text).collect();
 
         assert_eq!(texts.len(), 8);
         assert!(texts.iter().any(|t| t.contains("c0")));
         assert!(texts.iter().any(|t| t.contains("c6")));
+    }
+
+    /// In the panel a field routinely runs out of columns — a prompt written
+    /// as a question is wider than 48 on its own — so prompt and value wrap
+    /// instead of clipping. Clipping would lose one of the two things a form
+    /// row is for: what is being asked, or what has been typed so far.
+    #[test]
+    fn a_field_wraps_to_the_panel_width_instead_of_clipping() {
+        struct Case {
+            name: &'static str,
+            prompt: &'static str,
+            value: &'static str,
+            width: u16,
+            want_rows: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "fits on one row",
+                prompt: "ref",
+                value: "main",
+                width: 40,
+                want_rows: 1,
+            },
+            Case {
+                name: "one column short",
+                prompt: "ref",
+                value: "main",
+                width: 11,
+                want_rows: 2,
+            },
+            Case {
+                name: "the prompt alone overflows",
+                prompt: "Test name filter (blank runs everything)",
+                value: "",
+                width: 24,
+                want_rows: 2,
+            },
+            Case {
+                name: "a long value keeps going onto further rows",
+                prompt: "ref",
+                value: "release/2026-08-27-hotfix",
+                width: 16,
+                want_rows: 3,
+            },
+        ];
+
+        for case in cases {
+            let field = Field {
+                name: "ref".into(),
+                prompt: case.prompt.into(),
+                required: false,
+                kind: ParamKind::String,
+                value: case.value.into(),
+                static_choices: Vec::new(),
+                has_dynamic_completions: false,
+                candidates: CandidateState::None,
+                candidate_highlight: 0,
+                error: None,
+                int_min: None,
+                int_max: None,
+            };
+            let rows = field_render_rows(&field, true, 16, case.width);
+            let texts: Vec<String> = rows.into_iter().map(line_text).collect();
+
+            assert_eq!(texts.len(), case.want_rows, "{}: rows", case.name);
+            for text in &texts {
+                assert!(
+                    text.chars().count() <= usize::from(case.width),
+                    "{}: row {text:?} is wider than the pane",
+                    case.name
+                );
+            }
+            // Nothing was dropped: stripping the continuation gutter off
+            // every row after the first puts the field back together exactly.
+            let rejoined = texts
+                .iter()
+                .enumerate()
+                .map(|(i, text)| match i {
+                    0 => text.as_str(),
+                    _ => text.strip_prefix("│ ").unwrap(),
+                })
+                .collect::<String>();
+            assert_eq!(
+                rejoined,
+                format!("\u{25b6} {}: {}\u{258e}", case.prompt, case.value),
+                "{}: content",
+                case.name
+            );
+        }
     }
 
     #[test]

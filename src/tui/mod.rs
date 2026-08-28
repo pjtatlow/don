@@ -731,6 +731,11 @@ fn handle_key(
             ViewMode::Filter => app.filter.focus() == filter::FilterFocus::Query,
             ViewMode::Services => app.services_table.filtering,
             ViewMode::Tasks => app.tasks_table.filtering,
+            // A focused form is all keyboard: `s`, `t` and `f` are characters
+            // someone is typing into a param, and Tab is the form's own
+            // next-field. Unfocused it is just another panel, so the switching
+            // keys work from the log side as they do for the tables.
+            ViewMode::Form => app.focus == panes::Focus::Panel,
             _ => false,
         };
     if app.panel_open() && !typing {
@@ -1242,10 +1247,8 @@ fn handle_mouse(mouse: MouseEvent, at: std::time::Instant, app: &mut App, store:
             // screen. A side panel leaves it on screen — the guard used to say
             // `view_mode != Normal` from the days when every other mode took
             // the whole frame, which made selecting dead whenever a panel was
-            // open. Only the true full-screen overlays exclude it now.
-            if focus != panes::Focus::Logs
-                || matches!(app.view_mode, ViewMode::Failures | ViewMode::Form)
-            {
+            // open. The failure summary is the only full-screen overlay left.
+            if focus != panes::Focus::Logs || app.view_mode == ViewMode::Failures {
                 return;
             }
             match click_count(app, mouse.column, mouse.row, at) {
@@ -2014,8 +2017,12 @@ fn handle_form_key(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => {
-            app.form = None;
-            return_to_logs(app);
+            // Back to the table, not to the log: the form is a step *inside*
+            // running a task, and cancelling one param entry usually means
+            // running something else — which is a row away, not a panel away.
+            // `set_view_mode` drops the form.
+            app.set_view_mode(ViewMode::Tasks);
+            app.focus = panes::Focus::Panel;
             return Ok(());
         }
         KeyCode::Enter if ctrl => {
@@ -2179,7 +2186,12 @@ fn try_submit_form(
         }
     };
     dispatch_run_task_with_params(client, task_name.clone(), params);
-    app.form = None;
+    // Same hand-back as Esc, and for a stronger reason: the row the reader
+    // just ran is about to change state in that table. Leaving the mode on
+    // `Form` with no form left showed an empty bordered panel that answered
+    // no key at all.
+    app.set_view_mode(ViewMode::Tasks);
+    app.focus = panes::Focus::Panel;
     after_task_run(&task_name, app, store)?;
     Ok(())
 }
@@ -2288,6 +2300,59 @@ mod tests {
             cli_log_filter: None,
         });
         app.apply_service_runtime("api".to_string(), state, None, Vec::new());
+        app
+    }
+
+    /// An app whose one task declares one free-text param, so pressing enter
+    /// on its row opens the form rather than running it.
+    fn app_with_param_task() -> App {
+        use crate::config::{LogConfig, ParamKind, Task, TaskAutoRun, TaskParam};
+
+        let task = Task {
+            cmd: "echo".into(),
+            args: vec![],
+            dir: None,
+            env: HashMap::new(),
+            depends_on: vec![],
+            watch: vec![],
+            ignore: vec![],
+            debounce: None,
+            timeout: None,
+            log: LogConfig::Stdout,
+            interactive: false,
+            headless: None,
+            auto_run: TaskAutoRun::Always,
+            download: None,
+            bazel: None,
+            params: vec![TaskParam {
+                name: "branch".into(),
+                prompt: None,
+                required: false,
+                default: None,
+                kind: ParamKind::String,
+                choices: vec![],
+                completions: None,
+                validate: None,
+            }],
+            hidden: false,
+            auto_filter_on_failure: None,
+        };
+        let mut app = App::new(AppInit {
+            service_names: Vec::new(),
+            task_names: vec!["migrate".to_string()],
+            build_tool_names: Vec::new(),
+            task_configs: HashMap::from([("migrate".to_string(), task)]),
+            task_last_runs: HashMap::new(),
+            hidden_names: HashSet::new(),
+            auto_filter_on_failure_names: HashSet::new(),
+            cli_log_filter: None,
+        });
+        app.apply_task_state(
+            "migrate".to_string(),
+            crate::client::TaskState::Pending,
+            None,
+            Vec::new(),
+        );
         app
     }
 
@@ -2566,6 +2631,11 @@ mod tests {
             Case {
                 name: "filter panel open",
                 view_mode: ViewMode::Filter,
+                want_selection: true,
+            },
+            Case {
+                name: "param form open: a panel too, so the log is still there",
+                view_mode: ViewMode::Form,
                 want_selection: true,
             },
             Case {
@@ -3118,6 +3188,110 @@ mod tests {
             }
             assert_eq!(app.view_mode, case.want_mode, "{}: mode", case.name);
             assert_eq!(app.focus, case.want_focus, "{}: focus", case.name);
+        }
+    }
+
+    /// The param form lives by the panel's rules now that it is one: opening
+    /// it focuses the panel, a focused form owns every character key (`s`,
+    /// `t` and `f` are letters someone is typing, not panel switches), and
+    /// both ways out hand the panel back to the table the run started from.
+    ///
+    /// That last part is what a full-screen form got wrong twice over.
+    /// Cancelling dropped the reader all the way back to a bare log, a panel
+    /// away from the row they were about to try instead; and submitting
+    /// cleared the form while leaving the mode on `Form`, which drew an empty
+    /// bordered box that answered no key at all.
+    #[tokio::test]
+    async fn the_param_form_is_a_panel() {
+        struct Case {
+            name: &'static str,
+            /// Pressed after the form is open, in order.
+            keys: &'static [KeyCode],
+            want_mode: ViewMode,
+            want_focus: panes::Focus,
+            /// What the form's single field holds, or `None` when the form is
+            /// gone.
+            want_value: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "opening it focuses the panel",
+                keys: &[],
+                want_mode: ViewMode::Form,
+                want_focus: panes::Focus::Panel,
+                want_value: Some(""),
+            },
+            Case {
+                name: "the panel keys are just letters while it has focus",
+                keys: &[KeyCode::Char('s'), KeyCode::Char('t'), KeyCode::Char('f')],
+                want_mode: ViewMode::Form,
+                want_focus: panes::Focus::Panel,
+                want_value: Some("stf"),
+            },
+            Case {
+                name: "and tab is the form's own next field, not the split's",
+                keys: &[KeyCode::Tab, KeyCode::Char('x')],
+                want_mode: ViewMode::Form,
+                want_focus: panes::Focus::Panel,
+                want_value: Some("x"),
+            },
+            Case {
+                name: "esc hands the panel back to the table",
+                keys: &[KeyCode::Esc],
+                want_mode: ViewMode::Tasks,
+                want_focus: panes::Focus::Panel,
+                want_value: None,
+            },
+            Case {
+                name: "so does running it from the last field",
+                keys: &[KeyCode::Char('v'), KeyCode::Enter],
+                want_mode: ViewMode::Tasks,
+                want_focus: panes::Focus::Panel,
+                want_value: None,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_param_task();
+            let mut store = LogStore::with_capacity(10);
+            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
+            let controls = TuiControls {
+                lifecycle_emitter: LifecycleEmitter::discarding(),
+                mode: TuiMode::InProcess,
+            };
+            let mut press = |app: &mut App, code: KeyCode| {
+                handle_key(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    app,
+                    &mut store,
+                    &client,
+                    &controls,
+                )
+                .unwrap();
+            };
+
+            // `t` opens the tasks table, enter on the only row opens the form.
+            press(&mut app, KeyCode::Char('t'));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.view_mode, ViewMode::Form, "{}: setup", case.name);
+
+            for code in case.keys {
+                press(&mut app, *code);
+            }
+
+            assert_eq!(app.view_mode, case.want_mode, "{}: mode", case.name);
+            assert_eq!(app.focus, case.want_focus, "{}: focus", case.name);
+            assert_eq!(
+                app.form.as_ref().map(|f| f.fields[0].value.as_str()),
+                case.want_value,
+                "{}: value",
+                case.name
+            );
+            // The panel is open in every outcome, so the log is on screen
+            // throughout — the whole point of moving the form off the
+            // full-screen overlay.
+            assert!(app.panel_open(), "{}: panel", case.name);
         }
     }
 

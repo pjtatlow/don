@@ -37,9 +37,11 @@ pub(crate) enum ViewMode {
     Services,
     /// Full-screen summary of root failures and dependency-blocked items.
     Failures,
-    /// Param-entry form for a task. Opened from the task table when the user
-    /// selects a task with declared `params`. Collects values and, on
-    /// submit, dispatches `RunnerCommand::RunTask { name, params, reply }`.
+    /// Param-entry form for a task, in the side panel. Opened from the task
+    /// table when the user selects a task with declared `params`. Collects
+    /// values and, on submit, dispatches
+    /// `RunnerCommand::RunTask { name, params, reply }` and hands the panel
+    /// back to the table it came from.
     Form,
 }
 
@@ -546,7 +548,6 @@ impl App {
         self.services_table.reset();
         self.tasks_table.reset();
         self.failure_summary_scroll = 0;
-        self.form = None;
     }
 
     pub(crate) fn set_update_check(
@@ -570,13 +571,15 @@ impl App {
     ///
     /// Derived from the view mode rather than stored: what the panel shows and
     /// whether it is showing are one decision, and a second flag would let the
-    /// two drift. Failures and the param form are full-screen overlays, not
-    /// panels — they take the whole screen because they demand a decision,
-    /// where a panel is for acting while still watching output.
+    /// two drift. The failure summary is the only full-screen overlay left —
+    /// it takes the whole screen because it demands a decision, where a panel
+    /// is for acting while still watching output. The param form is a panel
+    /// for the same reason the tables are: filling it in is something you do
+    /// *about* a task whose log is still moving beside it.
     pub(crate) fn panel_open(&self) -> bool {
         matches!(
             self.view_mode,
-            ViewMode::Services | ViewMode::Tasks | ViewMode::Filter
+            ViewMode::Services | ViewMode::Tasks | ViewMode::Filter | ViewMode::Form
         )
     }
 
@@ -822,14 +825,18 @@ impl App {
 
     /// Change which view is up.
     ///
-    /// The one thing this does beyond the assignment is drop the log popup,
-    /// and it is why the assignment is a method at all. That popup is a detail
-    /// view of one *row* — opened with `l` from the services or tasks table —
-    /// so it has no meaning once that table is gone. Leaving it behind
-    /// stranded it: `s` and `t` close their panel from anywhere, and the only
-    /// key that dismissed the popup lived inside the table handlers, so a
-    /// popup that outlived its table could not be dismissed at all.
+    /// The one thing this does beyond the assignment is drop the param form,
+    /// and it is why the assignment is a method at all. Half-entered params
+    /// belong to the panel that was showing them, and every key that leaves
+    /// the form goes through some *other* handler — `s`, `t` and `f` switch
+    /// panels from anywhere, Esc closes from either side of the split — so a
+    /// form cleared only in the form's own handler would survive all of them
+    /// and come back already filled in, with values typed for whichever task
+    /// the reader has since moved off.
     pub(crate) fn set_view_mode(&mut self, mode: ViewMode) {
+        if mode != ViewMode::Form {
+            self.form = None;
+        }
         self.view_mode = mode;
     }
 

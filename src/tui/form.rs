@@ -4,10 +4,11 @@
 //! [`params`](crate::config::TaskParam). Owns the value for each declared
 //! param, the focus index, and any in-flight completion-resolve state.
 //!
-//! The form is a `ratatui` alt-screen modal like the status tables. One field per
-//! param, rendered top-to-bottom. Tab/Shift-Tab navigates between fields;
-//! Enter advances (or submits on the last field); Ctrl+Enter submits from
-//! any field; Esc cancels.
+//! The form takes over the side panel, like the status tables and the filter
+//! — the log keeps flowing beside it, because the answer to a param is often
+//! sitting in it. One field per param, rendered top-to-bottom. Tab/Shift-Tab
+//! navigates between fields; Enter advances (or submits on the last field);
+//! Esc hands the panel back to the task table.
 //!
 //! ## Widget per kind
 //!
