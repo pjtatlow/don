@@ -727,8 +727,8 @@ don start                    # start this project's stack (bare `don` prints hel
 don start --profile <name>   # start a subset
 don start <name>             # start a stopped service in the running daemon
 don stop                     # stop this project's stack
-don stop <name>              # stop a running service
-don restart <name>           # restart a service
+don stop <name>              # stop a running service, or kill a task's run
+don restart <name>           # restart a service, or re-run a task
 don status                   # show all services and their states
 don status -v                # verbose: watch paths, ports, commands, build targets
 don ports                    # show configured and actual runtime ports

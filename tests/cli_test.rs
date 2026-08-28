@@ -383,7 +383,10 @@ fn cli_logs_last_returns_recent_lines() {
 }
 
 #[test]
-fn cli_stop_on_task_returns_bad_request() {
+fn cli_stop_takes_a_task_and_start_does_not() {
+    // `stop` names either kind — a task's run is a process, and ending it is
+    // what `don stop` means. `start` still doesn't: starting a task is `don
+    // run`, which may have params to collect first.
     run_with_timeout(Duration::from_secs(10), async {
         let dir = TempDir::new("cli-stop-task");
         let toml = ConfigBuilder::new()
@@ -401,13 +404,22 @@ fn cli_stop_on_task_returns_bad_request() {
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
 
+        // The verb applies; there is just nothing in flight to apply it to.
         let cp = config_path.clone();
         let (code, _stdout, stderr) =
             tokio::task::spawn_blocking(move || run_cli(&cp, &["stop", "prep"]))
                 .await
                 .unwrap();
         assert_eq!(code, 1);
-        assert!(stderr.contains("task"), "stderr: {stderr}");
+        assert!(stderr.contains("not running"), "stderr: {stderr}");
+
+        let cp = config_path.clone();
+        let (code, _stdout, stderr) =
+            tokio::task::spawn_blocking(move || run_cli(&cp, &["start", "prep"]))
+                .await
+                .unwrap();
+        assert_eq!(code, 1);
+        assert!(stderr.contains("is a task"), "stderr: {stderr}");
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

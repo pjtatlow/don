@@ -19,6 +19,9 @@
 //! published, the process it holds, or the level it computes. The scheduler
 //! used to answer all three from copies, and the supervisor re-checked anyway.
 //!
+//! `stop` and `restart` dispatch on kind: a running task is a process too, and
+//! the supervisor that owns its run is the one that can end it.
+//!
 //! The reply still rides *down* with the request and comes back up on the
 //! report channel, so it keeps meaning what it always meant: the scheduler has
 //! applied this. `socket_test` reads a stop reply as "no longer a satisfied
@@ -68,13 +71,17 @@ impl ProcessCatalog {
         }
     }
 
-    /// Resolve a name for a control command.
+    /// Resolve a name for a service-only control command.
     ///
-    /// Checks *configured* services, then configured tasks — so `don stop` on
+    /// Checks *configured* services, then configured tasks — so `don start` on
     /// a task is a 400 "that's a task", not a 404. A configured service the
     /// active profile excluded resolves fine here and fails later as "not
     /// running", which is a 409; that asymmetry is deliberate and pinned by
     /// `server_test`.
+    ///
+    /// Only the verbs a task has no version of come through here. `stop` and
+    /// `restart` check [`Self::is_task`] first and address the task registry
+    /// instead.
     pub(crate) fn require_service(&self, name: &str) -> Result<(), CommandError> {
         if self.configured_services.contains(name) {
             return Ok(());
@@ -108,7 +115,8 @@ impl ProcessCatalog {
         })
     }
 
-    /// Whether `name` is a task, for the polymorphic restart dispatch.
+    /// Whether `name` is a task, for the polymorphic `stop` and `restart`
+    /// dispatch.
     pub(crate) fn is_task(&self, name: &str) -> bool {
         self.configured_tasks.contains(name)
     }
@@ -192,27 +200,42 @@ impl ProcessControl {
         rx.await.map_err(|_| Unavailable)
     }
 
-    /// Stop a running service.
+    /// Stop a running service, or end a task's run.
     ///
     /// Like [`Self::start`], addressed at the supervisor: whether there is
     /// anything to stop, and whether stopping it is meaningful, are questions
     /// about the process it holds.
+    ///
+    /// Polymorphic like [`Self::restart`], and for the same reason — a task
+    /// that is running is a process somebody may want to end, and `don stop
+    /// <name>` is what they will type for it. A task used to answer
+    /// [`CommandError::NotAService`] here, which said "not this verb" about
+    /// the one verb that fits.
     pub async fn stop(&self, name: &str) -> ControlResult {
-        if let Err(e) = self.catalog.require_service(name) {
+        if !self.catalog.is_task(name)
+            && let Err(e) = self.catalog.require_service(name)
+        {
             return Ok(Err(e));
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let sent = self.services.get(name).is_some_and(|handle| {
-            handle.request(crate::process::service_supervisor::ServiceCommand::Stop(
-                crate::process::service_supervisor::StopRequest {
-                    force: false,
-                    wait_full_exit: false,
-                    interrupt: Some(self.shutting_down.clone()),
-                    notify: crate::process::service_supervisor::StopNotify::Reply(Some(tx)),
-                    reset_policy: true,
-                },
-            ))
-        });
+        let sent = if self.catalog.is_task(name) {
+            self.tasks.get(name).is_some_and(|handle| {
+                handle
+                    .request(crate::process::task_supervisor::TaskCommand::Stop { reply: Some(tx) })
+            })
+        } else {
+            self.services.get(name).is_some_and(|handle| {
+                handle.request(crate::process::service_supervisor::ServiceCommand::Stop(
+                    crate::process::service_supervisor::StopRequest {
+                        force: false,
+                        wait_full_exit: false,
+                        interrupt: Some(self.shutting_down.clone()),
+                        notify: crate::process::service_supervisor::StopNotify::Reply(Some(tx)),
+                        reset_policy: true,
+                    },
+                ))
+            })
+        };
         if !sent {
             return Ok(Err(CommandError::InvalidState {
                 name: name.to_string(),
@@ -420,7 +443,7 @@ mod tests {
                 run: Err("is a service"),
             },
             Case {
-                name: "an active task",
+                name: "an active task, for a verb only a service has",
                 process: "setup",
                 control: Err("is a task"),
                 run: Ok(()),
@@ -515,6 +538,10 @@ mod tests {
             dead_control().stop("excluded").await,
             dead_control().restart("excluded").await,
             dead_control().hard_restart("excluded").await,
+            // A task with no mailbox: `stop` addresses the task registry for
+            // it, so it takes the same route as an absent service rather than
+            // refusing the verb.
+            dead_control().stop("setup").await,
         ] {
             let answered =
                 answered.expect("a missing supervisor must not read as the runner being gone");

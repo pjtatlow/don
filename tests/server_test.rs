@@ -560,29 +560,61 @@ fn integration_restart_endpoint_restarts_service() {
 }
 
 #[test]
-fn integration_stop_on_task_returns_400() {
-    // Control commands only apply to services — a task name should return
-    // 400 (bad request) with a clear message, not a confusing 404.
-    run_with_timeout(Duration::from_secs(10), async {
-        let dir = TempDir::new("server-task-control");
+fn integration_stop_ends_a_running_task() {
+    // `stop` is polymorphic like `restart`: a task's run is a process, and
+    // this is the verb that ends it. A task with nothing in flight is a 409
+    // ("not running"), the same answer a stopped service gives — not the 400
+    // "that's a task" this used to return for every task, running or not.
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("server-task-stop");
+        let out_path = dir.path().join("finished.txt");
         let toml = ConfigBuilder::new()
             .add_custom_service("keeper", "sleep", &["60"])
             .log("ignore")
             .ready_exec("true", &[])
             .done()
-            .add_task("prep", "true", &[])
+            .add_task(
+                "slow",
+                "sh",
+                &[
+                    "-c",
+                    &format!("sleep 30; echo done > {}", out_path.display()),
+                ],
+            )
             .log("ignore")
+            .auto_run(false)
             .done()
             .build();
 
         let (socket, shutdown_tx, handle) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_socket(&socket, Duration::from_secs(3)).await);
-
-        let (status, body) = request(&socket, "POST", "/stop/prep").await;
-        assert_eq!(status, 400, "body: {body}");
         assert!(
-            body.contains("task") && body.contains("services"),
-            "body should explain task vs service: {body}"
+            wait_for_process_state(&socket, "slow", "skipped", Duration::from_secs(3)).await,
+            "task should settle before the manual run"
+        );
+
+        // Nothing in flight yet.
+        let (status, body) = request(&socket, "POST", "/stop/slow").await;
+        assert_eq!(status, 409, "body: {body}");
+        assert!(body.contains("not running"), "body: {body}");
+
+        let (status, body) = request_with_body(&socket, "POST", "/run/slow", Some("{}")).await;
+        assert_eq!(status, 204, "body: {body}");
+        assert!(
+            wait_for_process_state(&socket, "slow", "running", Duration::from_secs(3)).await,
+            "task should be running before we stop it"
+        );
+
+        let (status, body) = request(&socket, "POST", "/stop/slow").await;
+        assert_eq!(status, 204, "body: {body}");
+        assert!(
+            wait_for_process_state(&socket, "slow", "pending_run", Duration::from_secs(5)).await,
+            "a stopped task waits for a trigger — `running` with nothing \
+             running is a row nobody can act on"
+        );
+        assert!(
+            !out_path.exists(),
+            "the sleep should have been killed, not left to finish"
         );
 
         let _ = shutdown_tx.send(()).await;

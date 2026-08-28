@@ -127,6 +127,16 @@ pub(crate) enum TaskCommand {
     Kill {
         done: Option<tokio::sync::oneshot::Sender<()>>,
     },
+    /// End the run in flight because somebody asked, and do not run again.
+    ///
+    /// Separate from [`Self::Kill`] in what it owes: an answer, a line saying
+    /// it happened, and a phase the reader can act on. Teardown wants none of
+    /// those — the stack is going away, so where the task ended up is nobody's
+    /// question. Whether there is anything to stop is answered here too, from
+    /// the same facts a duplicate run is refused by.
+    Stop {
+        reply: Option<tokio::sync::oneshot::Sender<crate::command::CommandResult>>,
+    },
 }
 
 /// Owner half for tasks. See [`Supervisors`].
@@ -298,9 +308,23 @@ enum Ask {
     Cancel {
         then: Option<RunRequest>,
         done: Option<tokio::sync::oneshot::Sender<()>>,
+        reason: CancelReason,
     },
     /// Nothing to do. Any reply has already been answered.
     Nothing,
+}
+
+/// Why a run is ending, which is all that separates the ways out of a cancel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancelReason {
+    /// Teardown, or the first half of a restart. Neither wants a phase left
+    /// behind: the stack is going away, or the next run is about to land on
+    /// top and publish its own.
+    Internal,
+    /// Somebody asked for this run to stop and nothing follows it. This is the
+    /// only cancel that has to leave the task somewhere — see
+    /// [`settle_stopped`].
+    Requested,
 }
 
 /// Answer a command's reply channel, if it had one.
@@ -430,7 +454,51 @@ fn resolve_command(
                 }
             }
         }
-        TaskCommand::Kill { done } => Ask::Cancel { then: None, done },
+        TaskCommand::Kill { done } => Ask::Cancel {
+            then: None,
+            done,
+            reason: CancelReason::Internal,
+        },
+        TaskCommand::Stop { reply } => {
+            // A build is the batcher's to run, not this supervisor's, so
+            // there is no process here to signal — saying "not running" at a
+            // task the table is showing as `building` would be a lie in the
+            // other direction.
+            if phase == super::TaskState::Building {
+                answer(
+                    reply,
+                    Err(crate::command::CommandError::InvalidState {
+                        name: name.to_string(),
+                        message: "waiting on its build — nothing to stop yet".to_string(),
+                    }),
+                );
+                return Ask::Nothing;
+            }
+            // Otherwise stoppable exactly when a run would be refused as a
+            // duplicate: "is something running?" is one question, and reading
+            // it from two different sets of facts is how a stop comes back
+            // "not running" at a row that says `running`. `spawned` covers the
+            // run in hand; the phase covers the window where a triggered run
+            // has announced itself and is still preparing.
+            if !spawned && phase != super::TaskState::Running {
+                answer(
+                    reply,
+                    Err(crate::command::CommandError::InvalidState {
+                        name: name.to_string(),
+                        message: "not running".to_string(),
+                    }),
+                );
+                return Ask::Nothing;
+            }
+            // Accepted the moment it is admitted, like a restart: the caller
+            // asked for the run to end, not to be told how it ended.
+            answer(reply, Ok(()));
+            Ask::Cancel {
+                then: None,
+                done: None,
+                reason: CancelReason::Requested,
+            }
+        }
         TaskCommand::BuildGraphChanged => Ask::Requery,
         TaskCommand::Rerun => {
             let Some(startup) = startup else {
@@ -514,6 +582,7 @@ fn resolve_command(
             answer(reply, Ok(()));
             Ask::Cancel {
                 done: None,
+                reason: CancelReason::Internal,
                 then: Some(RunRequest {
                     // Already resolved: these are the values the last run
                     // actually used.
@@ -542,6 +611,33 @@ fn kill_run(emitter: &crate::output::LifecycleEmitter, name: &str, pgid: i32) {
     {
         emitter.service_error_event(name, &format!("failed to kill task pgid {pgid}: {e}"));
     }
+}
+
+/// Land the phase a run ended on request settles into.
+///
+/// `Running` with nothing running is a row nobody can act on: the tasks table
+/// offers no key for it, and a blocking dependent goes on waiting for a run
+/// that is never going to finish. So a stopped task goes back to waiting for a
+/// trigger, still owing its dependents a run.
+///
+/// Nothing is recorded. The run was ended before it could succeed or fail, so
+/// its exit says nothing about the task — exactly the reasoning that keeps the
+/// cancel path from folding an exit status. The record still describes the
+/// last run that reached an end of its own.
+fn settle_stopped(
+    owner: &mut TaskPhaseOwner,
+    emitter: &crate::output::LifecycleEmitter,
+    name: &str,
+) {
+    let outcome = NoSpawnOutcome::pending_run("stopped (requested)".to_string());
+    // Say why before publishing: publishing is what releases the dependents
+    // that were waiting on this run, and they decide the moment they see it.
+    outcome.emit(emitter, name);
+    if let Some(needs_run_now) = outcome.needs_run_now() {
+        owner.set_needs_run_now(needs_run_now);
+    }
+    owner.set_pid(None);
+    owner.settle_without_run(outcome.state, None);
 }
 
 /// Drive one task's runs, strictly in order.
@@ -693,7 +789,9 @@ async fn supervise(
                                         },
                                     ) {
                                         Ask::Run(request)
-                                        | Ask::Cancel { then: Some(request), .. } => {
+                                        | Ask::Cancel {
+                                            then: Some(request), ..
+                                        } => {
                                             busy.store(true, Ordering::Relaxed);
                                             // A mailbox run supersedes standing
                                             // demand; withdrawing it here keeps
@@ -701,9 +799,23 @@ async fn supervise(
                                             demand = super::Demand::None;
                                             request
                                         }
-                                        Ask::Cancel { then: None, done } => {
+                                        Ask::Cancel {
+                                            then: None,
+                                            done,
+                                            reason,
+                                        } => {
                                             // Nothing in hand: the kill is
-                                            // already true.
+                                            // already true. A requested stop
+                                            // still settles, so `Requested`
+                                            // means the same thing from every
+                                            // side of the loop.
+                                            if reason == CancelReason::Requested {
+                                                settle_stopped(
+                                                    &mut owner,
+                                                    &ctx.emitter,
+                                                    &name,
+                                                );
+                                            }
                                             if let Some(done) = done {
                                                 let _ = done.send(());
                                             }
@@ -935,8 +1047,10 @@ async fn supervise(
         let mut superseded: Option<RunRequest> = None;
         // A cancel that lands mid-preparation cannot stop the spawn (dropping
         // the worker would take the handle with it), so it is recorded and
-        // paid out below once preparation has finished.
-        let mut abandoned = false;
+        // paid out below once preparation has finished. `Some` is the old
+        // `abandoned` flag; the reason it carries is what decides whether the
+        // task is left somewhere afterwards.
+        let mut cancelled_as: Option<CancelReason> = None;
         let mut cancel_done: Option<tokio::sync::oneshot::Sender<()>> = None;
         let result = loop {
             tokio::select! {
@@ -959,8 +1073,14 @@ async fn supervise(
                             },
                         ) {
                             Ask::Run(request) => superseded = Some(request),
-                            Ask::Cancel { then, done } => {
-                                abandoned = true;
+                            Ask::Cancel { then, done, reason } => {
+                                if cancelled_as.is_none()
+                                    && reason == CancelReason::Requested
+                                {
+                                    ctx.emitter
+                                        .service_event(&name, "stopping... (requested)");
+                                }
+                                cancelled_as = Some(reason);
                                 superseded = then;
                                 cancel_done = done.or(cancel_done);
                             }
@@ -978,9 +1098,14 @@ async fn supervise(
             }
         };
 
-        if abandoned || superseded.is_some() {
+        if cancelled_as.is_some() || superseded.is_some() {
             if let Ok(prepared) = result {
                 kill_superseded_spawn(&ctx.emitter, &name, prepared);
+            }
+            // Only when nothing follows: a restart's cancel is about to
+            // publish the phase of the run it starts.
+            if cancelled_as == Some(CancelReason::Requested) && superseded.is_none() {
+                settle_stopped(&mut owner, &ctx.emitter, &name);
             }
             if let Some(done) = cancel_done {
                 let _ = done.send(());
@@ -1141,6 +1266,9 @@ async fn supervise(
         // mid-run signals the group this supervisor owns.
         let pgid = outcome.pgid;
         let mut cancelled = false;
+        // Which kind of cancel ended it, for the settle below. Separate from
+        // `cancelled` because teardown sets that one too and leaves no phase.
+        let mut cancelled_as: Option<CancelReason> = None;
         // Teardown runs once per run: a second pass would re-signal a group
         // that is already dying.
         let mut tearing_down = false;
@@ -1214,18 +1342,20 @@ async fn supervise(
                             // after it — owning the exit is what makes that
                             // ordering structural rather than checked.
                             Ask::Run(request) => pending = Some(request),
-                            Ask::Cancel { then, done } => {
+                            Ask::Cancel { then, done, reason } => {
                                 if !cancelled {
                                     cancelled = true;
-                                    // A cancel that runs again narrates the
-                                    // stop; teardown narrates in bulk.
-                                    if then.is_some() {
+                                    // A cancel somebody asked for narrates the
+                                    // stop, whether or not a run follows it;
+                                    // teardown narrates in bulk.
+                                    if then.is_some() || reason == CancelReason::Requested {
                                         ctx.emitter
                                             .service_event(&name, "stopping... (requested)");
                                     }
                                     kill_run(&ctx.emitter, &name, pgid);
                                 }
                                 cancel_done = done.or(cancel_done);
+                                cancelled_as = Some(reason);
                                 pending = then;
                             }
                             // Running now; nothing to park.
@@ -1261,7 +1391,14 @@ async fn supervise(
             // different questions, and teardown waits on the second one — a
             // cancelled run that never said it let go would hold the whole
             // stack open.
-            owner.set_pid(None);
+            match cancelled_as {
+                // The one cancel that owes the reader a phase, and the only
+                // one with nothing coming after it to publish one.
+                Some(CancelReason::Requested) if pending.is_none() => {
+                    settle_stopped(&mut owner, &ctx.emitter, &name);
+                }
+                _ => owner.set_pid(None),
+            }
             if let Some(reply) = waiter.take() {
                 let _ = reply.send(Err(crate::command::CommandError::Failed {
                     name: name.clone(),
@@ -1941,6 +2078,67 @@ mod tests {
                 want_reply: None,
             },
             Case {
+                // The kill teardown sends and the stop a user asks for reach
+                // the same `Ask`, and are not the same thing: only one of them
+                // owes an answer and a phase.
+                name: "a stop ends the run in hand and says so",
+                command: Box::new(|reply| TaskCommand::Stop { reply }),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Running,
+                spawned: true,
+                self_write_suspect: false,
+                want_mode: None,
+                want: "stop",
+                want_params: vec![],
+                want_reply: Some(true),
+            },
+            Case {
+                // The window a triggered run announces itself in and is still
+                // preparing. Nothing has spawned, but the table says `running`
+                // and enter offers to stop it — so it has to be stoppable.
+                name: "a stop lands on a run that has not spawned yet",
+                command: Box::new(|reply| TaskCommand::Stop { reply }),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Running,
+                spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
+                want: "stop",
+                want_params: vec![],
+                want_reply: Some(true),
+            },
+            Case {
+                name: "a stop with nothing running is refused",
+                command: Box::new(|reply| TaskCommand::Stop { reply }),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Completed,
+                spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
+                want: "nothing",
+                want_params: vec![],
+                want_reply: Some(false),
+            },
+            Case {
+                // The build belongs to the batcher, so there is no process
+                // here to signal — and "not running" would be the wrong
+                // answer at a row reading `building`.
+                name: "a stop during a build has nothing to signal",
+                command: Box::new(|reply| TaskCommand::Stop { reply }),
+                task: test_task(),
+                last_params: vec![],
+                phase: super::super::TaskState::Building,
+                spawned: false,
+                self_write_suspect: false,
+                want_mode: None,
+                want: "nothing",
+                want_params: vec![],
+                want_reply: Some(false),
+            },
+            Case {
                 name: "a param-less restart reuses nothing and is accepted",
                 command: Box::new(|reply| TaskCommand::Restart { reply }),
                 task: test_task(),
@@ -2021,7 +2219,16 @@ mod tests {
                     Some(request.params.clone()),
                     Some(mode_label(&request.mode)),
                 ),
-                Ask::Cancel { then: None, .. } => ("cancel-only", None, None),
+                Ask::Cancel {
+                    then: None,
+                    reason: CancelReason::Internal,
+                    ..
+                } => ("cancel-only", None, None),
+                Ask::Cancel {
+                    then: None,
+                    reason: CancelReason::Requested,
+                    ..
+                } => ("stop", None, None),
                 Ask::Cancel {
                     then: Some(request),
                     ..

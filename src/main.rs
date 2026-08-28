@@ -118,12 +118,13 @@ enum Commands {
         #[arg(long)]
         print: bool,
     },
-    /// Stop this project's stack, or one running service when a name is given
+    /// Stop this project's stack, or one running service or task when a name
+    /// is given
     ///
     /// This is the project you're in, not the system-wide daemon — use
     /// `don daemon stop` for that.
     Stop {
-        /// Name of the service to stop (omit to stop the whole stack)
+        /// Name of the service or task to stop (omit to stop the whole stack)
         name: Option<String>,
     },
     /// Restart a running service

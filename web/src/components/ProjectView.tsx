@@ -11,10 +11,13 @@ interface Props {
   onBack: () => void;
 }
 
-/** Services a control action can be applied to, given the current state. */
+/** Which control actions apply to a process, given the current state. */
 function actions(process: Process): { start: boolean; stop: boolean; restart: boolean } {
-  if (process.kind !== "service") {
-    return { start: false, stop: false, restart: false };
+  // A task's run is a process too, and stop is the one verb that fits it:
+  // starting one is `run` (which may have params to collect first), and
+  // restarting it is the run button again.
+  if (process.kind === "task") {
+    return { start: false, stop: process.state === "running", restart: false };
   }
   const stopped = process.state === "stopped" || process.state === "failed";
   return { start: stopped, stop: !stopped, restart: !stopped };

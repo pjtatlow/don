@@ -129,7 +129,10 @@ _don_dynamic_kind() {
         break
     done
     case "$subcmd" in
-        start|stop|restart) echo services ;;
+        start) echo services ;;
+        # `stop` and `restart` take either kind — a task's run is a process
+        # they both act on.
+        stop|restart) echo processes ;;
         run) echo tasks ;;
         logs|attach) echo processes ;;
     esac
@@ -239,7 +242,8 @@ _don_with_dynamic() {
     fi
 
     case "$subcmd" in
-        start|stop|restart) kind=services ;;
+        start) kind=services ;;
+        stop|restart) kind=processes ;;
         run) kind=tasks ;;
         logs|attach) kind=processes ;;
         *) kind="" ;;
@@ -263,8 +267,10 @@ compdef _don_with_dynamic don
 /// don't need a shared helper — each rule stands alone.
 const FISH_POSTLUDE: &str = r#"
 # --- dynamic completion postlude (see `don completions fish`) ---
-complete -c don -n '__fish_seen_subcommand_from start stop restart' \
+complete -c don -n '__fish_seen_subcommand_from start' \
     -f -a '(command don __complete services 2>/dev/null)'
+complete -c don -n '__fish_seen_subcommand_from stop restart' \
+    -f -a '(command don __complete processes 2>/dev/null)'
 complete -c don -n '__fish_seen_subcommand_from run' \
     -f -a '(command don __complete tasks 2>/dev/null)'
 complete -c don -n '__fish_seen_subcommand_from logs attach' \

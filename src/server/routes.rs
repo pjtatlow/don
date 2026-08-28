@@ -236,7 +236,7 @@ async fn post_start(State(state): State<Arc<ApiState>>, Path(name): Path<String>
     map_command_reply(&name, reply, StatusCode::INTERNAL_SERVER_ERROR).await
 }
 
-/// `POST /stop/:name` — stop a running service.
+/// `POST /stop/:name` — stop a running service, or end a running task's run.
 async fn post_stop(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Response {
     let reply = state.control.stop(&name).await;
     map_command_reply(&name, reply, StatusCode::INTERNAL_SERVER_ERROR).await

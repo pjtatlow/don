@@ -75,7 +75,7 @@ use ratatui::text::Text;
 use ratatui::{TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot};
+use crate::client::{Client, EventStreamItem, RunnerEvent, ServiceState, StateSnapshot, TaskState};
 use crate::config::ParamKind;
 use crate::output::{FormattedLogLine, LifecycleEmitter};
 use app::{App, AppInit, ViewMode};
@@ -794,7 +794,7 @@ fn handle_key(
     match app.view_mode {
         ViewMode::Normal => handle_normal_key(key, app, store)?,
         ViewMode::Filter => handle_filter_key(key, app, store)?,
-        ViewMode::Tasks => handle_tasks_key(key, app, store, client)?,
+        ViewMode::Tasks => handle_tasks_key(key, app, store, client, controls)?,
         ViewMode::Services => {
             handle_services_key(key, app, client, controls)?;
         }
@@ -1583,6 +1583,7 @@ fn handle_tasks_key(
     app: &mut App,
     store: &mut LogStore,
     client: &std::sync::Arc<Client>,
+    controls: &TuiControls,
 ) -> Result<(), TuiError> {
     let total = app.task_items().len();
     if key.code == KeyCode::Esc && app.widen_log_from_narrow() {
@@ -1604,6 +1605,18 @@ fn handle_tasks_key(
             return Ok(());
         };
         if !item.runnable() {
+            // Enter is a toggle here, as it is in the services table: a run in
+            // flight is a process, and ending it is the only thing enter could
+            // usefully mean on that row. `Building` is the batcher's work and
+            // not this task's process, so there is nothing here to stop until
+            // the artifact lands — the key stays inert for it.
+            if item.state == TaskState::Running {
+                dispatch_overlay_command(
+                    client,
+                    &controls.lifecycle_emitter,
+                    overlay_stop_command(item.name),
+                );
+            }
             return Ok(());
         }
         if item.has_params {

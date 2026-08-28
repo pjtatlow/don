@@ -247,6 +247,9 @@ impl Client {
     }
 
     /// `POST /stop/:name`
+    ///
+    /// Names a service or a task: a task's run is a process too, and this is
+    /// what ends it.
     pub async fn stop(&self, name: &str) -> Result<(), ClientError> {
         self.control("/stop/", name).await
     }

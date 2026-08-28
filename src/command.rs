@@ -14,8 +14,9 @@ pub enum CommandError {
     UnknownService { name: String },
     /// No task with this name exists in the config.
     UnknownTask { name: String },
-    /// The name refers to a task, not a service — start/stop/restart only
-    /// apply to services.
+    /// The name refers to a task, not a service. `stop` and `restart` handle
+    /// both kinds; `start` and `hard-restart` are about a long-lived process
+    /// and have no meaning for a task, which `run` starts.
     NotAService { name: String },
     /// The name refers to a service, not a task — `run` only applies to tasks.
     NotATask { name: String },
@@ -36,10 +37,7 @@ impl std::fmt::Display for CommandError {
             Self::UnknownService { name } => write!(f, "unknown service '{name}'"),
             Self::UnknownTask { name } => write!(f, "unknown task '{name}'"),
             Self::NotAService { name } => {
-                write!(
-                    f,
-                    "'{name}' is a task — start/stop/restart only apply to services"
-                )
+                write!(f, "'{name}' is a task — use `don run` to start it")
             }
             Self::NotATask { name } => {
                 write!(

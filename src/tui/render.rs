@@ -646,7 +646,7 @@ fn draw_tasks_table(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         area,
         StatusTableView {
-            title: table_title(app, "tasks", "[enter] run  [a] attach  [/] filter"),
+            title: table_title(app, "tasks", "[enter] run/stop  [a] attach  [/] filter"),
             border_style: panel_border_style(app),
             header,
             rows,
@@ -994,7 +994,10 @@ fn task_selected_hint(app: &App) -> Option<String> {
         .selected_index(items.len())
         .and_then(|idx| items.get(idx))?;
     if !item.runnable() {
-        return Some("transitioning".to_string());
+        return Some(match item.state {
+            TaskState::Running => format!("enter stop {}", item.name),
+            _ => "transitioning".to_string(),
+        });
     }
     if item.has_params {
         Some(format!("enter form {}", item.name))
@@ -2228,6 +2231,72 @@ mod tests {
                 rendered.contains(case.want_state),
                 "width {} should preserve task state detail: {rendered}",
                 case.width
+            );
+        }
+    }
+
+    /// What enter offers on a task row, per state. Enter is a toggle here as
+    /// it is in the services table: a run in flight is a process, and ending
+    /// it is the only thing the key could usefully mean on that row — it used
+    /// to mean nothing at all, and the hint said "transitioning" at a task
+    /// that was going to sit there for a minute and a half.
+    #[test]
+    fn enter_runs_an_idle_task_and_stops_a_running_one() {
+        struct Case {
+            name: &'static str,
+            state: TaskState,
+            want: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "idle",
+                state: TaskState::Completed,
+                want: "enter run migrate",
+            },
+            Case {
+                name: "never run",
+                state: TaskState::Pending,
+                want: "enter run migrate",
+            },
+            Case {
+                name: "waiting for a trigger",
+                state: TaskState::PendingRun,
+                want: "enter run migrate",
+            },
+            Case {
+                name: "running",
+                state: TaskState::Running,
+                want: "enter stop migrate",
+            },
+            Case {
+                // The batcher owns the build, not this task's run, so there
+                // is no process here for enter to end.
+                name: "waiting on its build",
+                state: TaskState::Building,
+                want: "transitioning",
+            },
+        ];
+
+        for case in cases {
+            let mut app = App::new(AppInit {
+                service_names: Vec::new(),
+                task_names: vec!["migrate".to_string()],
+                build_tool_names: Vec::new(),
+                task_configs: HashMap::new(),
+                task_last_runs: HashMap::new(),
+                hidden_names: std::collections::HashSet::new(),
+                auto_filter_on_failure_names: std::collections::HashSet::new(),
+                cli_log_filter: None,
+            });
+            app.apply_task_state("migrate".to_string(), case.state, None, Vec::new());
+            app.view_mode = ViewMode::Tasks;
+
+            assert_eq!(
+                task_selected_hint(&app).as_deref(),
+                Some(case.want),
+                "{}",
+                case.name
             );
         }
     }
