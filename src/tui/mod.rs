@@ -171,31 +171,28 @@ struct TuiControls {
 ///
 /// A drop is rendered as a lifecycle line so it lands in the log where the
 /// missing lines would have been, rather than in a corner of the status bar.
-/// It carries the id the stream resumed at, so its position in the store is
-/// the truth about where the hole is.
-fn push_merged_event(
-    batch: &mut Vec<(crate::output::LogId, FormattedLogLine)>,
-    event: crate::output::MergedEvent,
-) {
+/// Arrival order puts it there on its own — the ids the events carry are the
+/// producing stream's, and there is more than one of those (see
+/// [`LogStores::next`]), so they are dropped here rather than carried into a
+/// store that orders by them.
+fn push_merged_event(batch: &mut Vec<FormattedLogLine>, event: crate::output::MergedEvent) {
     match event {
         crate::output::MergedEvent::Line(entry) => {
-            batch.push((entry.id, (*entry.line).clone()));
+            batch.push((*entry.line).clone());
         }
-        crate::output::MergedEvent::Dropped { count, resumed_at } => batch.push((
-            resumed_at,
-            FormattedLogLine {
-                name: crate::output::LIFECYCLE_EVENT_NAME.to_string(),
-                is_lifecycle: true,
-                is_verbose: false,
-                // The gap notice is the TUI's own, so it has no prefix from
-                // the sink to sit under.
-                prefix: Vec::new(),
-                bytes: format!(
-                    "{count} log line(s) dropped — history did not reach back far enough"
-                )
+        crate::output::MergedEvent::Dropped {
+            count,
+            resumed_at: _,
+        } => batch.push(FormattedLogLine {
+            name: crate::output::LIFECYCLE_EVENT_NAME.to_string(),
+            is_lifecycle: true,
+            is_verbose: false,
+            // The gap notice is the TUI's own, so it has no prefix from
+            // the sink to sit under.
+            prefix: Vec::new(),
+            bytes: format!("{count} log line(s) dropped — history did not reach back far enough")
                 .into_bytes(),
-            },
-        )),
+        }),
     }
 }
 
@@ -259,6 +256,7 @@ pub async fn run_tui(
     let mut stores = LogStores {
         output: LogStore::with_capacity(DEFAULT_CAPACITY),
         debug: LogStore::with_capacity(DEBUG_CAPACITY),
+        next: crate::output::LogId::ZERO,
     };
 
     let (input_tx, mut input_rx) = mpsc::channel::<AppEvent>(64);
@@ -310,7 +308,7 @@ pub async fn run_tui(
             maybe_event = log_rx.recv() => {
                 match maybe_event {
                     Some(first) => {
-                        let mut batch: Vec<(crate::output::LogId, FormattedLogLine)> =
+                        let mut batch: Vec<FormattedLogLine> =
                             Vec::with_capacity(LOG_BATCH_LIMIT);
                         push_merged_event(&mut batch, first);
                         while batch.len() < LOG_BATCH_LIMIT {
@@ -319,11 +317,11 @@ pub async fn run_tui(
                                 Err(_) => break,
                             }
                         }
-                        for (id, line) in batch {
+                        for line in batch {
                             if is_shutdown_start_line(&line) && !app.shutdown_started {
                                 app.begin_shutdown();
                             }
-                            stores.route(id, line);
+                            stores.route(line);
                         }
                         dirty = true;
                     }
@@ -486,11 +484,31 @@ struct LogStores {
     output: LogStore,
     /// What don said about them — see `LifecycleEmitter::debug_event`.
     debug: LogStore,
+    /// The id the next line is filed under — this client's own numbering, not
+    /// the ids the lines arrive carrying.
+    ///
+    /// The channel is not one stream. `don start` on a terminal, and `don
+    /// attach`, merge the runner's log stream with this client's own narration
+    /// ("restart requested", version-skew notices), and that narration comes
+    /// from a second `OutputManager` whose ids start at zero all over again.
+    /// So the first locally-narrated line arrives numbered 0 behind a stream
+    /// already in the hundreds.
+    ///
+    /// Both records binary-search by id ([`LogStore::get`],
+    /// [`LogStore::iter_from`]), so one id out of order makes those searches
+    /// answer `None` for lines that are sitting right there. The pane then
+    /// paints fewer rows than the view index counted for the same lines and
+    /// the bottom of the log goes blank — healing only when the offending
+    /// entry ages out. Numbering here instead makes that unrepresentable, for
+    /// however many sources the channel grows.
+    next: crate::output::LogId,
 }
 
 impl LogStores {
     /// File a line under the record it belongs to. The tag decides, once.
-    fn route(&mut self, id: crate::output::LogId, line: FormattedLogLine) {
+    fn route(&mut self, line: FormattedLogLine) {
+        let id = self.next;
+        self.next = crate::output::LogId(id.0.saturating_add(1));
         if line.is_verbose {
             self.debug.push(id, line);
         } else {
@@ -3305,6 +3323,107 @@ mod tests {
             // throughout — the whole point of moving the form off the
             // full-screen overlay.
             assert!(app.panel_open(), "{}: panel", case.name);
+        }
+    }
+
+    /// Two producers, one channel. `don start` on a terminal (and `don
+    /// attach`) merge the runner's log stream with this client's own narration
+    /// — "restart requested" and friends — and that narration comes from a
+    /// second `OutputManager` numbering from zero. So the ids arriving on the
+    /// channel are two interleaved sequences, not one.
+    ///
+    /// Filing lines under those ids put an id-0 line behind an id-120 one, and
+    /// both records binary-search by id: `get` began answering `None` for
+    /// lines that were sitting right there, the pane painted fewer rows than
+    /// the index had counted for the same lines, and the bottom of the log
+    /// went blank until the offending entry aged out. Restarting a service
+    /// from the tables was the reliable way to see it, because that is what
+    /// emits the first local line.
+    #[test]
+    fn interleaved_producers_still_file_lines_in_order() {
+        use crate::output::{LogId, MergedEvent, MergedLine};
+
+        struct Case {
+            name: &'static str,
+            /// The ids the events arrive carrying, in arrival order.
+            ids: &'static [u64],
+        }
+
+        let cases = [
+            Case {
+                name: "one well-behaved stream",
+                ids: &[0, 1, 2, 3, 4, 5],
+            },
+            Case {
+                name: "local narration restarts the numbering mid-stream",
+                ids: &[0, 1, 2, 120, 0, 121, 122],
+            },
+            Case {
+                name: "the two sequences interleave freely",
+                ids: &[7, 0, 8, 1, 9, 2, 10],
+            },
+            Case {
+                name: "and may collide outright",
+                ids: &[3, 3, 3, 3],
+            },
+        ];
+
+        for case in cases {
+            let mut stores = LogStores {
+                output: LogStore::with_capacity(64),
+                debug: LogStore::with_capacity(64),
+                next: LogId::ZERO,
+            };
+            stores.output.reflow(80);
+
+            let mut batch: Vec<FormattedLogLine> = Vec::new();
+            for (n, id) in case.ids.iter().enumerate() {
+                push_merged_event(
+                    &mut batch,
+                    MergedEvent::Line(MergedLine {
+                        id: LogId(*id),
+                        line: std::sync::Arc::new(FormattedLogLine {
+                            name: "api".to_string(),
+                            is_lifecycle: false,
+                            is_verbose: false,
+                            prefix: b"api   | ".to_vec(),
+                            bytes: format!("line {n}").into_bytes(),
+                        }),
+                    }),
+                );
+            }
+            for line in batch {
+                stores.route(line);
+            }
+
+            let store = &stores.output;
+            assert_eq!(
+                store.iter().count(),
+                case.ids.len(),
+                "{}: every line is kept",
+                case.name
+            );
+
+            // Sorted by id, which is what every search over the store assumes.
+            let ids: Vec<LogId> = store.iter().map(|entry| entry.id).collect();
+            let mut sorted = ids.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(ids, sorted, "{}: ids ascend and never repeat", case.name);
+
+            // And the searches agree with the sequence: this is the step that
+            // failed, and `build_view` drops on the floor whatever `get`
+            // cannot find.
+            for (n, id) in ids.iter().enumerate() {
+                let found = store.get(*id);
+                assert!(found.is_some(), "{}: get({id:?}) found nothing", case.name);
+                assert_eq!(
+                    found.map(|entry| String::from_utf8_lossy(&entry.line.bytes).into_owned()),
+                    Some(format!("line {n}")),
+                    "{}: get({id:?}) found the wrong line",
+                    case.name
+                );
+            }
         }
     }
 
