@@ -394,8 +394,13 @@ fn cli_stop_takes_a_task_and_start_does_not() {
             .log("ignore")
             .ready_exec("true", &[])
             .done()
+            // Manual-only: with auto_run the startup sweep puts a run of
+            // `prep` in flight, and a stop landing inside that window is a
+            // *valid* stop of a real run — exit 0, and this test flakes on
+            // whichever machine is slow enough to lose the race.
             .add_task("prep", "true", &[])
             .log("ignore")
+            .auto_run(false)
             .done()
             .build();
         let config_path = dir.path().join("don.toml");
