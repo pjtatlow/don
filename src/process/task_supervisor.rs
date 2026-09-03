@@ -223,7 +223,7 @@ fn request_requery(
             name: name.to_string(),
             kind: super::ProcessKind::Task,
             bazel: task_cfg.bazel.clone(),
-            watch_enabled: task_cfg.build_tool_watch_enabled(),
+            watch_enabled: false,
             working_dir,
             ignore_patterns,
             global_watch_ignore: ctx.global_watch_ignore.clone(),
@@ -235,9 +235,14 @@ fn request_requery(
 /// Ask the build manager for this task's artifact, and tell the scheduler a
 /// build is under way. Returns whether a request is now outstanding.
 ///
-/// The service side's rule applies unchanged: asked for at construction, not
-/// at gate-open, so the whole workspace coalesces into one invocation. See
-/// [`super::service_supervisor`].
+/// Unlike the service side, which asks at construction, a task asks when a run
+/// is admitted — a task's artifact has to be current at the moment it runs,
+/// and a build at construction would be stale by the time a dependency-gated
+/// run came round. Coalescing still holds for anything admitted together: the
+/// batcher's preparation window spans a burst of requests whenever it happens,
+/// not only the construction one. Runs separated in time build separately,
+/// which is the point. See [`super::service_supervisor`] and
+/// [`crate::build_tool::manager`].
 fn request_artifact(
     name: &str,
     task_cfg: &crate::config::Task,
@@ -261,7 +266,7 @@ fn request_artifact(
                     .bazel
                     .clone()
                     .map(|b| b.with_workspace_default(ctx.bazel_config.as_deref())),
-                watch_enabled: task_cfg.build_tool_watch_enabled(),
+                watch_enabled: false,
                 working_dir,
                 ignore,
             }),
@@ -707,15 +712,22 @@ async fn supervise(
     // re-query.
     let (requery_tx, mut requery_rx) =
         mpsc::unbounded_channel::<crate::build_tool::batch::RequeryOutcome>();
-    // Asked for after the owner exists, so the `Building` phase this enters is
-    // published by the thing that entered it.
-    let mut awaiting_artifact = match startup.as_ref() {
-        Some(startup) if startup.task_cfg.bazel.is_some() => {
-            owner.set(crate::process::TaskState::Building);
-            request_artifact(&name, &startup.task_cfg, &ctx, &prepare_tx, &batcher_tx)
-        }
-        _ => false,
-    };
+    // Nothing is built up front. A `bazel.target` task builds immediately
+    // before each run — including its first — so what spawns is never older
+    // than the sources. Building at startup as well would only add a second
+    // no-op bazel round trip before the same run.
+    let mut awaiting_artifact = false;
+    // A run held back until its build lands. Distinct from `pending`, which is
+    // "run this next": this one may not run yet.
+    let mut awaiting_build: Option<RunRequest> = None;
+    // Whether the run now in hand has already had its build. Set when a build
+    // releases a held run and cleared as that run is taken, so the run after
+    // it builds again rather than inheriting the answer.
+    let mut build_done_for_run = false;
+    // The artifact the build resolved for this task's `bazel.target`, held
+    // across runs so a re-run that skips the build still knows what to spawn.
+    // Per-process runtime state, so it lives here rather than on the config.
+    let mut bazel_binary: Option<String> = None;
     // A task is wanted from the moment it exists; its startup evaluation
     // decides whether it actually needs to run.
     let mut demand = super::Demand::Scheduled;
@@ -937,13 +949,23 @@ async fn supervise(
                                 use crate::build_tool::batch::PrepareOutcome;
                                 let Some(outcome) = outcome else { continue };
                                 match outcome {
-                                    // Nothing to record: a task runs the
-                                    // command it was configured with, and the
-                                    // build only had to make the target exist.
-                                    PrepareOutcome::Ready { .. } => {
+                                    // A `bazel.target` task with no `cmd` of
+                                    // its own runs this artifact directly; one
+                                    // that has a `cmd` ignores it and the build
+                                    // only had to make the target exist.
+                                    PrepareOutcome::Ready { binary_path } => {
+                                        if binary_path.is_some() {
+                                            bazel_binary = binary_path;
+                                        }
                                         awaiting_artifact = false;
                                         if owner.phase == crate::process::TaskState::Building {
                                             owner.set(crate::process::TaskState::Pending);
+                                        }
+                                        // Whatever was waiting on this build
+                                        // runs now, against what it produced.
+                                        if let Some(held) = awaiting_build.take() {
+                                            build_done_for_run = true;
+                                            pending = Some(held);
                                         }
                                     }
                                     // Sources changed mid-build; the build
@@ -963,6 +985,11 @@ async fn supervise(
                                     }
                                     PrepareOutcome::Failed(message) => {
                                         awaiting_artifact = false;
+                                        // The run this build was for cannot
+                                        // happen; there is nothing current to
+                                        // spawn. Reported below as the run it
+                                        // was going to be.
+                                        awaiting_build = None;
                                         // Not retried — see the service side.
                                         demand = super::Demand::None;
                                         // Classified like any other run that
@@ -986,6 +1013,28 @@ async fn supervise(
                 }
             }
         };
+
+        // Build before running. `bazel run` did this on every invocation and
+        // don has to as well, or a task spawns whatever was built the last
+        // time anything asked. Bazel decides whether that is real work; when
+        // the target is up to date it is a fast no-op.
+        if !build_done_for_run
+            && let Some(startup) = startup.as_ref()
+            && startup.task_cfg.bazel.is_some()
+        {
+            owner.set(crate::process::TaskState::Building);
+            awaiting_artifact =
+                request_artifact(&name, &startup.task_cfg, &ctx, &prepare_tx, &batcher_tx);
+            if awaiting_artifact {
+                awaiting_build = Some(request);
+                continue;
+            }
+            // The build manager is gone; nothing will arrive to release the
+            // run, so take it as it is rather than hanging on to it.
+            owner.set(crate::process::TaskState::Pending);
+        }
+        build_done_for_run = false;
+
         let RunRequest {
             params,
             mode,
@@ -1039,6 +1088,7 @@ async fn supervise(
             task_cfg.as_ref(),
             &params,
             mode,
+            bazel_binary.clone(),
         );
         tokio::pin!(worker);
 
@@ -2570,6 +2620,74 @@ mod tests {
     /// The registry is the addressing half and nothing more: a clone can
     /// reach a task, and an unknown name is `None` rather than something
     /// created on demand. If lookups ever started inserting, the map would
+    /// `bazel.watch` is a service setting. A task builds before every run, so
+    /// it is never stale and has nothing to gain from watching the graph —
+    /// and graph-watching a one-shot means re-running it on any transitive
+    /// source change, which is rarely what anyone wants from a task.
+    #[tokio::test]
+    async fn a_task_never_asks_for_graph_watching() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "watch left at its default",
+                toml: "[tasks.t]\nbazel.target = \"//a:b\"\n",
+            },
+            Case {
+                name: "watch asked for explicitly",
+                toml: "[tasks.t]\nbazel.target = \"//a:b\"\nbazel.watch = true\n",
+            },
+        ];
+
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let output = crate::output::OutputManager::new(&[], tokio::io::sink())
+                .await
+                .unwrap();
+            let ctx = super::super::task_worker::TaskWorkerContext {
+                bazel_config: None,
+                base_dir: temp.path().to_path_buf(),
+                platform: crate::config::Platform::LinuxX86_64,
+                emitter: output.clone_lifecycle_emitter(),
+                global_watch_ignore: Vec::new(),
+                endpoints: {
+                    let (writer, reader) = crate::endpoints::channel();
+                    std::mem::forget(writer);
+                    reader
+                },
+            };
+            let config: crate::config::Config = case.toml.parse().unwrap();
+            let task_cfg = config.tasks.get("t").unwrap().clone();
+
+            let (outcome_tx, _outcome_rx) = mpsc::unbounded_channel();
+            let (batcher_tx, mut batcher_rx) = mpsc::unbounded_channel();
+            assert!(
+                request_artifact("t", &task_cfg, &ctx, &outcome_tx, &batcher_tx),
+                "{}: the request should be outstanding",
+                case.name
+            );
+
+            let item = match batcher_rx.try_recv() {
+                Ok(crate::build_tool::batcher::BatchRequest::QueuePrepare { item, .. }) => item,
+                _ => panic!("{}: expected a prepare request", case.name),
+            };
+            assert!(
+                !item.watch_enabled,
+                "{}: a task must not enable graph watching",
+                case.name
+            );
+            assert_eq!(
+                item.bazel.as_ref().map(|b| b.target.as_str()),
+                Some("//a:b"),
+                "{}: the target still goes to the build",
+                case.name
+            );
+        }
+    }
+
     /// need synchronising and the lock-free `Arc<HashMap<_, _>>` would go.
     #[tokio::test]
     async fn the_registry_addresses_tasks_without_creating_them() {

@@ -126,7 +126,7 @@ mod tests {
 
     fn empty_task() -> Task {
         Task {
-            cmd: "echo".into(),
+            cmd: Some("echo".into()),
             args: vec![],
             dir: None,
             env: HashMap::new(),

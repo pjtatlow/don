@@ -272,7 +272,7 @@ tasks = ["migrate"]
         assert_eq!(run.args, vec!["dev"]);
 
         assert!(config.services.contains_key("worker"));
-        assert_eq!(config.tasks["migrate"].cmd, "migrate");
+        assert_eq!(config.tasks["migrate"].cmd.as_deref(), Some("migrate"));
         assert_eq!(config.tasks["migrate"].args, vec!["up"]);
         assert_eq!(config.tasks["migrate"].env["BASE"], "base");
         assert_eq!(config.tasks["migrate"].env["LOCAL"], "yes");

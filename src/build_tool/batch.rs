@@ -669,14 +669,19 @@ pub(crate) async fn run_batch_build_chain(
         ));
     }
 
-    // Step 3: resolve every succeeded bazel service's built-binary path,
-    // grouped by workspace. Lets a supervisor spawn the artifact directly
-    // instead of via `bazel run`. Tasks don't need this.
+    // Step 3: resolve every succeeded bazel item's built-binary path, grouped
+    // by workspace. Lets a supervisor spawn the artifact directly instead of
+    // via `bazel run`.
+    //
+    // Services and tasks alike: a task defined by `bazel.target` rather than
+    // `cmd` has nothing else to spawn. One cquery answers for every label in
+    // a workspace, so including tasks costs a longer argument list and not an
+    // extra round trip. A task that *does* name its own `cmd` ignores the
+    // answer — deciding that here would mean this layer knowing what a task
+    // is configured with.
     let bazel_services_to_resolve: Vec<&BatchBuildItem> = items
         .iter()
-        .filter(|i| {
-            i.kind == ProcessKind::Service && i.bazel.is_some() && succeeded.contains(&i.name)
-        })
+        .filter(|i| i.bazel.is_some() && succeeded.contains(&i.name))
         .collect();
 
     if !bazel_services_to_resolve.is_empty() {

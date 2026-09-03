@@ -215,10 +215,17 @@ impl Runner {
             }
             let verbose_info = {
                 let task = &rt.config;
+                // A `bazel.target` task has no command of its own until the
+                // build resolves one, so show the target it is defined by.
+                let base_cmd = match (&task.cmd, &task.bazel) {
+                    (Some(cmd), _) => cmd.clone(),
+                    (None, Some(bazel)) => format!("bazel run {}", bazel.target),
+                    (None, None) => String::new(),
+                };
                 let cmd_str = if task.args.is_empty() {
-                    task.cmd.clone()
+                    base_cmd
                 } else {
-                    format!("{} {}", task.cmd, task.args.join(" "))
+                    format!("{} {}", base_cmd, task.args.join(" "))
                 };
                 let watch_item = watch_snapshot
                     .as_ref()

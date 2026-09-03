@@ -854,6 +854,13 @@ impl Config {
             {
                 errors.push(format!("task '{name}': invalid timeout: {e}"));
             }
+            // Something has to run. `bazel.target` supplies the executable
+            // once the build has resolved it, so it stands in for `cmd`.
+            if task.cmd.is_none() && task.bazel.is_none() {
+                errors.push(format!(
+                    "task '{name}': must set `cmd` or `bazel.target` — there is nothing to run"
+                ));
+            }
             // Validate params and any placeholders that reference them.
             validate_task_params(name, task, &mut errors);
             // Validate download config.
@@ -1367,7 +1374,9 @@ fn validate_task_params(task_name: &str, task: &Task, errors: &mut Vec<String>) 
             }
         }
     };
-    scan("cmd", &task.cmd);
+    if let Some(cmd) = &task.cmd {
+        scan("cmd", cmd);
+    }
     for (idx, arg) in task.args.iter().enumerate() {
         scan(&format!("args[{idx}]"), arg);
     }
@@ -2224,7 +2233,7 @@ mod tests {
                     assert_eq!(config.tasks.len(), 2);
 
                     let migrate = &config.tasks["migrate"];
-                    assert_eq!(migrate.cmd, "dbmate");
+                    assert_eq!(migrate.cmd.as_deref(), Some("dbmate"));
                     assert_eq!(migrate.args, vec!["up"]);
                     assert_eq!(migrate.depends_on, vec![Dependency::blocking("postgres")]);
                     assert_eq!(migrate.watch, vec!["db/migrations/**/*.sql"]);
@@ -3987,6 +3996,55 @@ bazel.target = "//services/api:macos_arm64"
                     )
                 }
                 (Err(e), _) => panic!("case '{}': unexpected error kind {e}", case.name),
+            }
+        }
+    }
+
+    /// A task needs something to run, and `bazel.target` counts.
+    #[test]
+    fn a_task_needs_a_cmd_or_a_bazel_target() {
+        struct Case {
+            name: &'static str,
+            toml: &'static str,
+            want_error: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "a plain command",
+                toml: "[tasks.t]\ncmd = \"true\"\n",
+                want_error: false,
+            },
+            Case {
+                name: "defined by its bazel target alone",
+                toml: "[tasks.t]\nbazel.target = \"//a:b\"\n",
+                want_error: false,
+            },
+            Case {
+                name: "both — the target is then watch-only",
+                toml: "[tasks.t]\ncmd = \"make\"\nbazel.target = \"//a:b\"\n",
+                want_error: false,
+            },
+            Case {
+                name: "neither: nothing to run",
+                toml: "[tasks.t]\nwatch = [\"src/**\"]\n",
+                want_error: true,
+            },
+        ];
+
+        for case in cases {
+            let config: Config = case.toml.parse().unwrap();
+            let result = config.validate(Platform::LinuxX86_64);
+            match (result, case.want_error) {
+                (Err(ConfigError::Validation { errors }), true) => assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains("must set `cmd` or `bazel.target`")),
+                    "{}: wrong error {errors:?}",
+                    case.name
+                ),
+                (Ok(_), false) => {}
+                (other, _) => panic!("{}: unexpected {other:?}", case.name),
             }
         }
     }

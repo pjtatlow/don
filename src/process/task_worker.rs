@@ -197,6 +197,9 @@ pub(crate) async fn run_task_worker(
     task_cfg: &crate::config::Task,
     params: &HashMap<String, String>,
     mode: TaskRunMode,
+    // What the build resolved for this task's `bazel.target`, if anything.
+    // Held by the supervisor across runs — see its `bazel_binary`.
+    bazel_binary: Option<String>,
 ) -> Result<TaskRunPrepared, String> {
     let TaskWorkerContext {
         base_dir,
@@ -372,9 +375,16 @@ pub(crate) async fn run_task_worker(
     // Every task — interactive ones included — spawns on a runner-owned
     // PTY. "Foreground" means clients bridge to it over the socket; there
     // is no terminal handoff.
-    let spawn = task::spawn_task(task_cfg, name, &base_dir, platform, params)
-        .await
-        .map_err(|e| e.to_string())?;
+    let spawn = task::spawn_task(
+        task_cfg,
+        name,
+        &base_dir,
+        platform,
+        params,
+        bazel_binary.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(TaskRunPrepared::Spawned(Box::new(spawn)))
 }
 

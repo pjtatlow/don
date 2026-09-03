@@ -2548,7 +2548,7 @@ mod tests {
         use crate::config::{LogConfig, ParamKind, Task, TaskAutoRun, TaskParam};
 
         let task = Task {
-            cmd: "echo".into(),
+            cmd: Some("echo".into()),
             args: vec![],
             dir: None,
             env: HashMap::new(),

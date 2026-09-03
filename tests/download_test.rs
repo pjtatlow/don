@@ -373,7 +373,7 @@ fn integration_task_download_resolves_cmd() {
 
         // Build a Task with this download and verify resolved_cmd points at the cache.
         let task = Task {
-            cmd: "tool".to_string(),
+            cmd: Some("tool".to_string()),
             args: vec![],
             dir: None,
             env: std::collections::HashMap::new(),
@@ -396,11 +396,14 @@ fn integration_task_download_resolves_cmd() {
             .resolved_cmd(Platform::current().unwrap(), "test", Some(&cache_base))
             .unwrap();
         assert!(
-            resolved.starts_with(&cache_base),
+            resolved.as_ref().unwrap().starts_with(&cache_base),
             "resolved path should be under cache: {resolved:?}"
         );
-        assert_eq!(resolved.file_name().unwrap(), "tool");
-        assert!(resolved.exists(), "resolved binary should exist");
+        assert_eq!(resolved.as_ref().unwrap().file_name().unwrap(), "tool");
+        assert!(
+            resolved.as_ref().unwrap().exists(),
+            "resolved binary should exist"
+        );
 
         let _ = shutdown_tx.send(());
     });

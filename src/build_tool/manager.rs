@@ -47,10 +47,11 @@ const GRAPH_REQUERY_WINDOW: Duration = Duration::from_millis(100);
 
 /// How long to collect artifact-preparation requests before running them.
 ///
-/// Supervisors ask as they are constructed, which is one synchronous burst;
-/// this only has to be wide enough to span it. Getting this wrong is the one
-/// regression the "ask at construction" rule exists to avoid — a window that
-/// closed too early would give bazel one invocation per service.
+/// Services ask as they are constructed, which is one synchronous burst, and
+/// tasks ask as their runs are admitted — which for everything released
+/// together is another one. This only has to be wide enough to span a burst.
+/// Getting it wrong is the one regression batching exists to avoid: a window
+/// that closed too early would give bazel one invocation per process.
 const PREPARE_BATCH_WINDOW: Duration = Duration::from_millis(50);
 
 /// Coalesces build-tool rebuilds and build-graph re-queries.

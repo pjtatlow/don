@@ -400,7 +400,7 @@ mod tests {
 
     fn task_with(params: Vec<TaskParam>) -> Task {
         Task {
-            cmd: "echo".into(),
+            cmd: Some("echo".into()),
             args: vec![],
             dir: None,
             env: HashMap::new(),

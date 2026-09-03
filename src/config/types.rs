@@ -14,7 +14,13 @@ fn default_true() -> bool {
 pub struct BazelConfig {
     /// Bazel target label (e.g. `"//services/api:api"`).
     pub target: String,
-    /// Whether Don should auto-watch source packages resolved from the Bazel graph.
+    /// Whether Don should auto-watch source packages resolved from the Bazel
+    /// graph, restarting the service when any of them changes.
+    ///
+    /// **Services only.** A task builds its target before every run, so it is
+    /// never stale and has nothing to gain from watching the graph; what makes
+    /// a *task* run again is its own `watch` globs, its `depends_on`, or you.
+    /// Wanting a bazel graph watched is what makes something a service.
     #[serde(default = "default_true")]
     pub watch: bool,
     /// Name of a `.bazelrc` configuration to build this target under, passed

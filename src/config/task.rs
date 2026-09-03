@@ -82,7 +82,12 @@ pub struct TaskHeadless {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Task {
     /// The command to execute.
-    pub cmd: String,
+    ///
+    /// Optional because a task can instead be defined by `bazel.target`, in
+    /// which case it runs the built artifact. Validation requires one or the
+    /// other; a task with neither has nothing to run.
+    #[serde(default)]
+    pub cmd: Option<String>,
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,
@@ -144,7 +149,12 @@ pub struct Task {
     /// When a download exists for the current platform, its binary path
     /// replaces `cmd`. Without a matching platform entry, `cmd` is looked up on PATH.
     pub download: Option<DownloadConfig>,
-    /// Bazel build tool integration — auto-resolve watch patterns from the build graph.
+    /// Bazel build tool integration.
+    ///
+    /// The target is built immediately before every run of this task, so what
+    /// runs is never older than the sources. With no `cmd`, the task *is* the
+    /// built artifact. `bazel.watch` has no effect here — see
+    /// [`BazelConfig::watch`].
     pub bazel: Option<BazelConfig>,
     /// Optional parameter declarations. When non-empty, the task is
     /// considered "interactive" — when the task is needed, file-watch
@@ -167,16 +177,12 @@ pub struct Task {
 }
 
 impl Task {
-    pub(crate) fn build_tool_watch_enabled(&self) -> bool {
-        self.bazel.as_ref().is_some_and(|bazel| bazel.watch)
-    }
-
     pub(crate) fn apply_headless_override(&mut self) {
         let Some(headless) = &self.headless else {
             return;
         };
         if let Some(cmd) = &headless.cmd {
-            self.cmd.clone_from(cmd);
+            self.cmd = Some(cmd.clone());
         }
         if let Some(args) = &headless.args {
             self.args.clone_from(args);
@@ -188,24 +194,29 @@ impl Task {
 
     /// Resolve the task's command path, using the cached download binary
     /// if one is configured for this platform.
+    /// `None` when the task names no command of its own — a `bazel.target`
+    /// task, whose executable is only known once the build has resolved it.
     pub fn resolved_cmd(
         &self,
         platform: Platform,
         task_name: &str,
         cache_base: Option<&std::path::Path>,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<Option<PathBuf>, String> {
         let cache_base = cache_base
             .map(PathBuf::from)
             .unwrap_or_else(super::download::default_cache_base);
 
+        let own = || self.cmd.as_ref().map(PathBuf::from);
         let executable = match &self.download {
             Some(dl) => match dl.for_platform(platform) {
-                Some(artifact) => artifact
-                    .binary_path(&cache_base, task_name)
-                    .ok_or_else(|| format!("download url has no filename: {}", artifact.url))?,
-                None => PathBuf::from(&self.cmd),
+                Some(artifact) => Some(
+                    artifact
+                        .binary_path(&cache_base, task_name)
+                        .ok_or_else(|| format!("download url has no filename: {}", artifact.url))?,
+                ),
+                None => own(),
             },
-            None => PathBuf::from(&self.cmd),
+            None => own(),
         };
         Ok(executable)
     }
@@ -337,7 +348,12 @@ mod tests {
             let mut task: Task = toml::from_str(case.toml).unwrap();
             task.apply_headless_override();
 
-            assert_eq!(task.cmd, case.want_cmd, "{}: cmd", case.name);
+            assert_eq!(
+                task.cmd.as_deref(),
+                Some(case.want_cmd),
+                "{}: cmd",
+                case.name
+            );
             assert_eq!(task.args, case.want_args, "{}: args", case.name);
             assert!(!task.interactive, "{}: interactivity", case.name);
         }

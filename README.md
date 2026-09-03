@@ -551,6 +551,30 @@ bazel.target = "//services/api:api"
 bazel.config = "api-dev"
 ```
 
+A task's target is built immediately before **every** run of it, so what runs
+is never older than the sources — the guarantee `bazel run` gave you. Bazel
+decides whether that is real work; on an up-to-date target it is a fast no-op.
+
+A task may be defined by its target alone. With no `cmd`, don builds the
+target, resolves the produced executable and spawns it directly — the same
+path a Bazel *service* takes, and the reason neither needs `bazel run`:
+
+```toml
+[tasks.schema-sync]
+bazel.target = "//redo/scurry:schema_sync"
+args = ["--one=2"]              # passed to the built binary
+```
+
+A task that *does* set `cmd` keeps running it, and `bazel.target` then only
+builds the target first. If the artifact path can't be resolved, don falls
+back to `bazel run <target>`.
+
+`bazel.watch` is a **service** setting and does nothing on a task. A task is
+never stale, so it has nothing to gain from watching the graph, and
+re-running a one-shot on every transitive source change is rarely wanted.
+What re-runs a task is its own `watch` globs, its `depends_on`, or you — and
+wanting a graph watched is what makes something a service.
+
 Don passes `--config` after its own two flags, so a configuration that sets
 `--curses` or `--color` wins. Naming a configuration that no `.rc` file defines
 is a hard Bazel error, which is why there is no default.
@@ -991,6 +1015,7 @@ See [`examples/`](examples/) for complete working configs.
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
 | `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
 | `bazel.config` | string | `.bazelrc` configuration to build this target under, as `--config=<name>` |
+| `cmd` (tasks) | string | Optional when `bazel.target` is set — the task then runs the built artifact |
 | `bazel.config` (top-level `[bazel]`) | string | Same, for every Bazel build Don runs; per-service/task settings override it |
 | `download.platform.<platform>` | table | Per-platform download config |
 | `env` (top-level) | table | Environment for every service and task; a process's own `env` wins |

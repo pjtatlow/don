@@ -157,6 +157,7 @@ These fields are available on all service presets:
 | `log` | string or table | Logging output destination (see below) |
 | `log_filter` | list of regex strings | Per-service regex keep filters for log lines |
 | `log_exclude` | list of regex strings | Per-service regex drop filters for log lines; applied before `log_filter` |
+| `bazel.target` (tasks) | label | Builds the target; with no `cmd`, the task runs the built artifact directly |
 | `download` | table | Binary download configuration (see below) |
 | `on_failure` | string | `"notify"` or `"restart"`; controls service crash/unhealthy handling |
 | `platform` | map | Per-platform overrides (see below) |
