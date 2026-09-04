@@ -900,6 +900,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, store: &mut LogStore) -> Resu
         // inside a narrow: it was applied last and the title is advertising
         // this key for it. A second Esc reaches whatever is underneath.
         KeyCode::Esc if app.log_search.is_active() => app.log_search.cancel(),
+        KeyCode::Esc if app.widen_log_from_narrow() => {}
         // Held above the tail, Enter is the way back down — the gesture
         // everyone tries first. Above means *actually* above: a view merely
         // pinned at the tail (a selection does that) looks identical to
@@ -3632,6 +3633,90 @@ mod tests {
             }
             assert_eq!(app.view_mode, case.want_mode, "{}: mode", case.name);
             assert_eq!(app.focus, case.want_focus, "{}: focus", case.name);
+        }
+    }
+
+    /// `l` narrows the log beside the table; closing the table does not undo
+    /// that. Esc still has to, because the log title keeps advertising
+    /// `[esc] all` after the drawer is gone — swallowing the second `s`
+    /// would trap the reader in the table they just asked to leave.
+    #[test]
+    fn closing_a_table_leaves_a_narrow_that_esc_can_undo() {
+        struct Case {
+            name: &'static str,
+            keys: &'static [KeyCode],
+            want_mode: ViewMode,
+            want_focus: panes::Focus,
+            want_narrowed: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "s then l then s: drawer gone, still narrowed",
+                keys: &[KeyCode::Char('s'), KeyCode::Char('l'), KeyCode::Char('s')],
+                want_mode: ViewMode::Normal,
+                want_focus: panes::Focus::Logs,
+                want_narrowed: true,
+            },
+            Case {
+                name: "and esc from there restores the log",
+                keys: &[
+                    KeyCode::Char('s'),
+                    KeyCode::Char('l'),
+                    KeyCode::Char('s'),
+                    KeyCode::Esc,
+                ],
+                want_mode: ViewMode::Normal,
+                want_focus: panes::Focus::Logs,
+                want_narrowed: false,
+            },
+            Case {
+                name: "esc from the log side peels the narrow before the panel",
+                keys: &[
+                    KeyCode::Char('s'),
+                    KeyCode::Char('l'),
+                    KeyCode::Tab,
+                    KeyCode::Esc,
+                ],
+                want_mode: ViewMode::Services,
+                want_focus: panes::Focus::Logs,
+                want_narrowed: false,
+            },
+            Case {
+                name: "esc from the table peels the narrow and keeps the panel",
+                keys: &[KeyCode::Char('s'), KeyCode::Char('l'), KeyCode::Esc],
+                want_mode: ViewMode::Services,
+                want_focus: panes::Focus::Panel,
+                want_narrowed: false,
+            },
+        ];
+
+        for case in cases {
+            let mut app = app_with_service_state(ServiceState::Ready);
+            let mut store = LogStore::with_capacity(10);
+            let client = std::sync::Arc::new(Client::with_socket_path("/dev/null".into()));
+            let controls = TuiControls {
+                lifecycle_emitter: LifecycleEmitter::discarding(),
+                mode: TuiMode::InProcess,
+            };
+            for key in case.keys {
+                handle_key(
+                    KeyEvent::new(*key, KeyModifiers::NONE),
+                    &mut app,
+                    &mut store,
+                    &client,
+                    &controls,
+                )
+                .unwrap();
+            }
+            assert_eq!(app.view_mode, case.want_mode, "{}: mode", case.name);
+            assert_eq!(app.focus, case.want_focus, "{}: focus", case.name);
+            assert_eq!(
+                app.narrowed_to().is_some(),
+                case.want_narrowed,
+                "{}: narrowed?",
+                case.name
+            );
         }
     }
 
