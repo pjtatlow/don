@@ -174,6 +174,13 @@ pub(in crate::runner) async fn build_runtime_maps(
         if active_services.contains(name) {
             let mut resolved = svc.resolve(platform);
             resolved.depends_on = config.effective_depends_on(name, &resolved.depends_on);
+            resolved.secrets = config.effective_secrets(
+                name,
+                svc.platform
+                    .get(&platform)
+                    .and_then(|ov| ov.secrets.as_deref())
+                    .or(svc.secrets.as_deref()),
+            );
             services.insert(name.clone(), RuntimeService::new(resolved));
         }
     }
@@ -184,6 +191,8 @@ pub(in crate::runner) async fn build_runtime_maps(
         if active_tasks.contains(name) {
             let mut task = task.clone();
             task.depends_on = config.effective_depends_on(name, &task.depends_on);
+            let declared = task.secrets.take();
+            task.secrets = Some(config.effective_secrets(name, declared.as_deref()));
             if headless {
                 task.apply_headless_override();
             }

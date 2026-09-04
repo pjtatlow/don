@@ -76,6 +76,76 @@ run.args = ["scratch.js"]
 services = ["api", "scratch"]
 ```
 
+### Secrets
+
+Secrets are first-class in Don. Values never live in config, and Don never
+writes them to disk. `src/secrets/` is shaped to extract later as the `key`
+crate; Don does not shell out to a Key binary.
+
+Each `[[secrets]]` entry is one source. The provider is named by its key, the
+way a service names its kind, so settings only that provider understands sit
+inside it rather than at the top level. A source that names no provider is a
+config error.
+
+```toml
+[[secrets]]
+aws-ssm = { region = "us-east-1", profile = "dev" }
+vars = { STRIPE_SECRET_KEY = "/app/StripeSecretKey" }
+groups = { app = ["STRIPE_SECRET_KEY"] }
+
+[services.api]
+run.cmd = "./api"
+secrets = ["app"]        # only these keys are exported to this process
+```
+
+Because it is a list, each entry fetches with its own credentials, so one run
+can read parameters that live in separate accounts:
+
+```toml
+[[secrets]]
+aws-ssm = { profile = "dev" }
+vars = { STRIPE_SECRET_KEY = "/RedoDevelopment/StripeSecretKey" }
+
+[[secrets]]
+aws-ssm = { profile = "prod" }
+vars = { LAUNCH_DARKLY_SDK_KEY = "/RedoProduction/LaunchDarklySdkKey" }
+```
+
+Groups and managed names are the union across sources, so a process may declare
+a group from one and a key from another. A name supplied by more than one source
+takes the value of the last source that supplies it.
+
+A profile override replaces the list rather than merging into it, so a profile
+states its sources in full. A provider named only in one profile does not exist
+in any other, which is what keeps a dev stack from needing production
+credentials.
+
+`[service_groups.*] secrets` is the grant for members that omit `secrets`.
+A member that sets `secrets` replaces the group list (it is not merged).
+`secrets = []` is an explicit empty grant. Processes not in the group get
+nothing.
+
+```toml
+[service_groups.application-services]
+members = ["api-server", "admin-server"]
+secrets = ["production"]
+
+[services.admin-server]
+run.cmd = "./admin"
+
+[services.api-server]
+run.cmd = "./api"
+secrets = ["production", "other-secrets-group", "STRIPE_WEBHOOK_SECRET"]
+```
+
+
+At startup Don calls `aws ssm get-parameters --with-decryption` (raced against
+Ctrl+C), injects declared keys, and strips undeclared managed keys from
+inherited env. Known secret values are replaced with `***` in process logs
+(TUI, `GET /logs`, `.don/logs/runner.log`) before they hit any sink. Don does
+not put pulled values into its own environment. Expired AWS SSO credentials
+print `aws sso login --profile <name>`; Don does not log in for you.
+
 ### Services
 
 Services are long-running processes. Each service uses exactly one **preset** that determines how it's run:

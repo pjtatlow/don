@@ -2649,6 +2649,7 @@ mod tests {
                 .unwrap();
             let ctx = super::super::task_worker::TaskWorkerContext {
                 bazel_config: None,
+                secrets: crate::secrets::SecretStore::empty(),
                 base_dir: temp.path().to_path_buf(),
                 platform: crate::config::Platform::LinuxX86_64,
                 emitter: output.clone_lifecycle_emitter(),
@@ -2707,6 +2708,7 @@ mod tests {
                 std::mem::forget(writer);
                 reader
             },
+            secrets: crate::secrets::SecretStore::empty(),
         };
         let names = ["build".to_string(), "migrate".to_string()];
         let (report_tx, _report_rx) = mpsc::unbounded_channel();

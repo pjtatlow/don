@@ -20,6 +20,7 @@ include = [
 
 
 [dependencies]
+aho-corasick = "1"
 ansi-to-tui = "8"
 axum = "0.8"
 bollard = "0.21"

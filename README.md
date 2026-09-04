@@ -385,6 +385,50 @@ Group-level `depends_on` may reference services, tasks, or other groups,
 and propagates through nested groups (a member of a member group still
 inherits the outer group's deps).
 
+### Secrets
+
+Pull values from AWS SSM Parameter Store at startup. Config holds names and
+paths only — Don never writes values to disk. Known values are replaced with
+`***` in the TUI, `don logs`, and the runner log.
+
+```toml
+[[secrets]]
+aws-ssm = { region = "us-east-1", profile = "dev" }
+vars = { STRIPE_SECRET_KEY = "/app/StripeSecretKey", DD_API_KEY = "/app/Datadog/ApiKey" }
+groups = { app = ["STRIPE_SECRET_KEY"] }
+
+[services.api]
+run.cmd = "./api"
+secrets = ["app"]
+```
+
+Each `[[secrets]]` entry is one source, and names its provider by key. Settings
+only that provider understands live inside it. Because it is a list, each entry
+fetches with its own credentials, so one run can read parameters from separate
+accounts; a name supplied by more than one source takes the last one's value.
+
+A process only receives the keys it lists (a group name or an individual
+var). Managed names that were in the inherited environment are stripped
+unless declared. Expired AWS SSO prints `aws sso login --profile <name>`;
+Don does not log in for you.
+
+`[service_groups.*] secrets` is the grant for members that omit `secrets`.
+A member that sets `secrets` replaces that list; `secrets = []` is an
+explicit empty grant. Processes not in the group get nothing.
+
+```toml
+[service_groups.application-services]
+members = ["api-server", "admin-server"]
+secrets = ["app"]
+
+[services.admin-server]
+run.cmd = "./admin"
+
+[services.api-server]
+run.cmd = "./api"
+secrets = ["app", "DD_API_KEY"]
+```
+
 ### Ready Checks
 
 Don waits for services to be ready before starting dependents:
@@ -1019,6 +1063,13 @@ See [`examples/`](examples/) for complete working configs.
 | `bazel.config` (top-level `[bazel]`) | string | Same, for every Bazel build Don runs; per-service/task settings override it |
 | `download.platform.<platform>` | table | Per-platform download config |
 | `env` (top-level) | table | Environment for every service and task; a process's own `env` wins |
+| `secrets` | [string] | Secret vars or groups this process receives. Omit to inherit from a service group; `[]` is an empty grant |
+| `secrets` (service group) | [string] | Grant for members that omit `secrets` |
+| `secrets.provider` | string | `"aws-ssm"` |
+| `secrets.region` | string | AWS region |
+| `secrets.profile` | string | AWS CLI / SSO profile |
+| `secrets.vars` | {name: path} | Env name → SSM parameter path |
+| `secrets.groups` | {name: [string]} | Named bundles of vars |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
 | `profiles.<name>.overrides` | table | Config fragment merged over the base file while that profile is active |
 | `fallback_ports` | bool | Top-level: use an OS-assigned proxy/Docker host port when the preferred port is in use |

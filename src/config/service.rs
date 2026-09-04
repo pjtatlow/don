@@ -100,6 +100,8 @@ pub struct Service {
     /// service. When enabled, a service failure adds this service to the TUI
     /// log filter.
     pub auto_filter_on_failure: Option<bool>,
+    /// Secret refs this service declared. `None` inherits from service groups.
+    pub secrets: Option<Vec<String>>,
 
     /// The service kind. `None` when the base service has no preset
     /// and relies on a platform override to supply one.
@@ -147,6 +149,7 @@ struct RawService {
     hidden: bool,
     #[serde(default)]
     auto_filter_on_failure: Option<bool>,
+    secrets: Option<Vec<String>>,
 
     bazel: Option<BazelConfig>,
     docker: Option<DockerConfig>,
@@ -224,6 +227,7 @@ impl TryFrom<RawService> for Service {
             platform: raw.platform,
             hidden: raw.hidden,
             auto_filter_on_failure: raw.auto_filter_on_failure,
+            secrets: raw.secrets,
             kind,
         })
     }
@@ -263,6 +267,8 @@ pub struct ServiceOverride {
     pub tty: Option<bool>,
     pub on_failure: Option<OnFailure>,
     pub auto_filter_on_failure: Option<bool>,
+    /// If set, replaces the base service's secrets list.
+    pub secrets: Option<Vec<String>>,
 
     /// If set, completely replaces the base service kind.
     pub kind: Option<ServiceKind>,
@@ -292,6 +298,7 @@ struct RawServiceOverride {
     tty: Option<bool>,
     on_failure: Option<OnFailure>,
     auto_filter_on_failure: Option<bool>,
+    secrets: Option<Vec<String>>,
 
     bazel: Option<BazelConfig>,
     docker: Option<DockerConfig>,
@@ -327,6 +334,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             tty: raw.tty,
             on_failure: raw.on_failure,
             auto_filter_on_failure: raw.auto_filter_on_failure,
+            secrets: raw.secrets,
             kind,
         })
     }
@@ -372,6 +380,8 @@ pub struct ResolvedService {
     /// Optional per-service override for automatic log-filter selection on
     /// failure.
     pub auto_filter_on_failure: Option<bool>,
+    /// Secret names or group names this service may receive.
+    pub secrets: Vec<String>,
 
     /// The resolved service kind. `None` only if validation hasn't caught
     /// a missing preset (shouldn't happen after validation).
@@ -517,6 +527,7 @@ impl Service {
                 tty: self.tty,
                 on_failure: self.on_failure,
                 auto_filter_on_failure: self.auto_filter_on_failure,
+                secrets: self.secrets.clone().unwrap_or_default(),
                 kind: self.kind.clone(),
                 resolved_binary_path: None,
             },
@@ -562,6 +573,11 @@ impl Service {
                     auto_filter_on_failure: ov
                         .auto_filter_on_failure
                         .or(self.auto_filter_on_failure),
+                    secrets: ov
+                        .secrets
+                        .clone()
+                        .or_else(|| self.secrets.clone())
+                        .unwrap_or_default(),
                     kind,
                     resolved_binary_path: None,
                 }

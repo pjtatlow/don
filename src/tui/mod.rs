@@ -2576,6 +2576,7 @@ mod tests {
             }],
             hidden: false,
             auto_filter_on_failure: None,
+            secrets: None,
         };
         let mut app = App::new(AppInit {
             service_names: Vec::new(),

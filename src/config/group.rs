@@ -23,6 +23,8 @@ pub struct ServiceGroup {
     /// Dependencies applied to every (transitive) member of this group.
     /// May reference services, tasks, or other groups.
     pub depends_on: Vec<Dependency>,
+    /// Secret refs applied to every (transitive) member, additive with the member's own.
+    pub secrets: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -36,6 +38,8 @@ enum RawServiceGroup {
         members: Vec<String>,
         #[serde(default)]
         depends_on: Vec<Dependency>,
+        #[serde(default)]
+        secrets: Vec<String>,
     },
 }
 
@@ -45,13 +49,16 @@ impl From<RawServiceGroup> for ServiceGroup {
             RawServiceGroup::Simple(members) => ServiceGroup {
                 members,
                 depends_on: Vec::new(),
+                secrets: Vec::new(),
             },
             RawServiceGroup::Detailed {
                 members,
                 depends_on,
+                secrets,
             } => ServiceGroup {
                 members,
                 depends_on,
+                secrets,
             },
         }
     }

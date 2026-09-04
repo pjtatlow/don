@@ -67,10 +67,12 @@ struct ServiceOutputState {
     /// Attached clients, counted by [`attach::AttachControl`]; drives the
     /// stdout-sink pause. Reset by the supervisor's reap clear.
     attach_clients: usize,
+    secret_redactor: super::redact::SecretRedactor,
 }
 
 impl ServiceOutputState {
     fn output_chunks(&mut self, chunk: Bytes) -> Vec<Bytes> {
+        let chunk = Bytes::from(self.secret_redactor.redact_bytes(&chunk));
         if self.line_filter.is_empty() {
             self.ring_buffer.push_chunk(chunk.as_ref());
             return vec![chunk];
@@ -118,6 +120,7 @@ impl ServiceOutputState {
         if !self.line_filter.keeps(line.as_ref()) {
             return;
         }
+        let line = Bytes::from(self.secret_redactor.redact_bytes(&line));
         self.ring_buffer.push_chunk(line.as_ref());
         accepted.push(line);
     }
@@ -317,6 +320,7 @@ impl OutputHandle {
 }
 
 /// Start one process's output actor.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn(
     name: String,
     prefix: Bytes,
@@ -324,6 +328,7 @@ pub(super) fn spawn(
     stdout_sink: SinkHandle,
     mute: super::StdoutMuteControl,
     line_filter: CompiledLineFilter,
+    secret_redactor: super::redact::SecretRedactor,
 ) -> OutputHandle {
     let (output_tx, output_rx) = mpsc::channel(CHUNK_QUEUE_DEPTH);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -336,6 +341,7 @@ pub(super) fn spawn(
         sinks,
         attach_pty: None,
         attach_clients: 0,
+        secret_redactor,
     };
     // Detached: the actor ends when its channels close, which happens when
     // the last handle drops — or immediately on `ClearSinks`, which is how

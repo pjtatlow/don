@@ -174,6 +174,9 @@ pub struct Task {
     /// When enabled, a task failure adds this task to the TUI log filter.
     #[serde(default)]
     pub auto_filter_on_failure: Option<bool>,
+    /// Secret refs this task declared. `None` inherits from service groups.
+    #[serde(default)]
+    pub secrets: Option<Vec<String>>,
 }
 
 impl Task {

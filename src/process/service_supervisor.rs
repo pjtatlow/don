@@ -223,6 +223,7 @@ pub(crate) struct StartEnv {
     /// permitted from the moment its facts exist — which is before the
     /// watcher does.
     pub(crate) released: tokio::sync::watch::Receiver<bool>,
+    pub(crate) secrets: crate::secrets::SecretStore,
 }
 
 /// Owner half for services.
@@ -285,6 +286,7 @@ fn build_context(
         listen_fds_env: std::collections::HashMap::new(),
         fallback_ports: env.fallback_ports,
         prior_docker_port_bindings: last_docker_bindings.to_vec(),
+        secrets: env.secrets.clone(),
     }))
 }
 
@@ -1179,6 +1181,7 @@ async fn supervise(
                         &resolved,
                         false,
                         service_writer.as_ref(),
+                        &env.secrets,
                     );
                     // Raced against the mailbox so a Stop or a shutdown can
                     // cut a slow build short — the build child is
@@ -2660,6 +2663,7 @@ mod tests {
                 std::mem::forget(tx);
                 rx
             },
+            secrets: crate::secrets::SecretStore::empty(),
         };
         (env, batcher_rx, shutdown_tx)
     }

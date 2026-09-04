@@ -169,6 +169,14 @@ impl ServiceBuilder {
         self
     }
 
+    /// Declare which secret names or groups this process receives.
+    pub fn secrets(mut self, names: &[&str]) -> Self {
+        let names_str: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+        self.lines
+            .push(format!("secrets = [{}]", names_str.join(", ")));
+        self
+    }
+
     /// Add a TCP ready check.
     pub fn ready_tcp(mut self, addr: &str) -> Self {
         self.lines.push(format!("ready.tcp = \"{addr}\""));

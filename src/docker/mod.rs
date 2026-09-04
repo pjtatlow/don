@@ -242,6 +242,8 @@ pub(crate) async fn start_docker_service(
     env_files: &[std::path::PathBuf],
     base_dir: &std::path::Path,
     writer: Option<&crate::output::ServiceWriter>,
+    secrets: &crate::secrets::SecretStore,
+    secret_refs: &[String],
 ) -> Result<(DockerHandle, ChildOutput), DockerError> {
     let container_name = container_name(base_dir, name, config, fallback_ports);
 
@@ -262,6 +264,17 @@ pub(crate) async fn start_docker_service(
     // Build container configuration.
     let mut prepared = parse::prepare_port_mappings(&config.ports, fallback_ports, prior_bindings)?;
     let env_vars = parse::build_container_env(service_env, env_files, &config.env_file)?;
+    let mut env_map = std::collections::HashMap::new();
+    for entry in &env_vars {
+        if let Some((key, value)) = entry.split_once('=') {
+            env_map.insert(key.to_string(), value.to_string());
+        }
+    }
+    secrets.apply(&mut env_map, secret_refs);
+    let env_vars: Vec<String> = env_map
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
     let mut retried_dynamic = false;
 
     let (container_id, actual_bindings) = loop {
@@ -803,6 +816,8 @@ mod tests {
                     &[],
                     Path::new("/tmp"),
                     None,
+                    &crate::secrets::SecretStore::empty(),
+                    &[],
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{}: {e}", case.name));
