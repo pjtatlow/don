@@ -409,8 +409,10 @@ accounts; a name supplied by more than one source takes the last one's value.
 
 A process only receives the keys it lists (a group name or an individual
 var). Managed names that were in the inherited environment are stripped
-unless declared. Expired AWS SSO prints `aws sso login --profile <name>`;
-Don does not log in for you.
+unless declared. Don fetches with the AWS SDK (not the AWS CLI); credentials
+come from the SDK default chain, pinned by `region` / `profile` when those
+are set. Expired AWS SSO prints `aws sso login --profile <name>`; Don does
+not log in for you.
 
 `[service_groups.*] secrets` is the grant for members that omit `secrets`.
 A member that sets `secrets` replaces that list; `secrets = []` is an

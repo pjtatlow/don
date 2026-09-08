@@ -139,12 +139,16 @@ secrets = ["production", "other-secrets-group", "STRIPE_WEBHOOK_SECRET"]
 ```
 
 
-At startup Don calls `aws ssm get-parameters --with-decryption` (raced against
-Ctrl+C), injects declared keys, and strips undeclared managed keys from
-inherited env. Known secret values are replaced with `***` in process logs
-(TUI, `GET /logs`, `.don/logs/runner.log`) before they hit any sink. Don does
-not put pulled values into its own environment. Expired AWS SSO credentials
-print `aws sso login --profile <name>`; Don does not log in for you.
+At startup Don fetches SSM parameters with the AWS SDK (`GetParameters`,
+with decryption, batches of 10), raced against Ctrl+C. It injects declared
+keys and strips undeclared managed keys from inherited env. Credentials come
+from the SDK default chain (environment, shared config, SSO, IMDS); `region`
+and `profile` on `aws-ssm` pin that chain when set, and omitting them is
+the default lookup. Known secret values are replaced with `***` in process
+logs (TUI, `GET /logs`, `.don/logs/runner.log`) before they hit any sink.
+Don does not put pulled values into its own environment. Expired AWS SSO
+credentials print `aws sso login --profile <name>`; Don does not log in for
+you. The AWS CLI is not required.
 
 ### Services
 

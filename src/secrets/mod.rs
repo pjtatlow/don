@@ -1,4 +1,4 @@
-//! In-memory secret values and AWS SSM fetch. Extract this directory as `key`.
+//! In-memory secret values and AWS SSM fetch via the AWS SDK. Extract this directory as `key`.
 
 mod aws;
 mod config;

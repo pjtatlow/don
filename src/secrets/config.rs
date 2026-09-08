@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 /// provider understands live with it rather than at the top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretKind {
-    /// AWS Systems Manager Parameter Store (`aws ssm get-parameters`).
+    /// AWS Systems Manager Parameter Store (SDK `GetParameters`).
     AwsSsm(AwsSsmConfig),
 }
 
