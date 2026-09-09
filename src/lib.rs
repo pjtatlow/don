@@ -20,6 +20,7 @@ pub mod ports;
 pub mod process;
 pub(crate) mod proxy;
 pub mod runner;
+pub(crate) mod secrets;
 pub mod server;
 pub mod session_summary;
 pub mod signals;

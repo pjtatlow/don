@@ -160,6 +160,8 @@ pub enum RunnerError {
     PidFile(#[from] crate::sys::pid_file::PidFileError),
     #[error("config error: {0}")]
     Config(String),
+    #[error("{0}")]
+    Secrets(#[from] crate::secrets::SecretError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -312,7 +314,7 @@ impl Runner {
         output_manager: OutputManager,
         base_dir: PathBuf,
         profile: Option<&str>,
-        shutdown_rx: mpsc::Receiver<()>,
+        mut shutdown_rx: mpsc::Receiver<()>,
         headless: bool,
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -365,6 +367,18 @@ impl Runner {
         let active_tasks = setup::filter_active_tasks(&config, active_processes.as_ref());
 
         setup::prune_download_cache(&config, platform, &don_dir, &output_manager);
+
+        let secrets = {
+            if !config.secrets.is_empty() {
+                output_manager.lifecycle_event("fetching secrets...");
+                let store = crate::secrets::resolve(&config.secrets, &mut shutdown_rx).await?;
+                output_manager.set_secret_redactor(store.redactable_values());
+                output_manager.lifecycle_event(&format!("loaded {} secrets", store.len()));
+                store
+            } else {
+                crate::secrets::SecretStore::empty()
+            }
+        };
 
         let (mut services, tasks) = setup::build_runtime_maps(
             &config,
@@ -526,6 +540,7 @@ impl Runner {
                 bazel_config: config.bazel.config.clone(),
                 facts: facts_reader.clone(),
                 released: released_rx.clone(),
+                secrets: secrets.clone(),
             },
             &|name| output_manager.process_output(name),
             &|name| services.get(name).map(|rs| rs.resolved.clone()),
@@ -558,6 +573,7 @@ impl Runner {
                 global_watch_ignore: config.watch_ignore.clone(),
                 bazel_config: config.bazel.config.clone(),
                 endpoints: endpoints.reader(),
+                secrets: secrets.clone(),
             },
             &|name| output_manager.process_output(name),
             &|name| {

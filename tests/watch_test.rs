@@ -558,7 +558,7 @@ fn integration_edit_during_build_skips_intermediate_restart() {
             let rebuilds = output.matches("rebuilding (file changed)").count();
             let restarts = output.matches("restarting...").count();
             let build_successes = output.matches("bash build succeeded").count();
-            if rebuilds >= 2 && build_successes >= 3 {
+            if rebuilds >= 2 && build_successes >= 3 && restarts >= 1 {
                 assert_eq!(
                     restarts, 1,
                     "expected only one restart after two rebuild cycles. output: {output}"

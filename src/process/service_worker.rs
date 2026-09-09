@@ -17,6 +17,7 @@ pub(crate) struct ServiceStartContext {
     pub(crate) listen_fds_env: HashMap<String, String>,
     pub(crate) fallback_ports: bool,
     pub(crate) prior_docker_port_bindings: Vec<crate::docker::DockerPortBinding>,
+    pub(crate) secrets: crate::secrets::SecretStore,
 }
 
 pub(crate) async fn ensure_download_for_config_worker(
@@ -53,6 +54,7 @@ async fn run_preset_build_worker(
     cmd: &str,
     args: &[String],
     resolved: &crate::config::ResolvedService,
+    secrets: &crate::secrets::SecretStore,
 ) -> Result<(), String> {
     emitter.service_event(name, &format!("running {cmd} build..."));
 
@@ -63,6 +65,7 @@ async fn run_preset_build_worker(
     let work_dir = work_dir.as_path();
     let mut env: HashMap<String, String> = std::env::vars().collect();
     env.extend(resolved.env.clone());
+    secrets.apply(&mut env, &resolved.secrets);
 
     match crate::sys::spawn_process(crate::sys::SpawnConfig {
         cmd,
@@ -119,6 +122,7 @@ async fn run_preset_build_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_service_build_worker(
     base_dir: &std::path::Path,
     docker_client: Option<&bollard::Docker>,
@@ -127,6 +131,7 @@ pub(crate) async fn run_service_build_worker(
     resolved: &crate::config::ResolvedService,
     batch_built: bool,
     service_writer: Option<&crate::output::ServiceWriter>,
+    secrets: &crate::secrets::SecretStore,
 ) -> Result<(), String> {
     if batch_built {
         return Ok(());
@@ -155,7 +160,16 @@ pub(crate) async fn run_service_build_worker(
         }
         Some(crate::config::ServiceKind::Rust(rust_config)) => {
             let build_args = service::rust_build_args(rust_config);
-            run_preset_build_worker(base_dir, emitter, name, "cargo", &build_args, resolved).await
+            run_preset_build_worker(
+                base_dir,
+                emitter,
+                name,
+                "cargo",
+                &build_args,
+                resolved,
+                secrets,
+            )
+            .await
         }
         Some(crate::config::ServiceKind::Go(go_config)) => {
             let output_path = service::go_binary_path(go_config, name, base_dir);
@@ -163,7 +177,16 @@ pub(crate) async fn run_service_build_worker(
                 let _ = std::fs::create_dir_all(parent);
             }
             let build_args = service::go_build_args(go_config, &output_path);
-            run_preset_build_worker(base_dir, emitter, name, "go", &build_args, resolved).await
+            run_preset_build_worker(
+                base_dir,
+                emitter,
+                name,
+                "go",
+                &build_args,
+                resolved,
+                secrets,
+            )
+            .await
         }
         Some(crate::config::ServiceKind::Custom { build, .. }) => {
             if let Some(build_cmd) = build {
@@ -174,6 +197,7 @@ pub(crate) async fn run_service_build_worker(
                     &build_cmd.cmd,
                     &build_cmd.args,
                     resolved,
+                    secrets,
                 )
                 .await
             } else {
@@ -236,6 +260,7 @@ pub(crate) async fn start_service_worker(
             &context.resolved,
             context.batch_built,
             service_writer,
+            &context.secrets,
         )
         .await
         .map_err(|message| StartFailure {
@@ -257,6 +282,7 @@ pub(crate) async fn start_service_worker(
         Some(emitter),
         context.fallback_ports,
         &context.prior_docker_port_bindings,
+        &context.secrets,
     )
     .await
     .map_err(|e| StartFailure::other(e.to_string()))

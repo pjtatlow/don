@@ -107,6 +107,7 @@ pub(crate) async fn start_service(
     emitter: Option<&crate::output::LifecycleEmitter>,
     fallback_ports: bool,
     prior_docker_port_bindings: &[crate::docker::DockerPortBinding],
+    secrets: &crate::secrets::SecretStore,
 ) -> Result<StartResult, ServiceError> {
     // Dispatch based on the service kind.
     if let Some(ServiceKind::Docker(docker_config)) = &resolved.kind {
@@ -123,6 +124,8 @@ pub(crate) async fn start_service(
             &resolved.env_file,
             base_dir,
             service_writer,
+            secrets,
+            &resolved.secrets,
         )
         .await
         .map_err(|e| ServiceError::Docker(e.to_string()))?;
@@ -192,6 +195,8 @@ pub(crate) async fn start_service(
         &resolved.env,
         listen_fds_env,
     )?;
+    secrets.strip_undeclared(&mut env, &resolved.secrets);
+    secrets.inject(&mut env, &resolved.secrets);
     // Expose downloaded binaries on PATH so other services/tasks can call them.
     crate::sys::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
 

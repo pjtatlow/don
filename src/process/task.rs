@@ -62,8 +62,17 @@ pub(crate) async fn spawn_task(
     platform: Platform,
     params: &HashMap<String, String>,
     bazel_binary: Option<&str>,
+    secrets: &crate::secrets::SecretStore,
 ) -> Result<TaskSpawn, TaskError> {
-    let prepared = prepare_task_command(task, task_name, base_dir, platform, params, bazel_binary)?;
+    let prepared = prepare_task_command(
+        task,
+        task_name,
+        base_dir,
+        platform,
+        params,
+        bazel_binary,
+        secrets,
+    )?;
 
     let (handle, child_output) = spawn_process(SpawnConfig {
         cmd: &prepared.cmd,
@@ -93,6 +102,7 @@ fn prepare_task_command(
     // resolved one. Owned by the supervisor, which is the only thing that
     // sees the build outcome.
     bazel_binary: Option<&str>,
+    secrets: &crate::secrets::SecretStore,
 ) -> Result<PreparedTaskCommand, TaskError> {
     let render = |field: &str, s: &str| -> Result<String, TaskError> {
         template::render(s, params).map_err(|source| TaskError::Template {
@@ -117,9 +127,12 @@ fn prepare_task_command(
     let work_dir = work_dir.as_path();
 
     let mut env: HashMap<String, String> = std::env::vars().collect();
+    let secret_refs = task.secrets.as_deref().unwrap_or(&[]);
+    secrets.strip_undeclared(&mut env, secret_refs);
     for (k, v) in &task.env {
         env.insert(k.clone(), render(&format!("env['{k}']"), v)?);
     }
+    secrets.inject(&mut env, secret_refs);
     // Expose downloaded binaries on PATH.
     crate::sys::env::prepend_to_path(&mut env, &base_dir.join(".don").join("bin"));
     // Expose each param to the child as DON_PARAM_<NAME> so tasks can read
@@ -311,6 +324,7 @@ mod tests {
                 Platform::LinuxX86_64,
                 &HashMap::new(),
                 case.bazel_binary,
+                &crate::secrets::SecretStore::empty(),
             )
             .unwrap();
             assert_eq!(prepared.cmd, case.want_cmd, "{}: cmd", case.name);
@@ -330,6 +344,7 @@ mod tests {
             Platform::LinuxX86_64,
             &HashMap::new(),
             None,
+            &crate::secrets::SecretStore::empty(),
         )
         .unwrap_err();
         assert!(

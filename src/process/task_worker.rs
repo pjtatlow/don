@@ -45,6 +45,7 @@ pub(crate) struct TaskWorkerContext {
     /// Where every service can be reached, for rendering this task's
     /// `$(service.KEY)` env references at the moment it runs.
     pub(crate) endpoints: crate::endpoints::EndpointReader,
+    pub(crate) secrets: crate::secrets::SecretStore,
 }
 
 fn format_hash_progress(progress: TaskHashProgress) -> String {
@@ -209,6 +210,7 @@ pub(crate) async fn run_task_worker(
         // Read where the build request is built, not here.
         bazel_config: _,
         endpoints,
+        secrets,
     } = ctx;
     // Resolve `$(service.KEY)` here rather than at request time, so a run
     // picks up wherever its dependencies are reachable *now*.
@@ -382,6 +384,7 @@ pub(crate) async fn run_task_worker(
         platform,
         params,
         bazel_binary.as_deref(),
+        &secrets,
     )
     .await
     .map_err(|e| e.to_string())?;

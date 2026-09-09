@@ -13,6 +13,7 @@ mod actor;
 pub mod attach;
 pub mod emulator;
 pub(crate) mod osc;
+pub(crate) mod redact;
 pub(crate) mod ring_buffer;
 pub(crate) mod sanitize;
 
@@ -791,6 +792,8 @@ pub struct OutputManager {
     /// Broadcast tap + bounded history of the merged, formatted log stream.
     /// See [`MergedLogTap`].
     log_tap: MergedLogTap,
+    /// Replaces known secret values with `***` in process and lifecycle logs.
+    secret_redactor: redact::SecretRedactor,
 }
 
 /// A line's place in the merged stream.
@@ -1234,6 +1237,7 @@ impl OutputManager {
         let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let shed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let log_tap = MergedLogTap::with_capacity(DEFAULT_MERGED_HISTORY_CAPACITY);
+        let secret_redactor = redact::SecretRedactor::default();
         let stdout_handle = tokio::spawn(stdout_sink_task(
             stdout_rx,
             target,
@@ -1243,6 +1247,7 @@ impl OutputManager {
             mute.clone(),
             Arc::clone(&queued),
             Arc::clone(&shed),
+            secret_redactor.clone(),
         ));
         let stdout_sink = SinkHandle::Metered {
             tx: stdout_tx,
@@ -1297,6 +1302,7 @@ impl OutputManager {
                     stdout_sink.clone(),
                     mute.clone(),
                     line_filter,
+                    secret_redactor.clone(),
                 ),
             );
         }
@@ -1330,6 +1336,7 @@ impl OutputManager {
             log_filter,
             bazel_prefix: None,
             log_tap,
+            secret_redactor,
         })
     }
 
@@ -1364,6 +1371,15 @@ impl OutputManager {
     /// visible.
     pub fn set_log_filter(&self, allowlist: HashSet<String>) {
         self.log_filter.set(allowlist);
+    }
+
+    /// Install secret values to redact from logs. Call after fetch, before spawn.
+    pub fn set_secret_redactor<I, S>(&self, values: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.secret_redactor.set_values(values);
     }
 
     pub async fn register_build_tool(&mut self, name: &str) {
@@ -1502,6 +1518,7 @@ impl OutputManager {
                 self.stdout_sink.clone(),
                 self.mute.clone(),
                 CompiledLineFilter::default(),
+                self.secret_redactor.clone(),
             ),
         );
         let _ = self.services_watch.send(Arc::new(self.services.clone()));
@@ -1921,6 +1938,7 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mute: StdoutMuteControl,
     queued: Arc<std::sync::atomic::AtomicUsize>,
     shed: Arc<std::sync::atomic::AtomicU64>,
+    secret_redactor: redact::SecretRedactor,
 ) {
     use bytes::BytesMut;
 
@@ -1954,7 +1972,12 @@ async fn stdout_sink_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 }
             }
         };
-        queued.fetch_sub(msg.line.len(), Ordering::Relaxed);
+        let original_len = msg.line.len();
+        let msg = SinkLine {
+            line: Bytes::from(secret_redactor.redact_bytes(&msg.line)),
+            ..msg
+        };
+        queued.fetch_sub(original_len, Ordering::Relaxed);
 
         // Say what the send side had to drop. Reported from here so it lands
         // in the stream in order, rather than from a sender that has no idea

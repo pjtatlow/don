@@ -20,6 +20,9 @@ include = [
 
 
 [dependencies]
+aho-corasick = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ssm = "1"
 ansi-to-tui = "8"
 axum = "0.8"
 bollard = "0.21"
@@ -63,6 +66,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "1"
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tempfile = "3"
 
 # Enforce no-panics-in-production as a build-time constraint.
