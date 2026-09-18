@@ -454,8 +454,7 @@ pub async fn run_tui(
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
                 // The copy badge answers something the user just did; once it
                 // has been read it is only taking up the slot the update notice
-                // wants. OSC 52 never replies, so time is the only thing that
-                // can retire it.
+                // wants. Time is the only thing that can retire it.
                 if app
                     .copy_notice
                     .as_ref()
@@ -1672,13 +1671,12 @@ fn settle_selection(app: &mut App, store: &LogStore) {
 }
 
 /// [`settle_selection`] with the clipboard write passed in, so a test can read
-/// what would have been copied without asking the real terminal for its
-/// clipboard — OSC 52 goes straight to stdout, and a test suite that hijacks
-/// the clipboard of whoever runs it is a poor neighbour.
+/// what would have been copied without touching the real clipboard — a test
+/// suite that hijacks the clipboard of whoever runs it is a poor neighbour.
 fn settle_selection_with(
     app: &mut App,
     store: &LogStore,
-    write: impl FnOnce(&str) -> std::io::Result<()>,
+    write: impl FnOnce(&str) -> std::io::Result<selection::CopyMethod>,
 ) {
     app.log_selection.finish();
     copy_selection_with(app, store, write);
@@ -1691,7 +1689,7 @@ fn copy_selection(app: &mut App, store: &LogStore) {
 fn copy_selection_with(
     app: &mut App,
     store: &LogStore,
-    write: impl FnOnce(&str) -> std::io::Result<()>,
+    write: impl FnOnce(&str) -> std::io::Result<selection::CopyMethod>,
 ) {
     let Some(text) = selection::selected_text(&app.log_selection, &app.view_index, store) else {
         return;
@@ -1699,10 +1697,11 @@ fn copy_selection_with(
     let lines = text.lines().count();
     let now = std::time::Instant::now();
     app.copy_notice = Some(match write(&text) {
+        Ok(selection::CopyMethod::Native) => (format!("copied {lines} line(s)"), now),
         // OSC 52 is a request with no reply: a terminal that has it turned off
-        // discards it silently. Reporting what was sent is the only honest
-        // thing available — "copied" here means "asked the terminal to".
-        Ok(()) => (format!("copied {lines} line(s)"), now),
+        // discards it silently, so do not present a successful stdout write as
+        // confirmation that the clipboard changed.
+        Ok(selection::CopyMethod::Osc52) => (format!("sent {lines} line(s) via OSC 52"), now),
         Err(e) => (format!("copy failed: {e}"), now),
     });
 }
@@ -2762,10 +2761,9 @@ mod tests {
         assert_eq!(below.column, 3, "clamped to the pane's first column");
     }
 
-    /// Highlighting text copies it, without waiting for `y`. The badge is the
-    /// observable half — OSC 52 goes to the real stdout and never answers — so
-    /// that is what this reads: a notice means a copy was attempted, and no
-    /// notice means the clipboard was left alone.
+    /// Highlighting text copies it, without waiting for `y`. The write is
+    /// injected so the test can observe both the text and the transport-specific
+    /// badge without touching the real clipboard.
     #[test]
     fn settling_a_selection_copies_it() {
         use crate::output::LogId;
@@ -2775,9 +2773,11 @@ mod tests {
             from: (u64, usize),
             to: (u64, usize),
             want_copy: bool,
+            method: selection::CopyMethod,
             /// What lands on the clipboard — the log text, never the
             /// `api | ` column don itself put in front of it.
             want_text: Option<&'static str>,
+            want_notice: Option<&'static str>,
         }
 
         let cases = vec![
@@ -2786,21 +2786,27 @@ mod tests {
                 from: (1, 0),
                 to: (1, 5),
                 want_copy: true,
+                method: selection::CopyMethod::Osc52,
                 want_text: Some("hello"),
+                want_notice: Some("sent 1 line(s) via OSC 52"),
             },
             Case {
                 name: "a drag spanning two lines",
                 from: (1, 2),
                 to: (2, 4),
                 want_copy: true,
+                method: selection::CopyMethod::Native,
                 want_text: Some("llo from the api\nand"),
+                want_notice: Some("copied 2 line(s)"),
             },
             Case {
                 name: "a plain click selects nothing and copies nothing",
                 from: (1, 3),
                 to: (1, 3),
                 want_copy: false,
+                method: selection::CopyMethod::Native,
                 want_text: None,
+                want_notice: None,
             },
         ];
 
@@ -2841,7 +2847,7 @@ mod tests {
             let mut copied: Option<String> = None;
             settle_selection_with(&mut app, &store, |text| {
                 copied = Some(text.to_string());
-                Ok(())
+                Ok(case.method)
             });
 
             assert_eq!(
@@ -2854,6 +2860,12 @@ mod tests {
                 copied.as_deref(),
                 case.want_text,
                 "{}: copied text",
+                case.name
+            );
+            assert_eq!(
+                app.copy_notice.as_ref().map(|(notice, _)| notice.as_str()),
+                case.want_notice,
+                "{}: copy notice",
                 case.name
             );
         }

@@ -369,10 +369,9 @@ pub(crate) struct App {
     /// The drag in progress, or the last one that settled. Screen coordinates,
     /// so it is discarded whenever the view moves under it.
     pub(crate) log_selection: super::selection::Selection,
-    /// What the last copy did, and when it was said. OSC 52 gets no reply, so
-    /// this is the only feedback there can be — and it is transient, because a
-    /// badge that never leaves stops reading as an answer to what you just did
-    /// and starts reading as part of the furniture.
+    /// What the last copy transport did, and when it was said. This is
+    /// transient, because a badge that never leaves stops reading as an answer
+    /// to what you just did and starts reading as part of the furniture.
     pub(crate) copy_notice: Option<(String, std::time::Instant)>,
     /// A click's position, time and how many clicks have landed there in a
     /// row. Double- and triple-click are the same button event as a single

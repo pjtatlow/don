@@ -37,14 +37,19 @@
 //! knows what was selected: a double click picks a word on the press, but the
 //! reader may then drag out of it without ever letting go.
 //!
-//! ## OSC 52
+//! ## Clipboard transport
 //!
-//! Copying writes `ESC ] 52 ; c ; <base64> BEL` to the terminal, which asks it
-//! to set the system clipboard. That works over ssh and inside tmux, where
-//! reaching for a local clipboard API would not: the escape travels the same
-//! path as the rest of the output. Terminals that have it disabled ignore it,
-//! which is why the copy is also reported in the status bar — a silent no-op
-//! would be indistinguishable from success.
+//! A local macOS session writes through `pbcopy`. Everywhere else, copying
+//! writes `ESC ] 52 ; c ; <base64> BEL` to the terminal, which asks it to set
+//! the system clipboard. OSC 52 works over ssh and inside tmux, where reaching
+//! for a local clipboard API would not: the escape travels the same path as the
+//! rest of the output.
+//!
+//! OSC 52 has neither a capability probe nor a success acknowledgement. `$TERM`
+//! is not enough to infer support — Terminal.app and terminals that implement
+//! OSC 52 all commonly advertise `xterm-256color`. Known-negative terminal
+//! identities are rejected, and every other OSC 52 write is reported as sent,
+//! not confirmed copied.
 
 use super::log_store::LogStore;
 use super::logs::RowSource;
@@ -358,11 +363,97 @@ pub(crate) fn selected_text(
     )
 }
 
+/// How a successful clipboard write was transported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyMethod {
+    /// A local clipboard program exited successfully.
+    Native,
+    /// An unacknowledged request was sent to the terminal.
+    Osc52,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardStrategy {
+    NativeMacOs,
+    Osc52,
+    Unsupported,
+}
+
+/// Put `text` on the clipboard using the most reliable available transport.
+pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<CopyMethod> {
+    let remote = remote_session();
+    let term_program = std::env::var_os("TERM_PROGRAM");
+    match clipboard_strategy(cfg!(target_os = "macos"), remote, term_program.as_deref()) {
+        ClipboardStrategy::NativeMacOs => {
+            copy_with_pbcopy(text)?;
+            Ok(CopyMethod::Native)
+        }
+        ClipboardStrategy::Osc52 => {
+            write_osc52(text)?;
+            Ok(CopyMethod::Osc52)
+        }
+        ClipboardStrategy::Unsupported => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Terminal.app does not support OSC 52; hold Shift while selecting, then press Cmd+C",
+        )),
+    }
+}
+
+fn clipboard_strategy(
+    macos: bool,
+    remote: bool,
+    term_program: Option<&std::ffi::OsStr>,
+) -> ClipboardStrategy {
+    if macos && !remote {
+        ClipboardStrategy::NativeMacOs
+    } else if term_program.is_some_and(|program| program == "Apple_Terminal") {
+        ClipboardStrategy::Unsupported
+    } else {
+        ClipboardStrategy::Osc52
+    }
+}
+
+fn remote_session() -> bool {
+    ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "MOSH_CONNECTION"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+/// Write through the local macOS pasteboard helper.
+fn copy_with_pbcopy(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(text.as_bytes()),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "pbcopy stdin was not available",
+        )),
+    };
+    let status_result = child.wait();
+    write_result?;
+    let status = status_result?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "pbcopy exited with {status}"
+        )))
+    }
+}
+
 /// Ask the terminal to put `text` on the system clipboard, via OSC 52.
 ///
 /// Written straight to stdout rather than through ratatui: it is a request to
 /// the terminal, not a cell to paint, and it must not be diffed away.
-pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+fn write_osc52(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut stdout = std::io::stdout();
     let encoded = base64_encode(text.as_bytes());
@@ -402,6 +493,68 @@ fn base64_encode(input: &[u8]) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_strategy_uses_native_macos_and_rejects_terminal_app_osc52() {
+        struct Case {
+            name: &'static str,
+            macos: bool,
+            remote: bool,
+            term_program: Option<&'static str>,
+            want: ClipboardStrategy,
+        }
+
+        let cases = vec![
+            Case {
+                name: "local Terminal.app uses the macOS pasteboard",
+                macos: true,
+                remote: false,
+                term_program: Some("Apple_Terminal"),
+                want: ClipboardStrategy::NativeMacOs,
+            },
+            Case {
+                name: "every local macOS terminal uses the macOS pasteboard",
+                macos: true,
+                remote: false,
+                term_program: Some("iTerm.app"),
+                want: ClipboardStrategy::NativeMacOs,
+            },
+            Case {
+                name: "remote Terminal.app is known not to support OSC 52",
+                macos: false,
+                remote: true,
+                term_program: Some("Apple_Terminal"),
+                want: ClipboardStrategy::Unsupported,
+            },
+            Case {
+                name: "remote macOS must target the local terminal clipboard",
+                macos: true,
+                remote: true,
+                term_program: Some("iTerm.app"),
+                want: ClipboardStrategy::Osc52,
+            },
+            Case {
+                name: "unknown terminals get the portable request",
+                macos: false,
+                remote: false,
+                term_program: None,
+                want: ClipboardStrategy::Osc52,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                clipboard_strategy(
+                    case.macos,
+                    case.remote,
+                    case.term_program.map(std::ffi::OsStr::new),
+                ),
+                case.want,
+                "{}",
+                case.name
+            );
+        }
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {

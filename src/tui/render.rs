@@ -553,9 +553,8 @@ fn draw_bar(frame: &mut Frame<'_>, app: &App, box_area: Rect) {
             !app.log_selection.is_empty(),
         )
     };
-    // OSC 52 has no acknowledgement, so this line is the only sign a copy
-    // happened. It takes the right-hand slot over the update badge: the user
-    // just acted, and an answer to that beats a background notice.
+    // This takes the right-hand slot over the update badge: the user just acted,
+    // and an answer to that beats a background notice.
     let copy_badge = app.copy_notice.as_ref().map(|(notice, _)| {
         Line::from(Span::styled(
             format!(" {notice} "),

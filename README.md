@@ -118,9 +118,13 @@ Dragging to the top or bottom of the pane scrolls it, so a selection can run
 past what is on screen; hold at the edge and it keeps going, and drag right off
 the pane to speed it up.
 
-Copying goes through OSC 52, so it reaches your system clipboard over ssh and
-inside tmux. Terminals with OSC 52 disabled ignore it silently — the status bar
-reports what was sent, which is the only acknowledgement the protocol allows.
+In a local macOS session, copying goes through the native pasteboard. Elsewhere
+it uses OSC 52, so it can reach your system clipboard over ssh and inside tmux.
+OSC 52 has no portable capability check or acknowledgement: terminals with it
+disabled ignore the request silently, so the status bar says that the request
+was *sent* rather than claiming it was copied. Terminal.app is a known exception
+and does not support OSC 52, so copying from a remote session opened in it still
+needs native selection.
 
 ⌘ is not available to a terminal application: it has no encoding in the
 traditional input stream, and macOS terminals claim it for their own shortcuts
