@@ -5,7 +5,7 @@ use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::{ProcessStatus, Runner, RunnerCommand, ServiceState};
 use don::task_state::TaskStateStore;
-use helpers::config::ConfigBuilder;
+use helpers::config::{ConfigBuilder, parse_config};
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -70,7 +70,7 @@ async fn make_runner_verbose(
     base_dir: &std::path::Path,
     verbose: bool,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config
@@ -2186,7 +2186,7 @@ fn integration_don_pid_file_prevents_double_start() {
             .done()
             .build();
 
-        let config: Config = toml.parse().unwrap();
+        let config: Config = parse_config(&toml);
         config.validate(PLATFORM).unwrap();
 
         let (writer1, _buf1) = TestBuffer::new();
@@ -2213,7 +2213,7 @@ fn integration_don_pid_file_prevents_double_start() {
         _runner1.set_api_shutdown(api_shutdown);
 
         // Second runner should fail — PID file is held.
-        let config2: Config = toml.parse().unwrap();
+        let config2: Config = parse_config(&toml);
         config2.validate(PLATFORM).unwrap();
         let (writer2, _buf2) = TestBuffer::new();
         let output_manager2 = OutputManager::new(&[("svc", &LogConfig::Ignore)], writer2)

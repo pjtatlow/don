@@ -9,7 +9,7 @@ mod helpers;
 
 use don::config::{Config, LogConfig, Platform};
 use don::daemon::ProjectEntry;
-use helpers::config::ConfigBuilder;
+use helpers::config::{ConfigBuilder, parse_config};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::path::Path;
@@ -39,7 +39,7 @@ impl Harness {
             .done()
             .build();
 
-        let config: Config = toml.parse().unwrap();
+        let config: Config = parse_config(toml);
         config.validate(PLATFORM).unwrap();
         let service_configs: Vec<(&str, &LogConfig)> = config
             .services

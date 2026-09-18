@@ -77,6 +77,9 @@ pub struct Config {
     /// If unset, `don start` runs everything.
     #[serde(default)]
     pub default_profile: Option<String>,
+    /// Required. Old binaries ignore unknown keys, so they skip this field.
+    #[serde(default)]
+    pub min_version: Option<String>,
     /// File glob patterns, relative to the workspace root, ignored by all
     /// file-watch and watch-derived change detection.
     #[serde(default)]
@@ -523,6 +526,11 @@ impl Config {
     pub fn validate(&self, platform: Platform) -> Result<Vec<String>, ConfigError> {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
+        if let Some(error) =
+            min_version_error(self.min_version.as_deref(), env!("CARGO_PKG_VERSION"))
+        {
+            errors.push(error);
+        }
         let service_group_reference_names = self.profile_service_reference_names();
         let dependency_reference_names = self.dependency_reference_names();
         let profile_service_reference_names = self.profile_service_reference_names();
@@ -1200,6 +1208,26 @@ fn validate_profile_overrides(profile: &str, overrides: &toml::Value) -> Result<
     Ok(())
 }
 
+fn min_version_error(min_version: Option<&str>, binary_version: &str) -> Option<String> {
+    let Some(minimum) = min_version.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Some(format!(
+            "min_version is required (this binary is {binary_version}) — set min_version in don.toml"
+        ));
+    };
+    match crate::version::check_minimum(binary_version, minimum) {
+        crate::version::MinimumCheck::Met => None,
+        crate::version::MinimumCheck::Unmet => Some(format!(
+            "min_version = \"{minimum}\" requires don >= {minimum}, but this binary is {binary_version} — upgrade don and retry"
+        )),
+        crate::version::MinimumCheck::InvalidMinimum => Some(format!(
+            "min_version = \"{minimum}\" is not a valid version (expected major.minor.patch)"
+        )),
+        crate::version::MinimumCheck::InvalidCurrent => Some(format!(
+            "min_version = \"{minimum}\" requires don >= {minimum}, but this binary version '{binary_version}' cannot be compared — upgrade don and retry"
+        )),
+    }
+}
+
 /// Errors that can occur when loading or validating a don config.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -1481,6 +1509,22 @@ mod tests {
 
     const TEST_PLATFORM: Platform = Platform::LinuxX86_64;
 
+    fn ensure_min_version(toml: &str) -> String {
+        let has = toml.lines().any(|line| {
+            let line = line.trim_start();
+            !line.starts_with('#') && line.starts_with("min_version")
+        });
+        if has {
+            toml.to_string()
+        } else {
+            format!("min_version = \"0.0.0\"\n{toml}")
+        }
+    }
+
+    fn parse_cfg(toml: impl AsRef<str>) -> Config {
+        ensure_min_version(toml.as_ref()).parse().unwrap()
+    }
+
     /// Which `.bazelrc` configuration a target builds under: its own if it
     /// names one, else the workspace's, else none at all. Resolved once, where
     /// the build request is built, so nothing downstream has to know a
@@ -1528,7 +1572,7 @@ mod tests {
         ];
 
         for case in cases {
-            let config: Config = case.toml.parse().unwrap();
+            let config: Config = parse_cfg(case.toml);
             let workspace = config.bazel.config.as_deref();
 
             let service = config.services.get("api").unwrap().resolve(TEST_PLATFORM);
@@ -1627,7 +1671,7 @@ mod tests {
                     ),
                 ),
             ] {
-                let config: Config = toml.parse().unwrap();
+                let config: Config = parse_cfg(toml);
                 let result = config.validate(TEST_PLATFORM);
                 assert_eq!(
                     result.is_err(),
@@ -3418,7 +3462,7 @@ mod tests {
         ];
 
         for case in &cases {
-            let result = case.input.parse::<Config>();
+            let result = ensure_min_version(case.input).parse::<Config>();
             if case.expect_err {
                 assert!(
                     result.is_err(),
@@ -3508,7 +3552,7 @@ mod tests {
         ];
 
         for case in cases {
-            let config: Config = case.input.parse().unwrap();
+            let config: Config = parse_cfg(case.input);
             match (config.validate(TEST_PLATFORM), case.expected_error) {
                 (Err(ConfigError::Validation { errors }), Some(needle)) => assert!(
                     errors.iter().any(|error| error.contains(needle)),
@@ -3745,7 +3789,7 @@ mod tests {
 [services.api]
 bazel.target = "//services/api:api"
 "#;
-        let config: Config = toml.parse().unwrap();
+        let config: Config = parse_cfg(toml);
         let svc = config.services.get("api").unwrap();
         let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
             panic!("expected bazel kind");
@@ -3761,7 +3805,7 @@ bazel.target = "//services/api:api"
 bazel.target = "//services/api:api"
 bazel.watch = false
 "#;
-        let config: Config = toml.parse().unwrap();
+        let config: Config = parse_cfg(toml);
         let svc = config.services.get("api").unwrap();
         let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
             panic!("expected bazel kind");
@@ -3778,7 +3822,7 @@ cmd = "bazel"
 args = ["build", "//tools/codegen:all"]
 bazel.target = "//tools/codegen:all"
 "#;
-        let config: Config = toml.parse().unwrap();
+        let config: Config = parse_cfg(toml);
         let task = config.tasks.get("codegen").unwrap();
         assert_eq!(task.bazel.as_ref().unwrap().target, "//tools/codegen:all");
     }
@@ -3812,7 +3856,7 @@ bazel.target = "//services/api:linux"
 [services.api.platform.macos-aarch64]
 bazel.target = "//services/api:macos_arm64"
 "#;
-        let config: Config = toml.parse().unwrap();
+        let config: Config = parse_cfg(toml);
         let svc = config.services.get("api").unwrap();
 
         // Base config
@@ -4059,7 +4103,7 @@ bazel.target = "//services/api:macos_arm64"
         ];
 
         for case in cases {
-            let config: Config = case.toml.parse().unwrap();
+            let config: Config = parse_cfg(case.toml);
             let res = config.validate(TEST_PLATFORM);
             match (&res, case.want) {
                 (Ok(_), None) => {}
@@ -4120,7 +4164,7 @@ bazel.target = "//services/api:macos_arm64"
         ];
 
         for case in cases {
-            let config: Config = case.toml.parse().unwrap();
+            let config: Config = parse_cfg(case.toml);
             let result = config.validate(Platform::LinuxX86_64);
             match (result, case.want_error) {
                 (Err(ConfigError::Validation { errors }), true) => assert!(
@@ -4279,5 +4323,161 @@ bazel.target = "//services/api:macos_arm64"
         assert!(config.auto_filter_on_failure);
         assert_eq!(config.services["api"].auto_filter_on_failure, None);
         assert_eq!(config.tasks["lint"].auto_filter_on_failure, None);
+    }
+
+    #[test]
+    fn min_version_error_table() {
+        struct Case {
+            name: &'static str,
+            min: Option<&'static str>,
+            binary: &'static str,
+            want_none: bool,
+            needle: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                name: "unset",
+                min: None,
+                binary: "0.8.1",
+                want_none: false,
+                needle: Some("required"),
+            },
+            Case {
+                name: "empty",
+                min: Some(""),
+                binary: "0.8.1",
+                want_none: false,
+                needle: Some("required"),
+            },
+            Case {
+                name: "whitespace",
+                min: Some("  "),
+                binary: "0.8.1",
+                want_none: false,
+                needle: Some("required"),
+            },
+            Case {
+                name: "equal",
+                min: Some("0.8.1"),
+                binary: "0.8.1",
+                want_none: true,
+                needle: None,
+            },
+            Case {
+                name: "binary newer",
+                min: Some("0.1.0"),
+                binary: "0.8.1",
+                want_none: true,
+                needle: None,
+            },
+            Case {
+                name: "binary older",
+                min: Some("99.0.0"),
+                binary: "0.8.1",
+                want_none: false,
+                needle: Some("upgrade don"),
+            },
+            Case {
+                name: "invalid minimum",
+                min: Some("latest"),
+                binary: "0.8.1",
+                want_none: false,
+                needle: Some("not a valid version"),
+            },
+        ];
+        for case in cases {
+            let got = min_version_error(case.min, case.binary);
+            if case.want_none {
+                assert!(got.is_none(), "{}: {got:?}", case.name);
+            } else {
+                let err = got.expect(case.name);
+                let needle = case.needle.expect("needle");
+                assert!(err.contains(needle), "{}: {err}", case.name);
+                if let Some(min) = case.min.map(str::trim).filter(|value| !value.is_empty()) {
+                    assert!(err.contains(min), "{}: {err}", case.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn min_version_parses_and_gates_validate() {
+        let binary = env!("CARGO_PKG_VERSION");
+        let ok: Config = format!(
+            r#"
+                min_version = "{binary}"
+
+                [services.api]
+                run.cmd = "api"
+            "#
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(ok.min_version.as_deref(), Some(binary));
+        assert!(ok.validate(TEST_PLATFORM).is_ok());
+
+        let older_ok: Config = r#"
+            min_version = "0.0.1"
+
+            [services.api]
+            run.cmd = "api"
+        "#
+        .parse()
+        .unwrap();
+        assert!(older_ok.validate(TEST_PLATFORM).is_ok());
+
+        let too_new: Config = r#"
+            min_version = "99.0.0"
+
+            [services.api]
+            run.cmd = "api"
+        "#
+        .parse()
+        .unwrap();
+        let err = too_new.validate(TEST_PLATFORM).unwrap_err();
+        let ConfigError::Validation { errors } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            errors.iter().any(|e| e.contains("99.0.0")
+                && e.contains(binary)
+                && e.contains("upgrade don")),
+            "{errors:?}"
+        );
+
+        let invalid: Config = r#"
+            min_version = "not-a-version"
+
+            [services.api]
+            run.cmd = "api"
+        "#
+        .parse()
+        .unwrap();
+        let err = invalid.validate(TEST_PLATFORM).unwrap_err();
+        let ConfigError::Validation { errors } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            errors.iter().any(|e| e.contains("not a valid version")),
+            "{errors:?}"
+        );
+
+        let missing: Config = r#"
+            [services.api]
+            run.cmd = "api"
+        "#
+        .parse()
+        .unwrap();
+        assert!(missing.min_version.is_none());
+        let err = missing.validate(TEST_PLATFORM).unwrap_err();
+        let ConfigError::Validation { errors } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("min_version is required") && e.contains(binary)),
+            "{errors:?}"
+        );
     }
 }

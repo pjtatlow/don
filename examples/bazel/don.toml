@@ -10,6 +10,8 @@
 #
 # Run with: cargo run -- -c examples/bazel/don.toml
 
+min_version = "0.8.1"
+
 [services.api]
 bazel.target = "//services/api:api"
 proxy = { listen = "127.0.0.1:8080", env = "PORT" }

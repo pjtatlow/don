@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct ConfigBuilder {
     toml: String,
     has_service_groups_table: bool,
+    min_version: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -15,7 +16,18 @@ impl ConfigBuilder {
         Self {
             toml: String::new(),
             has_service_groups_table: false,
+            min_version: Some("0.0.0".to_string()),
         }
+    }
+
+    pub fn min_version(mut self, version: &str) -> Self {
+        self.min_version = Some(version.to_string());
+        self
+    }
+
+    pub fn omit_min_version(mut self) -> Self {
+        self.min_version = None;
+        self
     }
 
     /// Add a custom service with a run command. Call `.done()` to finalize.
@@ -116,16 +128,40 @@ impl ConfigBuilder {
 
     /// Get the generated TOML as a string.
     pub fn build(&self) -> String {
-        self.toml.clone()
+        self.render()
     }
 
     /// Write the generated TOML to `don.toml` in the given directory.
     /// Returns the path to the written file.
     pub fn write_to(&self, dir: &Path) -> PathBuf {
         let path = dir.join("don.toml");
-        std::fs::write(&path, &self.toml).unwrap();
+        std::fs::write(&path, self.render()).unwrap();
         path
     }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        if let Some(version) = &self.min_version {
+            writeln!(out, "min_version = \"{version}\"").unwrap();
+            writeln!(out).unwrap();
+        }
+        out.push_str(&self.toml);
+        out
+    }
+}
+
+pub fn parse_config(toml: impl AsRef<str>) -> don::config::Config {
+    let toml = toml.as_ref();
+    let has = toml.lines().any(|line| {
+        let line = line.trim_start();
+        !line.starts_with('#') && line.starts_with("min_version")
+    });
+    let toml = if has {
+        toml.to_string()
+    } else {
+        format!("min_version = \"0.0.0\"\n{toml}")
+    };
+    toml.parse().unwrap()
 }
 
 /// Builder for a service entry. Call `.done()` to finalize and return to `ConfigBuilder`.

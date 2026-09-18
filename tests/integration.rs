@@ -2,7 +2,7 @@
 mod helpers;
 
 use don::config::{Config, ConfigError, Platform, ServiceKind};
-use helpers::config::ConfigBuilder;
+use helpers::config::{ConfigBuilder, parse_config};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::time::Duration;
@@ -109,7 +109,7 @@ shutdown.graceful = true
 shutdown.signal = "SIGINT"
 "#;
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     config.validate(TEST_PLATFORM).unwrap();
     assert!(!config.shutdown.graceful);
     assert_eq!(config.shutdown.signal, "SIGTERM");
@@ -139,7 +139,7 @@ run.cmd = "api"
 log_filter = ["service keep [0-9]+"]
 "#;
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     config.validate(TEST_PLATFORM).unwrap();
     assert_eq!(config.log_filter.patterns, vec!["^global keep"]);
     assert_eq!(
@@ -158,7 +158,7 @@ run.cmd = "api"
 log_filter = ["["]
 "#;
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = err else {
         panic!("expected validation error");
@@ -299,7 +299,7 @@ cmd = "true"
 [[tasks.sync.params]]
 name = "timeout"
 "#;
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -419,7 +419,7 @@ fn validate_tcp_ready_check_on_listen_address_warns_body() {
         .done()
         .build();
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let warnings = config.validate(TEST_PLATFORM).unwrap();
     assert!(
         warnings
@@ -437,7 +437,7 @@ fn validate_tcp_ready_check_on_different_address_no_warning_body() {
         .done()
         .build();
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let warnings = config.validate(TEST_PLATFORM).unwrap();
     assert!(
         warnings.is_empty(),
@@ -499,6 +499,96 @@ fn don_validate_cli_missing_config_body() {
     assert!(stderr.contains("failed to read config file"));
 }
 
+fn don_validate_cli_min_version_ok_body() {
+    let dir = TempDir::new("cli-validate-min-version-ok");
+    ConfigBuilder::new()
+        .min_version(env!("CARGO_PKG_VERSION"))
+        .add_custom_service("api", "mybin", &[])
+        .done()
+        .write_to(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
+        .args([
+            "--config",
+            dir.child("don.toml").to_str().unwrap(),
+            "validate",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn don_validate_cli_min_version_mismatch_body() {
+    let dir = TempDir::new("cli-validate-min-version-mismatch");
+    ConfigBuilder::new()
+        .min_version("99.0.0")
+        .add_custom_service("api", "mybin", &[])
+        .done()
+        .write_to(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
+        .args([
+            "--config",
+            dir.child("don.toml").to_str().unwrap(),
+            "validate",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("min_version"), "{stderr}");
+    assert!(stderr.contains("99.0.0"), "{stderr}");
+    assert!(stderr.contains("upgrade don"), "{stderr}");
+}
+
+fn don_start_cli_min_version_mismatch_body() {
+    let dir = TempDir::new("cli-start-min-version-mismatch");
+    ConfigBuilder::new()
+        .min_version("99.0.0")
+        .add_custom_service("api", "mybin", &[])
+        .done()
+        .write_to(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
+        .args(["--config", dir.child("don.toml").to_str().unwrap(), "start"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("min_version"), "{stderr}");
+    assert!(stderr.contains("99.0.0"), "{stderr}");
+}
+
+
+fn don_validate_cli_min_version_missing_body() {
+    let dir = TempDir::new("cli-validate-min-version-missing");
+    ConfigBuilder::new()
+        .omit_min_version()
+        .add_custom_service("api", "mybin", &[])
+        .done()
+        .write_to(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
+        .args([
+            "--config",
+            dir.child("don.toml").to_str().unwrap(),
+            "validate",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("min_version is required"), "{stderr}");
+}
+
 // --- Download validation ---
 
 fn download_toml(extra_lines: &str) -> String {
@@ -525,7 +615,7 @@ run.cmd = "tool"
 url = "https://example.com/tool"
 sha256 = "tooshort"
 "#;
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -545,7 +635,7 @@ run.cmd = "tool"
 url = "file:///etc/passwd"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -565,7 +655,7 @@ fn validate_download_without_run_cmd_body() {
 url = "https://example.com/tool"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -580,7 +670,7 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 fn validate_valid_download_config_passes_body() {
     let toml = download_toml("");
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     assert!(config.validate(TEST_PLATFORM).is_ok());
 }
 
@@ -602,7 +692,7 @@ url = "https://example.com/v24.tgz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
 path = "cockroach-v24/cockroach"
 "#;
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -636,7 +726,7 @@ url = "https://example.com/v24.tgz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
 path = "cockroach-v24/cockroach"
 "#;
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     assert!(
         config.validate(TEST_PLATFORM).is_ok(),
         "explicit bin_names should resolve the collision"
@@ -653,7 +743,7 @@ run.cmd = "tool"
 url = "https://example.com/tool-mac.tar.gz"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     let warnings = config.validate(TEST_PLATFORM).unwrap();
     assert!(
         warnings
@@ -706,7 +796,7 @@ env = { OWN = "yes", SHARED = "service" }
 cmd = "migrate"
 "#;
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
 
     let api = &config.services["api"];
     assert_eq!(
@@ -772,6 +862,22 @@ bounded_test!(
 bounded_test!(
     don_validate_cli_missing_config,
     don_validate_cli_missing_config_body
+);
+bounded_test!(
+    don_validate_cli_min_version_ok,
+    don_validate_cli_min_version_ok_body
+);
+bounded_test!(
+    don_validate_cli_min_version_mismatch,
+    don_validate_cli_min_version_mismatch_body
+);
+bounded_test!(
+    don_start_cli_min_version_mismatch,
+    don_start_cli_min_version_mismatch_body
+);
+bounded_test!(
+    don_validate_cli_min_version_missing,
+    don_validate_cli_min_version_missing_body
 );
 bounded_test!(
     validate_download_bad_sha256_length,

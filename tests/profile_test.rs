@@ -7,7 +7,7 @@ use don::config::resolve_profile_processes;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::ConfigBuilder;
+use helpers::config::{ConfigBuilder, parse_config};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
@@ -166,7 +166,7 @@ fn resolve_profile_transitive_deps() {
     ];
 
     for case in cases {
-        let config: Config = case.toml.parse().unwrap();
+        let config: Config = parse_config(case.toml);
         let profile = config.profiles.get(case.profile_name).unwrap();
         let result = resolve_profile_processes(&config, profile);
         let mut result_sorted: Vec<String> = result.into_iter().collect();
@@ -248,7 +248,7 @@ async fn spawn_runner_with_profile(
     let config_path = base_dir.join("don.toml");
     std::fs::write(&config_path, toml).unwrap();
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config

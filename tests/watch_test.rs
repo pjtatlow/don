@@ -4,7 +4,7 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::ConfigBuilder;
+use helpers::config::{ConfigBuilder, parse_config};
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
@@ -57,7 +57,7 @@ async fn make_runner(
     toml: &str,
     base_dir: &std::path::Path,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config
@@ -101,7 +101,7 @@ async fn make_runner_verbose(
     toml: &str,
     base_dir: &std::path::Path,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     config.validate(PLATFORM).unwrap();
 
     let all_configs: Vec<(&str, &LogConfig)> = config

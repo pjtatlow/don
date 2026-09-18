@@ -6,7 +6,7 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::{Runner, RunnerEvent, ServiceState};
-use helpers::config::ConfigBuilder;
+use helpers::config::{ConfigBuilder, parse_config};
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -91,7 +91,7 @@ async fn spawn_runner_with<F: FnOnce(&OutputManager)>(
     let config_path = base_dir.join("don.toml");
     std::fs::write(&config_path, toml).unwrap();
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config
@@ -141,7 +141,7 @@ async fn make_runner(
     let config_path = base_dir.join("don.toml");
     std::fs::write(&config_path, toml).unwrap();
 
-    let config: Config = toml.parse().unwrap();
+    let config: Config = parse_config(toml);
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config

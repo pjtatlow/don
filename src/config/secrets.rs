@@ -201,7 +201,8 @@ mod tests {
             },
         ];
         for case in cases {
-            let config: Config = case.don.parse().unwrap();
+            let don = format!("min_version = \"0.0.0\"\n{}", case.don);
+            let config: Config = don.parse().unwrap();
             let result = config.validate(Platform::LinuxX86_64);
             match (case.want_err, result) {
                 (None, Ok(_)) => {}

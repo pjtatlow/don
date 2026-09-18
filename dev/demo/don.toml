@@ -11,6 +11,8 @@
 #
 # Nothing here should need anything but bash.
 
+min_version = "0.8.1"
+
 [services.chatty]
 run.cmd = "bash"
 run.args = [

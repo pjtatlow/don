@@ -1,8 +1,8 @@
 //! `don init` — scaffold a starter `don.toml` for a new project.
 //!
 //! Writes a commented template showing each preset (run, docker, rust, go,
-//! bazel) plus tasks and profiles. The file is meant to be edited;
-//! every section is commented out so `don validate` passes on the raw output.
+//! bazel) plus tasks and profiles. `min_version` is required and uncommented
+//! so `don validate` passes on the raw output.
 
 use std::path::Path;
 
@@ -16,6 +16,8 @@ const STARTER_TEMPLATE: &str = r#"# don — dev environment orchestrator.
 # Prefer the configured proxy/Docker host ports, but use OS-assigned ports when
 # those ports are already occupied. Discover actual values with `don ports`.
 # fallback_ports = true
+# Required. Old don binaries ignore this key; this don refuses to start without it.
+min_version = "__DON_VERSION__"
 
 # ── Services ────────────────────────────────────────────────────────────────
 # Long-running processes. Don keeps them alive and restarts on file changes.
@@ -96,9 +98,14 @@ pub fn write_starter_config(path: &Path, force: bool) -> Result<(), String> {
             path.display()
         ));
     }
-    std::fs::write(path, STARTER_TEMPLATE)
+    std::fs::write(path, starter_template())
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
+
+fn starter_template() -> String {
+    STARTER_TEMPLATE.replace("__DON_VERSION__", env!("CARGO_PKG_VERSION"))
+}
+
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -163,7 +170,15 @@ mod tests {
 
     #[test]
     fn starter_template_is_valid_toml() {
-        let parsed: toml::Value = toml::from_str(STARTER_TEMPLATE).unwrap();
-        assert!(parsed.as_table().unwrap().is_empty());
+        let template = starter_template();
+        let config: crate::config::Config = template.parse().unwrap();
+        assert_eq!(
+            config.min_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        config
+            .validate(crate::config::Platform::LinuxX86_64)
+            .unwrap();
     }
 }
+

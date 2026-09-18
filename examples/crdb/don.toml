@@ -18,6 +18,8 @@
 # the migrate task tries to connect). The random port is injected via
 # ${CRDB_PORT} in the CLI args.
 # ──────────────────────────────────────────────────────────────────────────────
+min_version = "0.8.1"
+
 [services.crdb]
 run.cmd = "cockroach"
 run.args = [

@@ -4,6 +4,8 @@
 # Don will wait 3s for graceful shutdown, then SIGKILL it.
 # The "good" service exits immediately on SIGTERM for contrast.
 
+min_version = "0.8.1"
+
 [services.good]
 run.cmd = "bash"
 run.args = ["-c", "while true; do echo 'good service working'; sleep 2; done"]
