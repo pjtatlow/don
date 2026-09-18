@@ -556,6 +556,25 @@ mod tests {
         }
     }
 
+    /// Exercise the real pasteboard only on an isolated macOS CI runner. A
+    /// normal local test run must never replace the developer's clipboard.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_macos_clipboard_round_trips_in_ci() {
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let text = "don macOS clipboard smoke test";
+        assert_eq!(copy_to_clipboard(text).unwrap(), CopyMethod::Native);
+
+        let output = std::process::Command::new("/usr/bin/pbpaste")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "pbpaste failed: {}", output.status);
+        assert_eq!(output.stdout, text.as_bytes());
+    }
+
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {
         struct Case {
