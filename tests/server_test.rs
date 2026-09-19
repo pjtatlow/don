@@ -4,7 +4,7 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::{ConfigBuilder, parse_config};
+use helpers::config::ConfigBuilder;
 use helpers::port::free_port;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
@@ -135,7 +135,7 @@ async fn spawn_runner(
     mpsc::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config

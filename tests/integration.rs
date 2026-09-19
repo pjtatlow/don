@@ -2,7 +2,7 @@
 mod helpers;
 
 use don::config::{Config, ConfigError, Platform, ServiceKind};
-use helpers::config::{ConfigBuilder, parse_config};
+use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::time::Duration;
@@ -65,10 +65,9 @@ fn validate_malformed_toml_body() {
     assert!(matches!(err, ConfigError::Parse(_)));
 }
 
-fn validate_empty_config_is_valid_body() {
+fn validate_config_with_only_min_version_is_valid_body() {
     let dir = TempDir::new("validate-empty");
-    let config_path = dir.child("don.toml");
-    std::fs::write(&config_path, "").unwrap();
+    let config_path = ConfigBuilder::new().write_to(dir.path());
 
     let config = Config::from_file(&config_path).unwrap();
     assert!(config.validate(TEST_PLATFORM).is_ok());
@@ -96,6 +95,7 @@ fn validate_config_with_tasks_and_profiles_body() {
 
 fn validate_shutdown_graceful_flags_body() {
     let toml = r#"
+min_version = "0.0.0"
 [shutdown]
 graceful = false
 
@@ -109,7 +109,7 @@ shutdown.graceful = true
 shutdown.signal = "SIGINT"
 "#;
 
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(TEST_PLATFORM).unwrap();
     assert!(!config.shutdown.graceful);
     assert_eq!(config.shutdown.signal, "SIGTERM");
@@ -132,6 +132,7 @@ shutdown.signal = "SIGINT"
 
 fn validate_log_filter_keep_regex_body() {
     let toml = r#"
+min_version = "0.0.0"
 log_filter = ["^global keep"]
 
 [services.api]
@@ -139,7 +140,7 @@ run.cmd = "api"
 log_filter = ["service keep [0-9]+"]
 "#;
 
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(TEST_PLATFORM).unwrap();
     assert_eq!(config.log_filter.patterns, vec!["^global keep"]);
     assert_eq!(
@@ -153,12 +154,13 @@ log_filter = ["service keep [0-9]+"]
 
 fn validate_log_filter_rejects_invalid_regex_body() {
     let toml = r#"
+min_version = "0.0.0"
 [services.api]
 run.cmd = "api"
 log_filter = ["["]
 "#;
 
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = err else {
         panic!("expected validation error");
@@ -197,6 +199,7 @@ fn config_from_file_merges_local_override_body() {
         std::fs::write(
             &config_path,
             r#"
+min_version = "0.0.0"
 default_profile = "base"
 watch_ignore = ["target/**"]
 
@@ -219,6 +222,7 @@ tasks = ["migrate"]
         std::fs::write(
             dir.child(case.local_name),
             r#"
+min_version = "0.0.0"
 default_profile = "local"
 watch_ignore = ["node_modules/**"]
 
@@ -283,8 +287,7 @@ tasks = ["migrate"]
 
 fn malformed_local_override_is_parse_error_body() {
     let dir = TempDir::new("local-override-malformed");
-    let config_path = dir.child("don.toml");
-    std::fs::write(&config_path, "").unwrap();
+    let config_path = ConfigBuilder::new().write_to(dir.path());
     std::fs::write(dir.child("don.local.toml"), "this is not [valid toml").unwrap();
 
     let err = Config::from_file(&config_path).unwrap_err();
@@ -293,13 +296,14 @@ fn malformed_local_override_is_parse_error_body() {
 
 fn validate_task_params_reject_run_flag_collisions_body() {
     let toml = r#"
+min_version = "0.0.0"
 [tasks.sync]
 cmd = "true"
 
 [[tasks.sync.params]]
 name = "timeout"
 "#;
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -419,7 +423,7 @@ fn validate_tcp_ready_check_on_listen_address_warns_body() {
         .done()
         .build();
 
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let warnings = config.validate(TEST_PLATFORM).unwrap();
     assert!(
         warnings
@@ -437,7 +441,7 @@ fn validate_tcp_ready_check_on_different_address_no_warning_body() {
         .done()
         .build();
 
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let warnings = config.validate(TEST_PLATFORM).unwrap();
     assert!(
         warnings.is_empty(),
@@ -594,6 +598,7 @@ fn don_validate_cli_min_version_missing_body() {
 fn download_toml(extra_lines: &str) -> String {
     format!(
         r#"
+min_version = "0.0.0"
 [services.tool]
 run.cmd = "tool"
 
@@ -608,6 +613,7 @@ path = "tool"
 
 fn validate_download_bad_sha256_length_body() {
     let toml = r#"
+min_version = "0.0.0"
 [services.tool]
 run.cmd = "tool"
 
@@ -615,7 +621,7 @@ run.cmd = "tool"
 url = "https://example.com/tool"
 sha256 = "tooshort"
 "#;
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -628,6 +634,7 @@ sha256 = "tooshort"
 
 fn validate_download_bad_url_scheme_body() {
     let toml = r#"
+min_version = "0.0.0"
 [services.tool]
 run.cmd = "tool"
 
@@ -635,7 +642,7 @@ run.cmd = "tool"
 url = "file:///etc/passwd"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -649,13 +656,14 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 fn validate_download_without_run_cmd_body() {
     // Download but no run.cmd → should error.
     let toml = r#"
+min_version = "0.0.0"
 [services.tool]
 
 [services.tool.download.platform.linux-x86_64]
 url = "https://example.com/tool"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -670,7 +678,7 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 fn validate_valid_download_config_passes_body() {
     let toml = download_toml("");
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     assert!(config.validate(TEST_PLATFORM).is_ok());
 }
 
@@ -678,6 +686,7 @@ fn validate_download_bin_name_collision_body() {
     // Two services download different binaries that would both link to
     // `.don/bin/cockroach` — must error unless disambiguated.
     let toml = r#"
+min_version = "0.0.0"
 [services.crdb_v25]
 run.cmd = "cockroach"
 [services.crdb_v25.download.platform.linux-x86_64]
@@ -692,7 +701,7 @@ url = "https://example.com/v24.tgz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
 path = "cockroach-v24/cockroach"
 "#;
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let err = config.validate(TEST_PLATFORM).unwrap_err();
     let ConfigError::Validation { errors } = &err else {
         panic!("expected validation error");
@@ -708,6 +717,7 @@ path = "cockroach-v24/cockroach"
 fn validate_download_bin_name_override_resolves_collision_body() {
     // Same two-crdb setup but with explicit bin_names → passes.
     let toml = r#"
+min_version = "0.0.0"
 [services.crdb_v25]
 run.cmd = "cockroach"
 [services.crdb_v25.download]
@@ -726,7 +736,7 @@ url = "https://example.com/v24.tgz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000002"
 path = "cockroach-v24/cockroach"
 "#;
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     assert!(
         config.validate(TEST_PLATFORM).is_ok(),
         "explicit bin_names should resolve the collision"
@@ -736,6 +746,7 @@ path = "cockroach-v24/cockroach"
 fn validate_download_missing_current_platform_warns_body() {
     // TEST_PLATFORM is LinuxX86_64. Provide only macos entries — should warn.
     let toml = r#"
+min_version = "0.0.0"
 [services.tool]
 run.cmd = "tool"
 
@@ -743,7 +754,7 @@ run.cmd = "tool"
 url = "https://example.com/tool-mac.tar.gz"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 "#;
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     let warnings = config.validate(TEST_PLATFORM).unwrap();
     assert!(
         warnings
@@ -765,8 +776,8 @@ bounded_test!(
 );
 bounded_test!(validate_malformed_toml, validate_malformed_toml_body);
 bounded_test!(
-    validate_empty_config_is_valid,
-    validate_empty_config_is_valid_body
+    validate_config_with_only_min_version_is_valid,
+    validate_config_with_only_min_version_is_valid_body
 );
 bounded_test!(
     validate_config_with_tasks_and_profiles,
@@ -786,6 +797,7 @@ bounded_test!(
 );
 fn global_env_reaches_every_process_body() {
     let toml = r#"
+min_version = "0.0.0"
 env = { CONF_PATH = "conf.sh.dev", SHARED = "global" }
 
 [services.api]
@@ -796,7 +808,7 @@ env = { OWN = "yes", SHARED = "service" }
 cmd = "migrate"
 "#;
 
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
 
     let api = &config.services["api"];
     assert_eq!(

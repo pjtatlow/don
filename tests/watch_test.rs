@@ -4,7 +4,7 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::{ConfigBuilder, parse_config};
+use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
@@ -57,7 +57,7 @@ async fn make_runner(
     toml: &str,
     base_dir: &std::path::Path,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config
@@ -101,7 +101,7 @@ async fn make_runner_verbose(
     toml: &str,
     base_dir: &std::path::Path,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
     let all_configs: Vec<(&str, &LogConfig)> = config
@@ -215,6 +215,7 @@ fn integration_global_watch_ignore_is_silent_in_verbose() {
         std::fs::write(dir.path().join("watched/a.txt"), "init").unwrap();
 
         let toml = r#"
+min_version = "0.0.0"
 watch_ignore = ["**/ignored/**"]
 
 [services.app]
@@ -281,6 +282,7 @@ fn integration_new_dir_at_runtime_triggers_rebuild() {
         std::fs::write(dir.path().join("src/main.rs"), "v1").unwrap();
 
         let toml = r#"
+min_version = "0.0.0"
 watch_ignore = ["**/node_modules/**"]
 
 [services.api]
@@ -332,6 +334,7 @@ fn integration_deep_new_dir_tree_at_runtime_triggers_rebuild() {
         std::fs::write(dir.path().join("src/main.rs"), "v1").unwrap();
 
         let toml = r#"
+min_version = "0.0.0"
 watch_ignore = ["**/node_modules/**"]
 
 [services.api]
@@ -385,6 +388,7 @@ fn integration_runtime_node_modules_is_not_watched() {
         std::fs::write(dir.path().join("src/main.rs"), "v1").unwrap();
 
         let toml = r#"
+min_version = "0.0.0"
 watch_ignore = ["**/node_modules/**"]
 
 [services.api]
@@ -1088,6 +1092,7 @@ fn integration_don_and_git_directories_are_never_watched() {
 
             // A project-wide glob, which is what pulls the dot directories in.
             let toml = r#"
+min_version = "0.0.0"
 [services.app]
 run.cmd = "bash"
 run.args = ["-c", "sleep 60"]
@@ -1144,6 +1149,7 @@ fn integration_unmatched_event_does_not_narrate_every_item() {
         // Three services watching the same thing: enough that a per-item
         // fan-out is unmistakable in the count.
         let toml = r#"
+min_version = "0.0.0"
 [services.one]
 run.cmd = "bash"
 run.args = ["-c", "sleep 60"]

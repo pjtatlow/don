@@ -150,20 +150,6 @@ impl ConfigBuilder {
     }
 }
 
-pub fn parse_config(toml: impl AsRef<str>) -> don::config::Config {
-    let toml = toml.as_ref();
-    let has = toml.lines().any(|line| {
-        let line = line.trim_start();
-        !line.starts_with('#') && line.starts_with("min_version")
-    });
-    let toml = if has {
-        toml.to_string()
-    } else {
-        format!("min_version = \"0.0.0\"\n{toml}")
-    };
-    toml.parse().unwrap()
-}
-
 /// Builder for a service entry. Call `.done()` to finalize and return to `ConfigBuilder`.
 pub struct ServiceBuilder {
     builder: ConfigBuilder,

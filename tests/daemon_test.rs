@@ -12,7 +12,7 @@ use don::config::{Config, LogConfig, Platform};
 use don::daemon::{DaemonClient, DaemonOptions, DaemonPaths};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::{ConfigBuilder, parse_config};
+use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::path::Path;
@@ -66,7 +66,7 @@ async fn spawn_runner(
     base_dir: &Path,
     daemon_socket: Option<std::path::PathBuf>,
 ) -> (mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
     let all_configs: Vec<(&str, &LogConfig)> = config

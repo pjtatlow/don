@@ -9,7 +9,6 @@ use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::ports::{manifest_path, read_manifest};
 use don::runner::Runner;
-use helpers::config::parse_config;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
@@ -74,7 +73,7 @@ async fn make_runner(
     toml: &str,
     base_dir: &std::path::Path,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config
@@ -154,6 +153,7 @@ fn docker_service_starts_and_outputs() {
 
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.echo-svc]
 docker.image = "alpine:latest"
 docker.container = "{container_name}"
@@ -202,6 +202,7 @@ fn docker_service_env_file_reaches_container() {
 
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.envcheck]
 docker.image = "alpine:latest"
 docker.container = "{container_name}"
@@ -269,6 +270,7 @@ fn docker_service_builds_from_dockerfile_without_image() {
         // don-<service> automatically.
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.buildsvc]
 docker.container = "{container_name}"
 docker.build.context = "."
@@ -310,6 +312,7 @@ fn docker_service_with_port_mapping() {
         // Use nginx to serve on a mapped port.
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.web]
 docker.image = "nginx:alpine"
 docker.container = "{container_name}"
@@ -360,6 +363,7 @@ fn docker_service_falls_back_from_occupied_host_port() {
 
         let toml = format!(
             r#"
+min_version = "0.0.0"
 fallback_ports = true
 
 [services.web]
@@ -464,6 +468,7 @@ fn docker_stale_container_cleaned_up() {
         // Now start don with the same container name — it should clean up the stale one.
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.db]
 docker.image = "alpine:latest"
 docker.container = "{container_name}"
@@ -512,6 +517,7 @@ fn docker_build_and_run() {
 
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.app]
 docker.image = "don-test-build-img:latest"
 docker.container = "{container_name}"

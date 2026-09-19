@@ -7,7 +7,7 @@ use don::config::resolve_profile_processes;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::{ConfigBuilder, parse_config};
+use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,7 @@ fn resolve_profile_transitive_deps() {
         Case {
             name: "direct services only",
             toml: r#"
+min_version = "0.0.0"
                 [services.api]
                 run.cmd = "api"
                 [services.worker]
@@ -44,6 +45,7 @@ fn resolve_profile_transitive_deps() {
         Case {
             name: "transitive dep chain: api -> migrate -> postgres",
             toml: r#"
+min_version = "0.0.0"
                 [services.postgres]
                 run.cmd = "pg"
                 [tasks.migrate]
@@ -61,6 +63,7 @@ fn resolve_profile_transitive_deps() {
         Case {
             name: "overlapping deps — no duplicates",
             toml: r#"
+min_version = "0.0.0"
                 [services.db]
                 run.cmd = "db"
                 [services.api]
@@ -78,6 +81,7 @@ fn resolve_profile_transitive_deps() {
         Case {
             name: "profile with only tasks",
             toml: r#"
+min_version = "0.0.0"
                 [services.postgres]
                 run.cmd = "pg"
                 [tasks.migrate]
@@ -92,6 +96,7 @@ fn resolve_profile_transitive_deps() {
         Case {
             name: "profile with tasks and services",
             toml: r#"
+min_version = "0.0.0"
                 [services.db]
                 run.cmd = "db"
                 [services.api]
@@ -110,6 +115,7 @@ fn resolve_profile_transitive_deps() {
         Case {
             name: "profile expands service groups and dependency groups",
             toml: r#"
+min_version = "0.0.0"
                 [services.postgres]
                 run.cmd = "pg"
                 [services.redis]
@@ -128,6 +134,7 @@ fn resolve_profile_transitive_deps() {
         Case {
             name: "profile expands nested service groups",
             toml: r#"
+min_version = "0.0.0"
                 [services.postgres]
                 run.cmd = "pg"
                 [services.redis]
@@ -146,6 +153,7 @@ fn resolve_profile_transitive_deps() {
         Case {
             name: "profile picks up group-level depends_on transitively",
             toml: r#"
+min_version = "0.0.0"
                 [services.api]
                 run.cmd = "api"
                 [services.web]
@@ -166,7 +174,7 @@ fn resolve_profile_transitive_deps() {
     ];
 
     for case in cases {
-        let config: Config = parse_config(case.toml);
+        let config: Config = case.toml.parse().unwrap();
         let profile = config.profiles.get(case.profile_name).unwrap();
         let result = resolve_profile_processes(&config, profile);
         let mut result_sorted: Vec<String> = result.into_iter().collect();
@@ -248,7 +256,7 @@ async fn spawn_runner_with_profile(
     let config_path = base_dir.join("don.toml");
     std::fs::write(&config_path, toml).unwrap();
 
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config
@@ -474,6 +482,7 @@ fn profile_service_group_starts_group_members() {
 /// A base file whose `prod` profile retargets the same services the `dev`
 /// profile runs — the local-prod shape: same stack, different conf.
 const OVERRIDE_CONFIG: &str = r#"
+min_version = "0.0.0"
 default_profile = "dev"
 
 [services.api]
@@ -601,6 +610,7 @@ fn local_file_outranks_profile_overrides_and_can_move_the_active_profile() {
         OVERRIDE_CONFIG,
         Some(
             r#"
+min_version = "0.0.0"
 default_profile = "prod"
 
 [services.api]
@@ -641,6 +651,7 @@ fn bad_profile_overrides_are_rejected_with_actionable_errors() {
         Case {
             name: "misspelled overrides key",
             toml: r#"
+min_version = "0.0.0"
                 [services.api]
                 run.cmd = "api"
                 [profiles.prod]
@@ -653,6 +664,7 @@ fn bad_profile_overrides_are_rejected_with_actionable_errors() {
         Case {
             name: "overrides selecting another profile",
             toml: r#"
+min_version = "0.0.0"
                 [services.api]
                 run.cmd = "api"
                 [profiles.prod]
@@ -665,6 +677,7 @@ fn bad_profile_overrides_are_rejected_with_actionable_errors() {
         Case {
             name: "overrides redefining profiles",
             toml: r#"
+min_version = "0.0.0"
                 [services.api]
                 run.cmd = "api"
                 [profiles.prod]
@@ -702,6 +715,7 @@ fn profile_overrides_retarget_the_global_env() {
     let config_path = write_config(
         &dir,
         r#"
+min_version = "0.0.0"
 default_profile = "dev"
 env = { CONF_PATH = "conf.sh.dev" }
 

@@ -9,7 +9,7 @@ use don::client::Client;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::{ConfigBuilder, parse_config};
+use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ const PLATFORM: Platform = Platform::LinuxX86_64;
 /// shutdown sender, and the join handle. Mirrors the pattern in
 /// tests/server_test.rs.
 async fn spawn_runner(toml: &str, base_dir: &Path) -> (PathBuf, mpsc::Sender<()>, JoinHandle<()>) {
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config
@@ -579,6 +579,7 @@ fn validate_show_prints_the_merged_config() {
         std::fs::write(
             &config_path,
             r#"
+min_version = "0.0.0"
 default_profile = "dev"
 
 [services.api]

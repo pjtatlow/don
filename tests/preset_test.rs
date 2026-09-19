@@ -4,7 +4,7 @@ mod helpers;
 use don::config::{Config, LogConfig, Platform};
 use don::output::OutputManager;
 use don::runner::Runner;
-use helpers::config::{ConfigBuilder, parse_config};
+use helpers::config::ConfigBuilder;
 use helpers::tempdir::TempDir;
 use helpers::timeout::run_with_timeout;
 use std::sync::{Arc, Mutex};
@@ -56,7 +56,7 @@ async fn make_runner(
     toml: &str,
     base_dir: &std::path::Path,
 ) -> (Runner, mpsc::Sender<()>, Arc<Mutex<Vec<u8>>>) {
-    let config: Config = parse_config(toml);
+    let config: Config = toml.parse().unwrap();
     config.validate(PLATFORM).unwrap();
 
     let service_configs: Vec<(&str, &LogConfig)> = config
@@ -204,6 +204,7 @@ func main() {
         // stamping so the test isn't subject to the host's temp-parent
         // VCS state — see the matching note in `go_preset_builds_and_runs`.
         let toml = r#"
+min_version = "0.0.0"
 [services.api]
 go.package = "."
 go.ldflags = "-X main.version=1.2.3"
