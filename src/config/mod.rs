@@ -1509,22 +1509,6 @@ mod tests {
 
     const TEST_PLATFORM: Platform = Platform::LinuxX86_64;
 
-    fn ensure_min_version(toml: &str) -> String {
-        let has = toml.lines().any(|line| {
-            let line = line.trim_start();
-            !line.starts_with('#') && line.starts_with("min_version")
-        });
-        if has {
-            toml.to_string()
-        } else {
-            format!("min_version = \"0.0.0\"\n{toml}")
-        }
-    }
-
-    fn parse_cfg(toml: impl AsRef<str>) -> Config {
-        ensure_min_version(toml.as_ref()).parse().unwrap()
-    }
-
     /// Which `.bazelrc` configuration a target builds under: its own if it
     /// names one, else the workspace's, else none at all. Resolved once, where
     /// the build request is built, so nothing downstream has to know a
@@ -1541,14 +1525,14 @@ mod tests {
         let cases = vec![
             Case {
                 name: "nothing named anywhere",
-                toml: "[services.api]\nbazel.target = \"//api\"\n\
+                toml: "min_version = \"0.0.0\"\n[services.api]\nbazel.target = \"//api\"\n\
                        [tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\n",
                 want_service: None,
                 want_task: None,
             },
             Case {
                 name: "the workspace names one and both inherit it",
-                toml: "[bazel]\nconfig = \"don\"\n\
+                toml: "min_version = \"0.0.0\"\n[bazel]\nconfig = \"don\"\n\
                        [services.api]\nbazel.target = \"//api\"\n\
                        [tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\n",
                 want_service: Some("don"),
@@ -1556,7 +1540,7 @@ mod tests {
             },
             Case {
                 name: "an item that names its own overrides the workspace",
-                toml: "[bazel]\nconfig = \"don\"\n\
+                toml: "min_version = \"0.0.0\"\n[bazel]\nconfig = \"don\"\n\
                        [services.api]\nbazel.target = \"//api\"\nbazel.config = \"api-dev\"\n\
                        [tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\nbazel.config = \"gen\"\n",
                 want_service: Some("api-dev"),
@@ -1564,7 +1548,7 @@ mod tests {
             },
             Case {
                 name: "an item may name one where the workspace does not",
-                toml: "[services.api]\nbazel.target = \"//api\"\nbazel.config = \"api-dev\"\n\
+                toml: "min_version = \"0.0.0\"\n[services.api]\nbazel.target = \"//api\"\nbazel.config = \"api-dev\"\n\
                        [tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\n",
                 want_service: Some("api-dev"),
                 want_task: None,
@@ -1572,7 +1556,7 @@ mod tests {
         ];
 
         for case in cases {
-            let config: Config = parse_cfg(case.toml);
+            let config: Config = case.toml.parse().unwrap();
             let workspace = config.bazel.config.as_deref();
 
             let service = config.services.get("api").unwrap().resolve(TEST_PLATFORM);
@@ -1652,26 +1636,26 @@ mod tests {
                 (
                     "global",
                     format!(
-                        "[bazel]\nconfig = \"{}\"\n[services.api]\nbazel.target = \"//api\"\n",
+                        "min_version = \"0.0.0\"\n[bazel]\nconfig = \"{}\"\n[services.api]\nbazel.target = \"//api\"\n",
                         case.config
                     ),
                 ),
                 (
                     "service",
                     format!(
-                        "[services.api]\nbazel.target = \"//api\"\nbazel.config = \"{}\"\n",
+                        "min_version = \"0.0.0\"\n[services.api]\nbazel.target = \"//api\"\nbazel.config = \"{}\"\n",
                         case.config
                     ),
                 ),
                 (
                     "task",
                     format!(
-                        "[tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\nbazel.config = \"{}\"\n",
+                        "min_version = \"0.0.0\"\n[tasks.gen]\ncmd = \"true\"\nbazel.target = \"//gen\"\nbazel.config = \"{}\"\n",
                         case.config
                     ),
                 ),
             ] {
-                let config: Config = parse_cfg(toml);
+                let config: Config = toml.parse().unwrap();
                 let result = config.validate(TEST_PLATFORM);
                 assert_eq!(
                     result.is_err(),
@@ -1913,6 +1897,7 @@ mod tests {
             ConfigTestCase {
                 name: "docker service builds without an explicit image",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.db]
                     docker.build.context = "."
                     docker.ports = ["5432:5432"]
@@ -1933,6 +1918,7 @@ mod tests {
             ConfigTestCase {
                 name: "docker service without image or build is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.db]
                     docker.ports = ["5432:5432"]
                 "#,
@@ -2286,6 +2272,7 @@ mod tests {
             ConfigTestCase {
                 name: "task with file watching",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.postgres]
                     docker.image = "postgres:16"
                     [services.postgres.ready]
@@ -2328,6 +2315,7 @@ mod tests {
             ConfigTestCase {
                 name: "task with no watch always runs",
                 input: r#"
+                    min_version = "0.0.0"
                     [tasks.setup]
                     cmd = "echo"
                     args = ["hello"]
@@ -2343,6 +2331,7 @@ mod tests {
             ConfigTestCase {
                 name: "service depends on task",
                 input: r#"
+                    min_version = "0.0.0"
                     [tasks.migrate]
                     cmd = "dbmate"
                     args = ["up"]
@@ -2359,6 +2348,7 @@ mod tests {
             ConfigTestCase {
                 name: "task depends on unknown name is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [tasks.migrate]
                     cmd = "dbmate"
                     args = ["up"]
@@ -2378,6 +2368,7 @@ mod tests {
             ConfigTestCase {
                 name: "service and task with same name is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.foo]
                     run.cmd = "foo"
 
@@ -2396,6 +2387,7 @@ mod tests {
             ConfigTestCase {
                 name: "service depends on unknown name is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     depends_on = ["ghost"]
@@ -2412,6 +2404,7 @@ mod tests {
             ConfigTestCase {
                 name: "service groups are valid in dependencies and profiles",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.postgres]
                     run.cmd = "postgres"
 
@@ -2444,6 +2437,7 @@ mod tests {
             ConfigTestCase {
                 name: "service groups can reference other service groups",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.postgres]
                     run.cmd = "postgres"
 
@@ -2480,6 +2474,7 @@ mod tests {
             ConfigTestCase {
                 name: "service group with unknown service is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
 
@@ -2501,6 +2496,7 @@ mod tests {
             ConfigTestCase {
                 name: "service group cycle is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
 
@@ -2520,6 +2516,7 @@ mod tests {
             ConfigTestCase {
                 name: "service group name colliding with service is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
 
@@ -2540,6 +2537,7 @@ mod tests {
             ConfigTestCase {
                 name: "dependency cycle is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.a]
                     run.cmd = "a"
                     depends_on = ["b"]
@@ -2564,6 +2562,7 @@ mod tests {
             ConfigTestCase {
                 name: "service group with depends_on parses",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
 
@@ -2585,6 +2584,7 @@ mod tests {
             ConfigTestCase {
                 name: "service group secrets inherit unless the member declares its own",
                 input: r#"
+                    min_version = "0.0.0"
                     [[secrets]]
                     aws-ssm = {}
                     [secrets.vars]
@@ -2638,6 +2638,7 @@ mod tests {
             ConfigTestCase {
                 name: "service group with depends_on but no members parses",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
 
@@ -2655,6 +2656,7 @@ mod tests {
             ConfigTestCase {
                 name: "group depends_on applies to direct member",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
 
@@ -2687,6 +2689,7 @@ mod tests {
             ConfigTestCase {
                 name: "group depends_on applies transitively to nested members",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
 
@@ -2719,6 +2722,7 @@ mod tests {
             ConfigTestCase {
                 name: "group depends_on can reference another group",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.web]
                     run.cmd = "web"
 
@@ -2749,6 +2753,7 @@ mod tests {
             ConfigTestCase {
                 name: "a non-blocking group reference makes every member non-blocking",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.web]
                     run.cmd = "web"
                     depends_on = [{ name = "backend", blocking = false }]
@@ -2780,6 +2785,7 @@ mod tests {
             ConfigTestCase {
                 name: "a name reached both ways keeps the blocking edge",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.web]
                     run.cmd = "web"
                     depends_on = [{ name = "backend", blocking = false }, "api"]
@@ -2811,6 +2817,7 @@ mod tests {
             ConfigTestCase {
                 name: "group with unknown depends_on target is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.web]
                     run.cmd = "web"
 
@@ -2835,6 +2842,7 @@ mod tests {
             ConfigTestCase {
                 name: "group depends_on typo gets a suggestion",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.postgres]
                     run.cmd = "postgres"
 
@@ -2861,6 +2869,7 @@ mod tests {
             ConfigTestCase {
                 name: "cycle introduced by group depends_on is detected",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
 
@@ -2884,6 +2893,7 @@ mod tests {
             ConfigTestCase {
                 name: "dependency cycle through service group is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     depends_on = ["datastores"]
@@ -2907,6 +2917,7 @@ mod tests {
             ConfigTestCase {
                 name: "self-referencing dependency is a cycle",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.loop]
                     run.cmd = "loop"
                     depends_on = ["loop"]
@@ -2923,6 +2934,7 @@ mod tests {
             ConfigTestCase {
                 name: "profiles with valid references",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     rust.binary = "api"
 
@@ -2948,6 +2960,7 @@ mod tests {
             ConfigTestCase {
                 name: "profile with unknown service is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     rust.binary = "api"
 
@@ -2966,6 +2979,7 @@ mod tests {
             ConfigTestCase {
                 name: "profile with unknown task is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     rust.binary = "api"
 
@@ -2984,6 +2998,7 @@ mod tests {
             ConfigTestCase {
                 name: "default_profile references a known profile",
                 input: r#"
+                    min_version = "0.0.0"
                     default_profile = "dev"
 
                     [services.api]
@@ -3001,6 +3016,7 @@ mod tests {
             ConfigTestCase {
                 name: "default_profile referencing unknown profile is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     default_profile = "ghost"
 
                     [services.api]
@@ -3047,6 +3063,7 @@ mod tests {
             ConfigTestCase {
                 name: "no preset is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.broken]
                     env = { FOO = "bar" }
                 "#,
@@ -3068,6 +3085,7 @@ mod tests {
             ConfigTestCase {
                 name: "ready check with no check type is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.broken]
                     run.cmd = "myservice"
                     [services.broken.ready]
@@ -3085,6 +3103,7 @@ mod tests {
             ConfigTestCase {
                 name: "ready check with multiple check types is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.broken]
                     run.cmd = "myservice"
                     [services.broken.ready]
@@ -3103,6 +3122,7 @@ mod tests {
             ConfigTestCase {
                 name: "invalid debounce duration is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     debounce = "banana"
@@ -3119,6 +3139,7 @@ mod tests {
             ConfigTestCase {
                 name: "a task's invalid debounce duration is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [tasks.gen]
                     cmd = "gen"
                     watch = ["src/**"]
@@ -3136,6 +3157,7 @@ mod tests {
             ConfigTestCase {
                 name: "a task's debounce is parsed and kept",
                 input: r#"
+                    min_version = "0.0.0"
                     [tasks.gen]
                     cmd = "gen"
                     watch = ["src/**"]
@@ -3153,6 +3175,7 @@ mod tests {
             ConfigTestCase {
                 name: "invalid ready interval is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     [services.api.ready]
@@ -3171,6 +3194,7 @@ mod tests {
             ConfigTestCase {
                 name: "monitor + on_failure default to off / Notify",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     [services.api.ready]
@@ -3191,6 +3215,7 @@ mod tests {
             ConfigTestCase {
                 name: "invalid ready timeout is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     [services.api.ready]
@@ -3212,6 +3237,7 @@ mod tests {
             ConfigTestCase {
                 name: "monitor + on_failure=restart parses cleanly",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     on_failure = "restart"
@@ -3235,6 +3261,7 @@ mod tests {
             ConfigTestCase {
                 name: "on_failure works without a ready check (crash-only restarts)",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     on_failure = "restart"
@@ -3250,6 +3277,7 @@ mod tests {
             ConfigTestCase {
                 name: "invalid monitor_interval is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     [services.api.ready]
@@ -3274,6 +3302,7 @@ mod tests {
             ConfigTestCase {
                 name: "unhealthy_after = 0 with monitor enabled is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     [services.api.ready]
@@ -3298,6 +3327,7 @@ mod tests {
             ConfigTestCase {
                 name: "invalid shutdown timeout is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     [services.api.shutdown]
@@ -3319,6 +3349,7 @@ mod tests {
             ConfigTestCase {
                 name: "invalid task timeout is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [tasks.build]
                     cmd = "make"
                     timeout = "lots"
@@ -3335,6 +3366,7 @@ mod tests {
             ConfigTestCase {
                 name: "invalid shutdown signal is a validation error",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     [services.api.shutdown]
@@ -3352,6 +3384,7 @@ mod tests {
             ConfigTestCase {
                 name: "valid shutdown signals pass validation",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     [services.api.shutdown]
@@ -3390,6 +3423,7 @@ mod tests {
             ConfigTestCase {
                 name: "reload = false with platform override",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     reload = false
@@ -3415,6 +3449,7 @@ mod tests {
             ConfigTestCase {
                 name: "tty defaults to true",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                 "#,
@@ -3427,6 +3462,7 @@ mod tests {
             ConfigTestCase {
                 name: "tty = false spawns without a controlling PTY",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.data]
                     run.cmd = "data"
                     tty = false
@@ -3440,6 +3476,7 @@ mod tests {
             ConfigTestCase {
                 name: "tty platform override",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     tty = false
@@ -3462,7 +3499,7 @@ mod tests {
         ];
 
         for case in &cases {
-            let result = ensure_min_version(case.input).parse::<Config>();
+            let result = case.input.parse::<Config>();
             if case.expect_err {
                 assert!(
                     result.is_err(),
@@ -3490,6 +3527,7 @@ mod tests {
             Case {
                 name: "duplicate random proxy addresses are allowed",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.api]
                     run.cmd = "api"
                     proxy = "127.0.0.1:0"
@@ -3504,6 +3542,7 @@ mod tests {
             Case {
                 name: "duplicate preferred proxy addresses remain invalid",
                 input: r#"
+                    min_version = "0.0.0"
                     fallback_ports = true
 
                     [services.api]
@@ -3520,6 +3559,7 @@ mod tests {
             Case {
                 name: "docker port mappings validate with the config",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.database]
                     docker.image = "postgres:16"
                     docker.ports = ["not-a-port-mapping"]
@@ -3530,6 +3570,7 @@ mod tests {
             Case {
                 name: "explicit docker container warns with fallback ports",
                 input: r#"
+                    min_version = "0.0.0"
                     fallback_ports = true
 
                     [services.database]
@@ -3542,6 +3583,7 @@ mod tests {
             Case {
                 name: "explicit docker container does not warn by default",
                 input: r#"
+                    min_version = "0.0.0"
                     [services.database]
                     docker.image = "postgres:16"
                     docker.container = "shared-postgres"
@@ -3552,7 +3594,7 @@ mod tests {
         ];
 
         for case in cases {
-            let config: Config = parse_cfg(case.input);
+            let config: Config = case.input.parse().unwrap();
             match (config.validate(TEST_PLATFORM), case.expected_error) {
                 (Err(ConfigError::Validation { errors }), Some(needle)) => assert!(
                     errors.iter().any(|error| error.contains(needle)),
@@ -3786,10 +3828,11 @@ mod tests {
     #[test]
     fn test_parse_bazel_config() {
         let toml = r#"
+min_version = "0.0.0"
 [services.api]
 bazel.target = "//services/api:api"
 "#;
-        let config: Config = parse_cfg(toml);
+        let config: Config = toml.parse().unwrap();
         let svc = config.services.get("api").unwrap();
         let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
             panic!("expected bazel kind");
@@ -3801,11 +3844,12 @@ bazel.target = "//services/api:api"
     #[test]
     fn test_parse_bazel_watch_false() {
         let toml = r#"
+min_version = "0.0.0"
 [services.api]
 bazel.target = "//services/api:api"
 bazel.watch = false
 "#;
-        let config: Config = parse_cfg(toml);
+        let config: Config = toml.parse().unwrap();
         let svc = config.services.get("api").unwrap();
         let Some(ServiceKind::Bazel(bazel)) = &svc.kind else {
             panic!("expected bazel kind");
@@ -3817,12 +3861,13 @@ bazel.watch = false
     #[test]
     fn test_parse_task_with_bazel() {
         let toml = r#"
+min_version = "0.0.0"
 [tasks.codegen]
 cmd = "bazel"
 args = ["build", "//tools/codegen:all"]
 bazel.target = "//tools/codegen:all"
 "#;
-        let config: Config = parse_cfg(toml);
+        let config: Config = toml.parse().unwrap();
         let task = config.tasks.get("codegen").unwrap();
         assert_eq!(task.bazel.as_ref().unwrap().target, "//tools/codegen:all");
     }
@@ -3850,13 +3895,14 @@ bazel.target = "//services/api:api"
     #[test]
     fn test_build_tool_config_platform_override() {
         let toml = r#"
+min_version = "0.0.0"
 [services.api]
 bazel.target = "//services/api:linux"
 
 [services.api.platform.macos-aarch64]
 bazel.target = "//services/api:macos_arm64"
 "#;
-        let config: Config = parse_cfg(toml);
+        let config: Config = toml.parse().unwrap();
         let svc = config.services.get("api").unwrap();
 
         // Base config
@@ -3886,6 +3932,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "no params is fine",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                 "#,
@@ -3894,6 +3941,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "placeholder referencing declared param is fine",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     args = ["{{name}}"]
@@ -3905,6 +3953,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "headless placeholder referencing declared param is fine",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     headless = { args = ["{{name}}"] }
@@ -3916,6 +3965,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "headless placeholder referencing unknown param errors",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     headless = { cmd = "{{nme}}" }
@@ -3927,6 +3977,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "placeholder referencing unknown param errors with suggestion",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     args = ["{{nme}}"]
@@ -3938,6 +3989,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "reserved name collides",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -3948,6 +4000,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "choices and completions are mutually exclusive",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -3961,6 +4014,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "int validate min > max",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -3973,6 +4027,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "validate requires int kind",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -3984,6 +4039,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "choices on bool is rejected",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -3996,6 +4052,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "bad bool default",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -4008,6 +4065,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "bad int default",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -4020,6 +4078,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "int default outside range",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -4033,6 +4092,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "choice default must be among choices",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -4046,6 +4106,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "duplicate param names",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -4058,6 +4119,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "invalid identifier",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -4068,6 +4130,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "bad cache duration",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     [[tasks.t.params]]
@@ -4081,6 +4144,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "placeholder in env resolves",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     env = { X = "{{val}}" }
@@ -4092,6 +4156,7 @@ bazel.target = "//services/api:macos_arm64"
             Case {
                 name: "placeholder in dir resolves",
                 toml: r#"
+                    min_version = "0.0.0"
                     [tasks.t]
                     cmd = "echo"
                     dir = "{{where}}"
@@ -4103,7 +4168,7 @@ bazel.target = "//services/api:macos_arm64"
         ];
 
         for case in cases {
-            let config: Config = parse_cfg(case.toml);
+            let config: Config = case.toml.parse().unwrap();
             let res = config.validate(TEST_PLATFORM);
             match (&res, case.want) {
                 (Ok(_), None) => {}
@@ -4143,28 +4208,28 @@ bazel.target = "//services/api:macos_arm64"
         let cases = vec![
             Case {
                 name: "a plain command",
-                toml: "[tasks.t]\ncmd = \"true\"\n",
+                toml: "min_version = \"0.0.0\"\n[tasks.t]\ncmd = \"true\"\n",
                 want_error: false,
             },
             Case {
                 name: "defined by its bazel target alone",
-                toml: "[tasks.t]\nbazel.target = \"//a:b\"\n",
+                toml: "min_version = \"0.0.0\"\n[tasks.t]\nbazel.target = \"//a:b\"\n",
                 want_error: false,
             },
             Case {
                 name: "both — the target is then watch-only",
-                toml: "[tasks.t]\ncmd = \"make\"\nbazel.target = \"//a:b\"\n",
+                toml: "min_version = \"0.0.0\"\n[tasks.t]\ncmd = \"make\"\nbazel.target = \"//a:b\"\n",
                 want_error: false,
             },
             Case {
                 name: "neither: nothing to run",
-                toml: "[tasks.t]\nwatch = [\"src/**\"]\n",
+                toml: "min_version = \"0.0.0\"\n[tasks.t]\nwatch = [\"src/**\"]\n",
                 want_error: true,
             },
         ];
 
         for case in cases {
-            let config: Config = parse_cfg(case.toml);
+            let config: Config = case.toml.parse().unwrap();
             let result = config.validate(Platform::LinuxX86_64);
             match (result, case.want_error) {
                 (Err(ConfigError::Validation { errors }), true) => assert!(
