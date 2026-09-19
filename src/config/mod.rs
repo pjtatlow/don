@@ -4504,9 +4504,9 @@ bazel.target = "//services/api:macos_arm64"
             panic!("expected validation error");
         };
         assert!(
-            errors.iter().any(|e| e.contains("99.0.0")
-                && e.contains(binary)
-                && e.contains("upgrade don")),
+            errors
+                .iter()
+                .any(|e| e.contains("99.0.0") && e.contains(binary) && e.contains("upgrade don")),
             "{errors:?}"
         );
 

@@ -546,9 +546,13 @@ fn don_validate_cli_min_version_mismatch_body() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("min_version"), "{stderr}");
-    assert!(stderr.contains("99.0.0"), "{stderr}");
-    assert!(stderr.contains("upgrade don"), "{stderr}");
+    assert!(stderr.contains("Required: Don >= 99.0.0"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("Current: Don {}", env!("CARGO_PKG_VERSION"))),
+        "{stderr}"
+    );
+    assert!(stderr.contains("brew upgrade pjtatlow/tap/don"), "{stderr}");
+    assert!(stderr.contains("don-installer.sh | sh"), "{stderr}");
 }
 
 fn don_start_cli_min_version_mismatch_body() {
@@ -566,10 +570,14 @@ fn don_start_cli_min_version_mismatch_body() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("min_version"), "{stderr}");
-    assert!(stderr.contains("99.0.0"), "{stderr}");
+    assert!(stderr.contains("Required: Don >= 99.0.0"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("Current: Don {}", env!("CARGO_PKG_VERSION"))),
+        "{stderr}"
+    );
+    assert!(stderr.contains("brew upgrade pjtatlow/tap/don"), "{stderr}");
+    assert!(stderr.contains("don-installer.sh | sh"), "{stderr}");
 }
-
 
 fn don_validate_cli_min_version_missing_body() {
     let dir = TempDir::new("cli-validate-min-version-missing");

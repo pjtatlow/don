@@ -106,7 +106,6 @@ fn starter_template() -> String {
     STARTER_TEMPLATE.replace("__DON_VERSION__", env!("CARGO_PKG_VERSION"))
 }
 
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -181,4 +180,3 @@ mod tests {
             .unwrap();
     }
 }
-

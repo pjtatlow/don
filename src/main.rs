@@ -10,7 +10,7 @@ use don::TaskRunInfo;
 use don::client::{Client, ClientError, RunTaskOptions};
 use don::runner::{ProcessStatus, ServiceState, TaskState};
 use std::borrow::Cow;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,57 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// single helper makes intentional error output easy to grep for.
 fn errln(msg: impl std::fmt::Display) {
     let _ = write!(std::io::stderr(), "{msg}\r\n");
+}
+
+fn format_config_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    let Some(minimum_start) = message.find("min_version = \"") else {
+        return format!("Error: {message}");
+    };
+    let minimum_start = minimum_start + "min_version = \"".len();
+    let Some(minimum_end) = message[minimum_start..].find('"') else {
+        return format!("Error: {message}");
+    };
+    let minimum = &message[minimum_start..minimum_start + minimum_end];
+    let current_marker = "but this binary is ";
+    let Some(current_start) = message.find(current_marker) else {
+        return format!("Error: {message}");
+    };
+    let current_start = current_start + current_marker.len();
+    let Some(current_end) = message[current_start..].find(" —") else {
+        return format!("Error: {message}");
+    };
+    let current = &message[current_start..current_start + current_end];
+    let is_tty = std::io::stderr().is_terminal();
+    let (red, yellow, green, bold, reset) = if is_tty {
+        (
+            SetForegroundColor(Color::Red).to_string(),
+            SetForegroundColor(Color::Yellow).to_string(),
+            SetForegroundColor(Color::Green).to_string(),
+            SetAttribute(Attribute::Bold).to_string(),
+            ResetColor.to_string(),
+        )
+    } else {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    };
+
+    format!(
+        "{red}{bold}Error: this Don binary is too old for this project{reset}\n\n\
+         {bold}Required:{reset} Don >= {yellow}{minimum}{reset}\n\
+         {bold}Current: {reset}Don {yellow}{current}{reset}\n\n\
+         {bold}Upgrade Don and retry:{reset}\n\n\
+         {bold}macOS (Homebrew):{reset}\n\
+           {green}brew upgrade pjtatlow/tap/don{reset}\n\n\
+         {bold}Linux:{reset}\n\
+           {green}curl --proto '=https' --tlsv1.2 -LsSf \\
+             https://github.com/pjtatlow/don/releases/latest/download/don-installer.sh | sh{reset}"
+    )
 }
 
 #[derive(Parser, Debug)]
@@ -1558,7 +1609,6 @@ async fn run_start_attached(
 /// Interactive (foreground) tasks are no obstacle — they run on
 /// runner-owned PTYs and clients bridge to them over the socket.
 fn should_auto_attach(config_path: &Path, no_tui: bool) -> bool {
-    use std::io::IsTerminal;
     if no_tui || !std::io::stdout().is_terminal() {
         return false;
     }
@@ -1597,7 +1647,6 @@ async fn attach_tui_inner(
     use don::client::{Client, LogStreamEvent};
 
     {
-        use std::io::IsTerminal;
         if !std::io::stdout().is_terminal() {
             return Err(
                 "don attach needs a terminal — use `don status` or `don logs` in scripts".into(),
@@ -2274,9 +2323,7 @@ fn validate(config_path: &std::path::Path, profile: Option<&str>) -> Result<(), 
         )
     })?;
 
-    let warnings = config
-        .validate(platform)
-        .map_err(|e| format!("Error: {e}"))?;
+    let warnings = config.validate(platform).map_err(format_config_error)?;
     for warning in &warnings {
         errln(format!("Warning: {warning}"));
     }
@@ -2509,8 +2556,6 @@ async fn run_start(
     no_daemon: bool,
     with_ui: Option<u16>,
 ) -> Result<(), String> {
-    use std::io::IsTerminal;
-
     // Serving a UI from this process means not depending on a daemon at all.
     let no_daemon = no_daemon || with_ui.is_some();
 
@@ -2525,9 +2570,7 @@ async fn run_start(
         )
     })?;
 
-    let warnings = config
-        .validate(platform)
-        .map_err(|e| format!("Error: {e}"))?;
+    let warnings = config.validate(platform).map_err(format_config_error)?;
     for warning in &warnings {
         errln(format!("Warning: {warning}"));
     }
@@ -3157,6 +3200,20 @@ mod tests {
             };
             assert_eq!(json, case.expected_json, "case '{}'", case.name);
         }
+    }
+
+    #[test]
+    fn min_version_error_recommends_platform_upgrade_commands() {
+        let message = super::format_config_error(
+            "config validation failed:\nmin_version = \"99.0.0\" requires don >= 99.0.0, but this binary is 0.8.1 — upgrade don and retry",
+        );
+
+        assert!(message.contains("brew upgrade pjtatlow/tap/don"));
+        assert!(message.contains(
+            "https://github.com/pjtatlow/don/releases/latest/download/don-installer.sh | sh"
+        ));
+        assert!(message.contains("99.0.0"));
+        assert!(message.contains("0.8.1"));
     }
 
     #[test]
