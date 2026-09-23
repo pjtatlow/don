@@ -128,7 +128,10 @@ pub enum RunnerEvent {
     },
     /// The initial startup sweep has decided every process — nothing is left
     /// merely being *considered*. Fires once per run.
-    StartupSettled,
+    StartupSettled {
+        /// Monotonic elapsed milliseconds from run start to startup settlement.
+        elapsed_ms: u64,
+    },
     /// Graceful shutdown has started.
     ShutdownStarted,
     /// Shutdown complete — the runner's last word before its streams close.
@@ -1159,7 +1162,9 @@ impl Runner {
                     // issuing a command — see `StateReader::
                     // wait_for_startup_complete`.
                     self.state.set_startup_complete(true);
-                    let _ = self.event_tx.send(RunnerEvent::StartupSettled);
+                    let _ = self.event_tx.send(RunnerEvent::StartupSettled {
+                        elapsed_ms: self.started_at.elapsed().as_millis() as u64,
+                    });
                     let starts = self.service_starts.registry();
                     let has_running_services = self.services.iter().any(|(name, _rs)| {
                         matches!(
@@ -1710,6 +1715,34 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_settled_reports_elapsed_since_runner_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runner, _shutdown_tx) = runner_from_toml("", temp.path()).await;
+        runner.started_at = Instant::now() - Duration::from_secs(30);
+        let started_at = runner.started_at;
+        let mut events = runner.subscribe();
+        let minimum_ms = started_at.elapsed().as_millis() as u64;
+
+        tokio::time::timeout(Duration::from_secs(5), runner.run())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let maximum_ms = started_at.elapsed().as_millis() as u64;
+        let mut settled_count = 0;
+        while let Ok(event) = events.try_recv() {
+            if let RunnerEvent::StartupSettled { elapsed_ms } = event {
+                assert!((minimum_ms..=maximum_ms).contains(&elapsed_ms));
+                let payload = serde_json::to_value(&event).unwrap();
+                assert_eq!(payload["elapsed_ms"], elapsed_ms);
+                assert!(payload.get("started_at").is_none());
+                settled_count += 1;
+            }
+        }
+        assert_eq!(settled_count, 1);
     }
 
     #[test]

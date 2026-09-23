@@ -670,7 +670,7 @@ fn apply_runner_event(event: RunnerEvent, app: &mut App) -> bool {
         // from the sweep finishing — that signal is for API clients deciding
         // whether it's meaningful to ask the runner to run something.
         // `ShutdownComplete` is taken by the loop before it reaches here.
-        RunnerEvent::StartupSettled
+        RunnerEvent::StartupSettled { .. }
         | RunnerEvent::ShutdownStarted
         | RunnerEvent::ShutdownComplete { .. } => false,
     }
