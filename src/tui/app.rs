@@ -1109,6 +1109,53 @@ mod tests {
         );
     }
 
+    fn sync_lazy_hidden_from_display(app: &mut App) {
+        let lazy: HashSet<String> = app
+            .services_state
+            .iter()
+            .filter(|(_, s)| matches!(s, ServiceState::Lazy))
+            .map(|(n, _)| n.clone())
+            .collect();
+        app.filter.set_hidden_from_display(lazy);
+    }
+
+    #[test]
+    fn a_lazy_service_coming_online_does_not_widen_a_narrowed_filter() {
+        let mut app = app_with_names(
+            vec![
+                "merchant-app".to_string(),
+                "merchant-server".to_string(),
+                "kafka".to_string(),
+            ],
+            vec![],
+        );
+        apply_service(&mut app, "kafka", ServiceState::Lazy, None);
+        sync_lazy_hidden_from_display(&mut app);
+        app.filter.restore(HashSet::from([
+            "merchant-app".to_string(),
+            "merchant-server".to_string(),
+            "kafka".to_string(),
+        ]));
+
+        apply_service(&mut app, "kafka", ServiceState::Ready, None);
+        sync_lazy_hidden_from_display(&mut app);
+
+        assert!(!app.should_render_log("kafka", false));
+        assert!(app.should_render_log("merchant-app", false));
+        assert!(app.should_render_log("merchant-server", false));
+    }
+
+    #[test]
+    fn a_lazy_service_coming_online_stays_on_when_the_filter_is_at_defaults() {
+        let mut app = app_with_names(vec!["api".to_string(), "kafka".to_string()], vec![]);
+        apply_service(&mut app, "kafka", ServiceState::Lazy, None);
+        sync_lazy_hidden_from_display(&mut app);
+        apply_service(&mut app, "kafka", ServiceState::Ready, None);
+        sync_lazy_hidden_from_display(&mut app);
+        assert!(app.should_render_log("kafka", false));
+        assert!(app.should_render_log("api", false));
+    }
+
     fn services(entries: &[(&str, ServiceState)]) -> HashMap<String, ServiceState> {
         entries.iter().map(|(n, s)| (n.to_string(), *s)).collect()
     }

@@ -143,8 +143,24 @@ impl FilterState {
         if self.hidden_from_display == hidden {
             return;
         }
+        let newly_visible: Vec<String> = self
+            .hidden_from_display
+            .difference(&hidden)
+            .cloned()
+            .collect();
         self.hidden_from_display = hidden;
+        if self.is_interactively_narrowed() {
+            for name in newly_visible {
+                self.active_selected.remove(&name);
+            }
+        }
         self.recompute_rows();
+    }
+
+    fn is_interactively_narrowed(&self) -> bool {
+        self.default_selected.iter().any(|name| {
+            !self.hidden_from_display.contains(name) && !self.active_selected.contains(name)
+        })
     }
 
     /// True when the current active selection hides any names. Used by the
@@ -1016,5 +1032,101 @@ mod tests {
         s.set_hidden_from_display(hidden);
         assert!(s.passes("db"));
         assert!(s.passes("api"));
+    }
+
+    #[test]
+    fn becoming_visible_follows_an_interactive_narrow_not_is_active() {
+        struct Case {
+            all: &'static [&'static str],
+            config_hidden: &'static [&'static str],
+            initially_lazy: &'static [&'static str],
+            active: Option<&'static [&'static str]>,
+            coming_online: &'static str,
+            want_passes: bool,
+        }
+
+        let cases = vec![
+            Case {
+                all: &["api", "worker", "kafka"],
+                config_hidden: &[],
+                initially_lazy: &["kafka"],
+                active: None,
+                coming_online: "kafka",
+                want_passes: true,
+            },
+            Case {
+                all: &["api", "worker", "kafka"],
+                config_hidden: &[],
+                initially_lazy: &["kafka"],
+                active: Some(&["api", "kafka"]),
+                coming_online: "kafka",
+                want_passes: false,
+            },
+            Case {
+                all: &["api", "worker", "kafka", "noise"],
+                config_hidden: &["noise"],
+                initially_lazy: &["kafka"],
+                active: None,
+                coming_online: "kafka",
+                want_passes: true,
+            },
+            Case {
+                all: &["api", "worker", "kafka", "noise"],
+                config_hidden: &["noise"],
+                initially_lazy: &["kafka"],
+                active: Some(&["api", "kafka"]),
+                coming_online: "kafka",
+                want_passes: false,
+            },
+        ];
+
+        for case in cases {
+            let hidden_cfg: HashSet<String> = case
+                .config_hidden
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            let mut s = FilterState::new(
+                case.all.iter().map(|s| (*s).to_string()).collect(),
+                &hidden_cfg,
+                None,
+            );
+            let lazy: HashSet<String> = case
+                .initially_lazy
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            s.set_hidden_from_display(lazy);
+            if let Some(active) = case.active {
+                s.restore(active.iter().map(|n| (*n).to_string()).collect());
+            }
+            if !case.config_hidden.is_empty() && case.active.is_none() {
+                assert!(s.is_active());
+            }
+            assert!(s.passes(case.coming_online));
+            let remaining_lazy: HashSet<String> = case
+                .initially_lazy
+                .iter()
+                .filter(|n| **n != case.coming_online)
+                .map(|n| (*n).to_string())
+                .collect();
+            s.set_hidden_from_display(remaining_lazy);
+            assert_eq!(s.passes(case.coming_online), case.want_passes);
+        }
+    }
+
+    #[test]
+    fn learn_name_joins_active_only_when_showing_everything() {
+        let mut s = state(&["api", "web"]);
+        s.learn_name("latecomer");
+        assert!(s.passes("latecomer"));
+        assert!(s.passes("api"));
+
+        let mut s = state(&["api", "web"]);
+        s.restore(["api"].iter().map(|n| (*n).to_string()).collect());
+        s.learn_name("latecomer");
+        assert!(!s.passes("latecomer"));
+        assert!(s.passes("api"));
+        assert!(!s.passes("web"));
     }
 }
