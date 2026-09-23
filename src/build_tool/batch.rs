@@ -1,9 +1,9 @@
 use crate::process::ProcessKind;
-use crate::process::paths::any_glob_path_changed_since;
+use crate::process::paths::FileChangeScan;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -746,22 +746,44 @@ pub(crate) async fn run_batch_build_chain(
     // Step 4: decide each item, newest-mtime scan included. Every requested
     // name gets exactly one outcome — a supervisor is waiting on it and
     // silence would leave it parked forever.
+    let checks_started = Instant::now();
+    let mut scan = FileChangeScan::default();
+    if built_count > 0 {
+        emitter.lifecycle_event("checking for files changed during build...");
+    }
     for item in &items {
         let decided = if let Some(message) = failed.get(&item.name) {
             PrepareOutcome::Failed(message.clone())
         } else if succeeded.contains(&item.name) {
-            if let Some(reason) = stale_since(
+            let check_started = Instant::now();
+            let checked = stale_since(
                 item,
                 resolved_info_by_item.get(&item.name),
                 &base_dir,
                 scan_since,
-            ) {
-                emitter.service_event(&item.name, reason);
-                PrepareOutcome::Stale
-            } else {
-                PrepareOutcome::Ready {
-                    binary_path: binary_paths.get(&item.name).cloned(),
+                std::mem::take(&mut scan),
+            )
+            .await
+            .map(|(returned_scan, reason)| {
+                scan = returned_scan;
+                reason
+            });
+            emitter.service_debug_event(
+                &item.name,
+                &format!(
+                    "file change check ({:.3}s)",
+                    check_started.elapsed().as_secs_f64()
+                ),
+            );
+            match checked {
+                Ok(Some(reason)) => {
+                    emitter.service_event(&item.name, reason);
+                    PrepareOutcome::Stale
                 }
+                Ok(None) => PrepareOutcome::Ready {
+                    binary_path: binary_paths.get(&item.name).cloned(),
+                },
+                Err(error) => PrepareOutcome::Failed(format!("file change check failed: {error}")),
             }
         } else {
             // The resolver returned neither a success nor a failure for this
@@ -771,6 +793,12 @@ pub(crate) async fn run_batch_build_chain(
             PrepareOutcome::Failed("build tool returned no result for this target".to_string())
         };
         outcome.items.push((item.name.clone(), decided));
+    }
+    if built_count > 0 {
+        emitter.lifecycle_event(&format!(
+            "file change check complete ({:.2}s)",
+            checks_started.elapsed().as_secs_f64()
+        ));
     }
 
     outcome
@@ -783,20 +811,42 @@ pub(crate) async fn run_batch_build_chain(
 /// This is not the rebuild cycle's staleness flag and cannot be merged with
 /// it: that one is learned from the watcher, and during this build nothing is
 /// watching these paths yet — they are what this build resolves.
-fn stale_since(
+async fn stale_since(
     item: &BatchBuildItem,
     info: Option<&crate::build_tool::ResolvedBuildInfo>,
     base_dir: &Path,
     scan_since: SystemTime,
-) -> Option<&'static str> {
+    mut scan: FileChangeScan,
+) -> Result<(FileChangeScan, Option<&'static str>), tokio::task::JoinError> {
     if !item.watch_enabled {
-        return None;
+        return Ok((scan, None));
     }
-    let info = info?;
+    let Some(info) = info else {
+        return Ok((scan, None));
+    };
+    let item = item.clone();
+    let info = info.clone();
+    let base_dir = base_dir.to_path_buf();
+    // A cancelled prepare discards this read-only result without blocking
+    // the runner's shutdown or allowing a supervisor to start the artifact.
+    tokio::task::spawn_blocking(move || {
+        let reason = check_stale_since(&item, &info, &base_dir, scan_since, &mut scan);
+        (scan, reason)
+    })
+    .await
+}
+
+fn check_stale_since(
+    item: &BatchBuildItem,
+    info: &crate::build_tool::ResolvedBuildInfo,
+    base_dir: &Path,
+    scan_since: SystemTime,
+    scan: &mut FileChangeScan,
+) -> Option<&'static str> {
     let source_changed =
-        any_glob_path_changed_since(base_dir, &info.watch_paths, &item.ignore, scan_since);
+        scan.any_changed_since(base_dir, &info.watch_paths, &item.ignore, scan_since);
     let graph_changed =
-        any_glob_path_changed_since(base_dir, &info.graph_definition_globs, &[], scan_since);
+        scan.any_changed_since(base_dir, &info.graph_definition_globs, &[], scan_since);
     match (source_changed, graph_changed, item.kind) {
         (true, true, ProcessKind::Service) => {
             Some("files changed during build — rebuilding before start")
@@ -884,6 +934,163 @@ mod tests {
             watch_enabled,
             working_dir: PathBuf::from("."),
             ignore: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn freshness_check_keeps_changes_made_during_the_build() {
+        struct Case {
+            kind: ProcessKind,
+            watch: bool,
+            ignore_source: bool,
+            changed: &'static [&'static str],
+            want: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                kind: ProcessKind::Service,
+                watch: true,
+                ignore_source: false,
+                changed: &[],
+                want: None,
+            },
+            Case {
+                kind: ProcessKind::Service,
+                watch: true,
+                ignore_source: false,
+                changed: &["src/app.rs"],
+                want: Some("source files changed during build — rebuilding before start"),
+            },
+            Case {
+                kind: ProcessKind::Service,
+                watch: true,
+                ignore_source: false,
+                changed: &["BUILD.bazel"],
+                want: Some("build graph changed during build — rebuilding before start"),
+            },
+            Case {
+                kind: ProcessKind::Service,
+                watch: true,
+                ignore_source: false,
+                changed: &["src/app.rs", "BUILD.bazel"],
+                want: Some("files changed during build — rebuilding before start"),
+            },
+            Case {
+                kind: ProcessKind::Service,
+                watch: true,
+                ignore_source: true,
+                changed: &["src/app.rs"],
+                want: None,
+            },
+            Case {
+                kind: ProcessKind::Service,
+                watch: false,
+                ignore_source: false,
+                changed: &["src/app.rs", "BUILD.bazel"],
+                want: None,
+            },
+            Case {
+                kind: ProcessKind::Task,
+                watch: true,
+                ignore_source: false,
+                changed: &["BUILD.bazel"],
+                want: Some("build graph changed during build — re-running build before start"),
+            },
+        ];
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path();
+            std::fs::create_dir(repo.join("src")).unwrap();
+            std::fs::write(repo.join("src/app.rs"), "").unwrap();
+            std::fs::write(repo.join("BUILD.bazel"), "").unwrap();
+            let since = SystemTime::now() + std::time::Duration::from_secs(60);
+            for changed in case.changed {
+                std::fs::File::options()
+                    .write(true)
+                    .open(repo.join(changed))
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(since + std::time::Duration::from_secs(60)),
+                    )
+                    .unwrap();
+            }
+            let mut item = bazel_item("api", case.watch);
+            item.kind = case.kind;
+            if case.ignore_source {
+                item.ignore.push("src/**".into());
+            }
+            let info = crate::build_tool::ResolvedBuildInfo {
+                watch_paths: vec!["src/**".into()],
+                graph_definition_globs: vec!["BUILD".into(), "BUILD.bazel".into()],
+            };
+            assert_eq!(
+                stale_since(&item, Some(&info), repo, since, FileChangeScan::default())
+                    .await
+                    .unwrap()
+                    .1,
+                case.want
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_freshness_checks_keep_per_service_and_graph_decisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        let since = SystemTime::now() + std::time::Duration::from_secs(60);
+        for file in ["src/app.rs", "BUILD.bazel"] {
+            std::fs::write(repo.join(file), "").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(repo.join(file))
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(since + std::time::Duration::from_secs(60)),
+                )
+                .unwrap();
+        }
+        let info = crate::build_tool::ResolvedBuildInfo {
+            watch_paths: vec!["src/**".into()],
+            graph_definition_globs: vec!["BUILD.bazel".into()],
+        };
+        let mut scan = FileChangeScan::default();
+        for (name, watch, ignore, kind, want) in [
+            ("disabled", false, false, ProcessKind::Service, None),
+            (
+                "ignored",
+                true,
+                true,
+                ProcessKind::Service,
+                Some("build graph changed during build — rebuilding before start"),
+            ),
+            (
+                "api",
+                true,
+                false,
+                ProcessKind::Service,
+                Some("files changed during build — rebuilding before start"),
+            ),
+            (
+                "worker",
+                true,
+                false,
+                ProcessKind::Task,
+                Some("files changed during build — re-running build before start"),
+            ),
+        ] {
+            let mut item = bazel_item(name, watch);
+            item.kind = kind;
+            if ignore {
+                item.ignore = vec!["src/**".into(), "BUILD.bazel".into()];
+            }
+            let reason;
+            (scan, reason) = stale_since(&item, Some(&info), repo, since, scan)
+                .await
+                .unwrap();
+            assert_eq!(reason, want, "{name}");
         }
     }
 

@@ -1280,17 +1280,16 @@ async fn supervise(
                 continue;
             }
             ServiceCommand::Stop(request) => {
-                // A stop someone asked for is admitted here. Holding nothing
-                // is only an error if there was nothing to clear either: a
-                // lazy service that never triggered, or one parked in a
-                // failure, is *stoppable* — that is how a user clears it —
-                // and `run_stop` below is a no-op that lands `Stopped`.
+                // A superseded start may have no held process yet. It is still
+                // stoppable, as are lazy/pending services and failures to clear.
+                // `run_stop` succeeds without a handle and lands `Stopped`.
                 if let StopNotify::Reply(Some(_)) = &request.notify
                     && held.is_none()
                     && !matches!(
                         owner.phase,
                         super::ServiceState::Lazy
                             | super::ServiceState::Pending
+                            | super::ServiceState::Starting
                             | super::ServiceState::Failed
                             | super::ServiceState::DependencyFailed
                     )
@@ -1310,6 +1309,7 @@ async fn supervise(
                             (false, super::ServiceState::Lazy | super::ServiceState::Pending) => {
                                 "stopped before lazy start"
                             }
+                            (false, super::ServiceState::Starting) => "stopped during start",
                             (false, _) => "stopped (was failed)",
                             (true, _) => "stopping... (requested)",
                         },
@@ -3336,6 +3336,135 @@ mod tests {
                 "{}: artifact_ahead",
                 case.name
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_during_start_settles_even_before_a_process_is_held() {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+
+        for download_succeeds in [true, false] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let temp = tempfile::tempdir().unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let content = b"unused downloaded artifact";
+                let sha = hex::encode(Sha256::digest(content));
+                let config: crate::config::Config = format!(
+                    "[services.svc]\nrun.cmd = 'true'\n\
+                     [services.svc.download.platform.linux-x86_64]\n\
+                     url = 'http://{addr}/artifact'\nsha256 = '{sha}'\n"
+                )
+                .parse()
+                .unwrap();
+                let resolved = config.services["svc"].resolve(Platform::LinuxX86_64);
+                let (mut env, _batcher_rx, _shutdown_tx) = env_with_batcher(false).await;
+                env.base_dir = temp.path().to_path_buf();
+                env.pid_dir = temp.path().join("pids");
+                std::fs::create_dir_all(&env.pid_dir).unwrap();
+                let (mut facts, mut publishers, world) = crate::facts::channel(std::iter::once((
+                    "svc".to_string(),
+                    crate::facts::ProcessFacts::for_service(
+                        "svc",
+                        super::super::ServiceState::Pending,
+                        None,
+                        Vec::new(),
+                    ),
+                )));
+                env.facts = world;
+                let (tx, rx) = mpsc::unbounded_channel();
+                let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+                let supervisor = supervise(
+                    "svc".to_string(),
+                    rx,
+                    env,
+                    None,
+                    report_tx,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    Some(resolved),
+                    Vec::new(),
+                    publishers.remove("svc"),
+                );
+                tokio::pin!(supervisor);
+                tx.send(ServiceCommand::Start(StartRequest {
+                    mode: ServiceStartMode::Full,
+                    intent: super::super::ServiceStartIntent::Background,
+                    fresh_backend_ports: false,
+                }))
+                .unwrap();
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut supervisor => panic!("supervisor exited during start"),
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+                tx.send(ServiceCommand::Stop(StopRequest {
+                    force: false,
+                    wait_full_exit: false,
+                    interrupt: None,
+                    notify: StopNotify::Reply(Some(reply_tx)),
+                    reset_policy: true,
+                }))
+                .unwrap();
+                // The download cannot finish yet, so this poll consumes Stop
+                // while the supervisor is still preparing its first process.
+                assert!(futures_util::poll!(&mut supervisor).is_pending());
+                let response = if download_succeeds {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        content.len()
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                if download_succeeds {
+                    socket.write_all(content).await.unwrap();
+                }
+                let report = tokio::select! {
+                    _ = &mut supervisor => panic!("supervisor exited before stop completed"),
+                    reply = &mut reply_rx => panic!("stop during start was rejected: {reply:?}"),
+                    report = report_rx.recv() => report.unwrap(),
+                };
+                let super::super::ProcessReport::ServiceStopComplete { result, reply, .. } = report
+                else {
+                    panic!("superseded start must report a completed stop");
+                };
+                assert!(result.is_ok(), "{result:?}");
+                while let Ok((name, update)) = facts.try_recv() {
+                    facts.apply(name, update);
+                }
+                let stopped = facts.snapshot().get("svc").unwrap();
+                assert_eq!(
+                    stopped.phase,
+                    crate::facts::Phase::Service(super::super::ServiceState::Stopped)
+                );
+                assert!(stopped.holds_nothing());
+                assert!(!stopped.satisfied);
+                reply.unwrap().send(Ok(())).unwrap();
+                assert!(reply_rx.await.unwrap().is_ok());
+
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.send(ServiceCommand::Stop(StopRequest {
+                    force: false,
+                    wait_full_exit: false,
+                    interrupt: None,
+                    notify: StopNotify::Reply(Some(reply_tx)),
+                    reset_policy: true,
+                }))
+                .unwrap();
+                let reply = tokio::select! {
+                    _ = &mut supervisor => panic!("supervisor exited"),
+                    reply = reply_rx => reply.unwrap(),
+                };
+                assert!(matches!(
+                    reply,
+                    Err(crate::command::CommandError::InvalidState { .. })
+                ));
+            })
+            .await
+            .unwrap();
         }
     }
 
