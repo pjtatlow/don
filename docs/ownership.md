@@ -204,6 +204,9 @@ not an accident:
    event**, and narrates before publishing anything that unblocks a dependent.
    Publishing is what releases the processes waiting on you; a line emitted
    afterwards lands behind the "starting..." it was meant to explain.
+   Terminal task facts carry `report_pending` until the exit report is queued,
+   so a task-only stack cannot exit in the gap between those channels. Clearing
+   it publishes another update, waking a root that already consumed the report.
 2. **The root drains facts before handling any report or command.** Both
    channels are unbounded, so by the time a report is dequeued the facts behind
    it are already queued. That is what makes "`don stop` returned" imply "no
@@ -352,7 +355,10 @@ The load-bearing detail:
 
 An artifact can be built before its dependencies are up — bazel does not care
 whether postgres is listening. So a supervisor requests its build **when it is
-constructed**, not when its dependencies become satisfied. Every supervisor asks at once, the
+constructed**, not when its dependencies become satisfied. Tasks first check
+whether startup will run them: manual tasks, unchanged watched inputs, and
+already-completed once tasks request no artifact. Runnable tasks queue their
+artifacts before waiting for dependencies. Every eligible supervisor asks up front, the
 debounce window coalesces them, and bazel gets one invocation for the whole
 workspace. Building only once dependencies were satisfied would serialise builds along the
 dependency chain, which is the one real regression this ordering avoids by
@@ -364,8 +370,9 @@ One request is late by construction, and it is why nothing builds the instant
 `Runner::new` returns. Watch paths are resolved *by* these builds and have to
 reach the watcher before anything spawns — but the watcher does not exist
 until the runner has set it up. The build manager parks preparation requests
-until the runner says `WatchReady`, which is also what guarantees the whole
-startup burst leaves as one batch. A supervisor then waits for its outcome
+until the runner says `WatchReady` and every task has finished its startup
+check. This keeps slow input hashing in the same initial batch. Later explicit
+task runs still request a fresh build. A supervisor then waits for its outcome
 before spawning, so the registrations are always in place first.
 
 ### Two rules that come with it

@@ -106,6 +106,9 @@ pub(crate) struct ProcessFacts {
     /// dependent must still not treat it as up. Only the supervisor that
     /// armed the timer can answer this.
     pub(crate) restart_pending: bool,
+    /// A terminal phase is visible, but its completion report is not queued yet.
+    /// The root must keep receiving until the publisher clears this flag.
+    pub(crate) report_pending: bool,
 }
 
 impl ProcessFacts {
@@ -151,6 +154,7 @@ impl ProcessFacts {
             },
             detail: Detail::Service { runtime },
             restart_pending: false,
+            report_pending: false,
         }
     }
 
@@ -189,6 +193,7 @@ impl ProcessFacts {
             },
             detail: Detail::Task { pid, last_run },
             restart_pending: false,
+            report_pending: false,
         }
     }
 

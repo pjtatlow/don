@@ -340,14 +340,6 @@ impl Runner {
             &base_dir,
             &config.watch_ignore,
         );
-        let (batcher_tx, batcher_handle) = build_batcher::spawn(
-            state_reader,
-            output_manager.clone_lifecycle_emitter(),
-            build_batcher::WorkspaceContext {
-                base_dir: base_dir.clone(),
-                global_watch_ignore: global_watch_ignore.clone(),
-            },
-        );
         let (watch_status_tx, watch_status_reader) = crate::watch::report::status_channel();
         let completions = crate::param_completions::CompletionResolver::new(
             config.tasks.clone(),
@@ -389,6 +381,16 @@ impl Runner {
             headless,
         )
         .await;
+
+        let (batcher_tx, batcher_handle) = build_batcher::spawn(
+            state_reader,
+            output_manager.clone_lifecycle_emitter(),
+            build_batcher::WorkspaceContext {
+                base_dir: base_dir.clone(),
+                startup_tasks: tasks.keys().cloned().collect(),
+                global_watch_ignore: global_watch_ignore.clone(),
+            },
+        );
 
         // Bind every proxy before any supervisor exists, so a port conflict
         // fails startup before anything spawns — "validate everything before
@@ -1581,6 +1583,69 @@ mod tests {
                 "{}: non-blocking edge",
                 case.name
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_completion_cannot_settle_startup_before_its_report_is_queued() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for code in [0, 3] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut runner, _shutdown_tx) = runner_from_toml("", temp.path()).await;
+            let config: Config = "[tasks.build]\ncmd = 'true'\n".parse().unwrap();
+            let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+            let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+            let mut observed_before_report = false;
+            task_supervisor::TaskRunOutcome {
+                name: "build".to_string(),
+                task_cfg: config.tasks["build"].clone(),
+                base_dir: temp.path().to_path_buf(),
+                global_watch_ignore: Vec::new(),
+                pgid: 4242,
+                report_tx,
+            }
+            .finish(
+                Ok(std::process::ExitStatus::from_raw(code << 8)),
+                std::time::Duration::from_millis(5),
+                Some(reply_tx),
+                |success, last_run, report_pending| {
+                    let mut facts = crate::facts::ProcessFacts::for_task(
+                        "build",
+                        if success {
+                            TaskState::Completed
+                        } else {
+                            TaskState::Failed
+                        },
+                        success,
+                        None,
+                        last_run,
+                        Vec::new(),
+                    );
+                    facts.report_pending = report_pending;
+                    runner.facts.apply("build".to_string(), facts);
+                    // Run the root's exit predicate in the publication/report gap.
+                    if report_rx.is_empty() {
+                        observed_before_report = true;
+                        assert!(
+                            !runner.initial_startup_settled(),
+                            "exit code {code}: must keep receiving the completion report"
+                        );
+                    }
+                },
+            )
+            .await;
+            assert!(observed_before_report);
+            assert!(runner.initial_startup_settled());
+            let ProcessReport::TaskExited(exit) = report_rx.try_recv().unwrap() else {
+                panic!("expected the completion report");
+            };
+            assert_eq!(exit.success, code == 0);
+            assert!(exit.reply.is_some());
+            assert!(matches!(
+                reply_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
         }
     }
 

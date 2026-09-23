@@ -35,10 +35,10 @@
 //! preparation build and must reach the watcher before anything spawns, but
 //! the watcher does not exist until the runner has finished setting it up.
 //! So preparation requests that arrive before [`BatchRequest::WatchReady`] are
-//! parked here rather than queued — which is also what makes the whole
-//! startup burst land in one batch.
+//! parked here rather than queued. The first batch also waits for every task's
+//! startup check, so hashing inputs cannot split runnable tasks into later builds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot};
@@ -105,6 +105,8 @@ pub(crate) enum BatchRequest {
     WatchReady {
         updates: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
     },
+    /// A task has decided whether to join the initial preparation batch.
+    StartupTaskChecked { name: String },
     /// Queue a rebuild and (re)open the batch window. The outcome goes back
     /// to `outcome`, which is the requesting supervisor's own channel.
     QueueRebuild {
@@ -140,6 +142,7 @@ enum WorkerDone {
 /// The workspace facts every preparation batch needs, fixed at construction.
 pub(crate) struct WorkspaceContext {
     pub(crate) base_dir: PathBuf,
+    pub(crate) startup_tasks: HashSet<String>,
     /// Project-wide watch-ignore patterns, for the build-graph registrations
     /// the chain pushes to the watcher.
     pub(crate) global_watch_ignore: Vec<String>,
@@ -169,6 +172,7 @@ async fn run(
     emitter: LifecycleEmitter,
     workspace: WorkspaceContext,
 ) {
+    let mut startup_tasks = workspace.startup_tasks.clone();
     let mut scheduler = BuildBatcher::new();
     let mut rebuild_specs: HashMap<String, RebuildSpec> = HashMap::new();
     // Where each item's outcome goes. Overwritten on every queue, so it is
@@ -190,13 +194,16 @@ async fn run(
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<WorkerDone>();
 
     loop {
+        if watch_updates.is_some() && startup_tasks.is_empty() {
+            scheduler.queue_prepares(std::mem::take(&mut parked_prepares));
+        }
         tokio::select! {
             request = request_rx.recv() => match request {
                 Some(BatchRequest::QueuePrepare { item, outcome }) => {
                     let name = item.name.clone();
                     prepare_outcomes.insert(name.clone(), outcome);
                     prepare_specs.insert(name.clone(), *item);
-                    if watch_updates.is_some() {
+                    if watch_updates.is_some() && startup_tasks.is_empty() {
                         scheduler.queue_prepare(name);
                     } else if !parked_prepares.contains(&name) {
                         parked_prepares.push(name);
@@ -204,7 +211,9 @@ async fn run(
                 }
                 Some(BatchRequest::WatchReady { updates }) => {
                     watch_updates = Some(updates);
-                    scheduler.queue_prepares(std::mem::take(&mut parked_prepares));
+                }
+                Some(BatchRequest::StartupTaskChecked { name }) => {
+                    startup_tasks.remove(&name);
                 }
                 Some(BatchRequest::QueueRebuild { spec, outcome }) => {
                     scheduler.queue_rebuild(spec.name());
@@ -568,6 +577,7 @@ mod tests {
             emitter,
             WorkspaceContext {
                 base_dir: std::env::temp_dir(),
+                startup_tasks: HashSet::new(),
                 global_watch_ignore: Vec::new(),
             },
         );
@@ -646,6 +656,67 @@ mod tests {
         let extra = tokio::time::timeout(Duration::from_millis(500), api_rx.recv()).await;
         assert!(extra.is_err(), "exactly one batch for the burst");
         handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_build_waits_for_startup_task_checks() {
+        let (_writer, reader) = state_store::channel(StateSnapshot::default());
+        let (tx, handle) = spawn(
+            reader,
+            test_emitter().await,
+            WorkspaceContext {
+                base_dir: std::env::temp_dir(),
+                startup_tasks: ["migrate".to_string(), "lint".to_string()].into(),
+                global_watch_ignore: Vec::new(),
+            },
+        );
+        let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel();
+        tx.send(BatchRequest::QueuePrepare {
+            item: Box::new(prepare_item("api")),
+            outcome: outcome_tx.clone(),
+        })
+        .unwrap();
+        tx.send(BatchRequest::WatchReady { updates: None }).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), outcome_rx.recv())
+                .await
+                .is_err()
+        );
+
+        tx.send(BatchRequest::QueuePrepare {
+            item: Box::new(prepare_item("migrate")),
+            outcome: outcome_tx,
+        })
+        .unwrap();
+        tx.send(BatchRequest::StartupTaskChecked {
+            name: "migrate".into(),
+        })
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), outcome_rx.recv())
+                .await
+                .is_err()
+        );
+
+        // A manual task releases its check without requesting an artifact.
+        tx.send(BatchRequest::StartupTaskChecked {
+            name: "lint".into(),
+        })
+        .unwrap();
+        for _ in 0..2 {
+            let outcome = tokio::time::timeout(Duration::from_secs(1), outcome_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(outcome, PrepareOutcome::Failed(_)));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), outcome_rx.recv())
+                .await
+                .is_err()
+        );
+        handle.abort();
+        let _ = handle.await;
     }
 
     /// One edit fans out into a rebuild request per affected service; those

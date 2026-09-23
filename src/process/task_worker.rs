@@ -9,9 +9,7 @@ use std::time::Instant;
 
 #[derive(Clone, Copy)]
 pub(crate) enum TaskRunMode {
-    Startup {
-        has_dependents: bool,
-    },
+    Startup,
     Triggered,
     /// A watch trigger that landed while this task was running, or just after
     /// it finished — so the change may be the task's own output arriving back
@@ -28,7 +26,6 @@ pub(crate) enum TaskRunMode {
 }
 
 pub(crate) enum TaskRunPrepared {
-    PendingRun { message: String },
     Skipped { message: String },
     Spawned(Box<task::TaskSpawn>),
 }
@@ -110,7 +107,7 @@ struct StartupTaskInputs {
 
 /// What to do with a task during the startup sweep.
 #[derive(Debug, PartialEq, Eq)]
-enum StartupTaskDecision {
+pub(crate) enum StartupTaskDecision {
     /// Don't run; report the reason and leave the task idle.
     Skip { message: &'static str },
     /// Don't auto-run, but mark the task as needing a manual run.
@@ -192,6 +189,96 @@ fn decide_startup_task(inputs: StartupTaskInputs) -> StartupTaskDecision {
     StartupTaskDecision::Run
 }
 
+pub(crate) async fn check_startup_task(
+    ctx: &TaskWorkerContext,
+    name: &str,
+    task_cfg: &crate::config::Task,
+    has_dependents: bool,
+) -> StartupTaskDecision {
+    let TaskWorkerContext {
+        base_dir,
+        emitter,
+        global_watch_ignore,
+        ..
+    } = ctx;
+    let has_watch = !task_cfg.watch.is_empty();
+    let watch_base = working_dir_for(base_dir, task_cfg.dir.as_deref());
+    let ignore_patterns =
+        resolve_watch_ignore_patterns(&watch_base, &task_cfg.ignore, base_dir, global_watch_ignore);
+    let task_state = TaskStateStore::new(base_dir.join(".don").join("task-state"));
+    let needs_watch_run = if has_watch {
+        let check_started = Instant::now();
+        emitter.service_debug_event(
+            name,
+            &format!(
+                "task state: watched input check started base={} patterns={:?} ignore_patterns={}",
+                watch_base.display(),
+                task_cfg.watch,
+                ignore_patterns.len()
+            ),
+        );
+        let progress_emitter = emitter.clone();
+        let progress_name = name.to_string();
+        match task_state
+            .needs_run_with_progress(
+                name,
+                &task_cfg.watch,
+                &ignore_patterns,
+                Some(&watch_base),
+                move |progress| {
+                    progress_emitter
+                        .service_debug_event(&progress_name, &format_hash_progress(progress));
+                },
+            )
+            .await
+        {
+            Ok(needs_run) => {
+                emitter.service_debug_event(
+                    name,
+                    &format!(
+                        "task state: watched input check complete changed={needs_run} elapsed={:?}",
+                        check_started.elapsed()
+                    ),
+                );
+                needs_run
+            }
+            Err(e) => {
+                emitter.service_debug_event(
+                    name,
+                    &format!(
+                        "task state: watched input check failed after {:?}: {e}; treating inputs as changed",
+                        check_started.elapsed()
+                    ),
+                );
+                true
+            }
+        }
+    } else {
+        false
+    };
+    let has_success = match task_state.has_success(name).await {
+        Ok(has_success) => has_success,
+        Err(e) => {
+            emitter.service_debug_event(
+                name,
+                &format!(
+                    "task state: failed to read prior success marker: {e}; treating task as never successful"
+                ),
+            );
+            false
+        }
+    };
+
+    decide_startup_task(StartupTaskInputs {
+        auto_run: task_cfg.auto_run,
+        has_params: !task_cfg.params.is_empty(),
+        has_watch,
+        needs_watch_run,
+        has_success,
+        has_dependents,
+    })
+}
+
 pub(crate) async fn run_task_worker(
     ctx: TaskWorkerContext,
     name: &str,
@@ -268,98 +355,6 @@ pub(crate) async fn run_task_worker(
                     &format!("task state: self-write check failed: {e}; running anyway"),
                 );
             }
-        }
-    }
-    if let TaskRunMode::Startup { has_dependents } = mode {
-        let has_watch = !task_cfg.watch.is_empty();
-        let watch_base = working_dir_for(&base_dir, task_cfg.dir.as_deref());
-        let ignore_patterns = resolve_watch_ignore_patterns(
-            &watch_base,
-            &task_cfg.ignore,
-            &base_dir,
-            &global_watch_ignore,
-        );
-        let task_state = TaskStateStore::new(base_dir.join(".don").join("task-state"));
-        let needs_watch_run = if has_watch {
-            let check_started = Instant::now();
-            emitter.service_debug_event(
-                name,
-                &format!(
-                    "task state: watched input check started base={} patterns={:?} ignore_patterns={}",
-                    watch_base.display(),
-                    task_cfg.watch,
-                    ignore_patterns.len()
-                ),
-            );
-            let progress_emitter = emitter.clone();
-            let progress_name = name.to_string();
-            match task_state
-                .needs_run_with_progress(
-                    name,
-                    &task_cfg.watch,
-                    &ignore_patterns,
-                    Some(&watch_base),
-                    move |progress| {
-                        progress_emitter
-                            .service_debug_event(&progress_name, &format_hash_progress(progress));
-                    },
-                )
-                .await
-            {
-                Ok(needs_run) => {
-                    emitter.service_debug_event(
-                        name,
-                        &format!(
-                            "task state: watched input check complete changed={needs_run} elapsed={:?}",
-                            check_started.elapsed()
-                        ),
-                    );
-                    needs_run
-                }
-                Err(e) => {
-                    emitter.service_debug_event(
-                        name,
-                        &format!(
-                            "task state: watched input check failed after {:?}: {e}; treating inputs as changed",
-                            check_started.elapsed()
-                        ),
-                    );
-                    true
-                }
-            }
-        } else {
-            false
-        };
-        let has_success = match task_state.has_success(name).await {
-            Ok(has_success) => has_success,
-            Err(e) => {
-                emitter.service_debug_event(
-                    name,
-                    &format!(
-                        "task state: failed to read prior success marker: {e}; treating task as never successful"
-                    ),
-                );
-                false
-            }
-        };
-
-        match decide_startup_task(StartupTaskInputs {
-            auto_run: task_cfg.auto_run,
-            has_params: !task_cfg.params.is_empty(),
-            has_watch,
-            needs_watch_run,
-            has_success,
-            has_dependents,
-        }) {
-            StartupTaskDecision::Skip { message } => {
-                return Ok(TaskRunPrepared::Skipped {
-                    message: message.to_string(),
-                });
-            }
-            StartupTaskDecision::PendingRun { message } => {
-                return Ok(TaskRunPrepared::PendingRun { message });
-            }
-            StartupTaskDecision::Run => {}
         }
     }
 

@@ -32,24 +32,24 @@ impl Runner {
             .filter(|(_, rs)| rs.resolved.lazy)
             .map(|(name, _)| name.as_str())
             .collect();
-        !self
-            .facts_snapshot()
-            .iter()
-            .any(|(name, facts)| match facts.phase {
-                Phase::Service(state) => {
-                    !lazy.contains(name.as_str())
-                        && matches!(
-                            state,
-                            ServiceState::Pending
-                                | ServiceState::Building
-                                | ServiceState::Starting
-                                | ServiceState::Running
-                        )
+        !self.facts_snapshot().iter().any(|(name, facts)| {
+            facts.report_pending
+                || match facts.phase {
+                    Phase::Service(state) => {
+                        !lazy.contains(name.as_str())
+                            && matches!(
+                                state,
+                                ServiceState::Pending
+                                    | ServiceState::Building
+                                    | ServiceState::Starting
+                                    | ServiceState::Running
+                            )
+                    }
+                    Phase::Task(state) => matches!(
+                        state,
+                        TaskState::Pending | TaskState::Building | TaskState::Running
+                    ),
                 }
-                Phase::Task(state) => matches!(
-                    state,
-                    TaskState::Pending | TaskState::Building | TaskState::Running
-                ),
-            })
+        })
     }
 }
