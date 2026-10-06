@@ -3,6 +3,7 @@
 use super::error::SecretError;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// The kind of secret source — exactly one of these must be set.
 ///
@@ -24,6 +25,17 @@ pub struct AwsSsmConfig {
     /// run reads parameters that live in separate accounts.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Read region, names and paths from an SSM argument file into one group.
+    #[serde(default, rename = "args-file")]
+    pub args_file: Option<ArgsFile>,
+}
+
+/// A line-oriented SSM argument file and the group receiving all its variables.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArgsFile {
+    pub path: PathBuf,
+    pub group: String,
 }
 
 /// A named bundle of secret keys, referenced from `secrets = ["group"]`.
@@ -89,6 +101,52 @@ impl TryFrom<RawSecretsConfig> for SecretsConfig {
 }
 
 impl SecretsConfig {
+    /// Resolve an argument file relative to the directory containing don.toml.
+    /// Inline mappings, groups and region cannot accompany a file-backed source.
+    pub fn load_args_file(&mut self, config_dir: &Path) -> Result<(), SecretError> {
+        let SecretKind::AwsSsm(aws) = &self.kind;
+        let Some(file) = &aws.args_file else {
+            return Ok(());
+        };
+        if !self.vars.is_empty() || !self.groups.is_empty() || aws.region.is_some() {
+            return Err(SecretError::msg(
+                "aws-ssm.args-file cannot be combined with vars, groups or aws-ssm.region",
+            ));
+        }
+        if file.path.as_os_str().is_empty() || file.group.is_empty() {
+            return Err(SecretError::msg(
+                "aws-ssm.args-file needs a nonempty path and group",
+            ));
+        }
+        let path = config_dir.join(&file.path);
+        let content = std::fs::read_to_string(&path).map_err(|error| {
+            SecretError::msg(format!(
+                "failed to read SSM args-file '{}': {error}",
+                path.display()
+            ))
+        })?;
+        let manifest = super::args_file::parse(&content).map_err(|error| {
+            SecretError::msg(format!("SSM args-file '{}': {error}", path.display()))
+        })?;
+        let groups = HashMap::from([(
+            file.group.clone(),
+            Group {
+                keys: manifest.keys,
+            },
+        )]);
+        let mut aws = aws.clone();
+        aws.region = Some(manifest.region);
+        aws.args_file = None;
+        let loaded = SecretsConfig {
+            kind: SecretKind::AwsSsm(aws),
+            vars: manifest.vars,
+            groups,
+        };
+        loaded.validate()?;
+        *self = loaded;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), SecretError> {
         let errors = self.mapping_errors();
         if errors.is_empty() {
@@ -99,6 +157,9 @@ impl SecretsConfig {
     }
 
     pub fn mapping_errors(&self) -> Vec<String> {
+        if matches!(&self.kind, SecretKind::AwsSsm(aws) if aws.args_file.is_some()) {
+            return vec!["unresolved aws-ssm.args-file — load with Config::from_file or call load_args_file first".into()];
+        }
         let mut errors = Vec::new();
         if self.vars.is_empty() {
             errors.push("vars is empty — nothing to fetch".to_string());

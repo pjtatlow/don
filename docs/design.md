@@ -111,6 +111,27 @@ aws-ssm = { profile = "prod" }
 vars = { LAUNCH_DARKLY_SDK_KEY = "/RedoProduction/LaunchDarklySdkKey" }
 ```
 
+An existing SSM argument file can supply an entire group directly, so a CLI
+fetcher and Don use the same declaration:
+
+```toml
+[[secrets]]
+aws-ssm = { profile = "dev", args-file = { path = "tools/local/dev-secrets.args", group = "development" } }
+```
+
+The file contains one argument per line: `--region`, its value, then repeated
+`--var`, environment variable name, and SSM parameter path. Don does no shell
+expansion. It derives the mapping and group membership from the file. Identical
+duplicate variables are deduplicated; conflicting paths are rejected. This
+source cannot also declare inline `vars`, `groups`, or `aws-ssm.region`.
+Credentials remain in `aws-ssm.profile` or the AWS default chain.
+
+The path is relative to the directory containing `don.toml`, including when
+selected by a profile or `.local.toml` override. It is read after those overrides
+on every config load (`start` or `validate`); changing it requires a new start.
+Library consumers use `Config::from_file` or resolve the source explicitly with
+`SecretsConfig::load_args_file` before validation or fetching.
+
 Groups and managed names are the union across sources, so a process may declare
 a group from one and a key from another. A name supplied by more than one source
 takes the value of the last source that supplies it.

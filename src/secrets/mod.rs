@@ -1,5 +1,6 @@
 //! In-memory secret values and AWS SSM fetch via the AWS SDK. Extract this directory as `key`.
 
+mod args_file;
 mod aws;
 mod config;
 mod error;
