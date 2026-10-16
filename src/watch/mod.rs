@@ -1335,16 +1335,16 @@ fn is_covered(
     mode: RecursiveMode,
     existing: &HashMap<PathBuf, RecursiveMode>,
 ) -> bool {
-    if existing
-        .iter()
-        .any(|(dir, m)| *m == RecursiveMode::Recursive && path.starts_with(dir))
-    {
-        return true;
-    }
     if mode == RecursiveMode::NonRecursive && existing.contains_key(path) {
         return true;
     }
-    false
+    // Only ancestors can cover this path. Looking them up avoids scanning
+    // every registered directory for each request in a large workspace.
+    // An empty path is a prefix of absolute paths too, but not an ancestor.
+    existing.get(Path::new("")) == Some(&RecursiveMode::Recursive)
+        || path
+            .ancestors()
+            .any(|dir| existing.get(dir) == Some(&RecursiveMode::Recursive))
 }
 
 /// Build an `ignore` override matcher from the workspace `watch_ignore` globs,
@@ -1628,26 +1628,27 @@ fn reconcile_watches(
     desired: &[(PathBuf, RecursiveMode)],
     registered: &HashMap<PathBuf, RecursiveMode>,
 ) -> Vec<WatchAction> {
-    // Simulate the registration as we go so a recursive watch planned early in
-    // the batch covers its descendants later in the batch.
-    let mut sim = registered.clone();
+    // Track additions separately so each request needn't clone the entire
+    // registered set. Earlier additions still cover later requests in this batch.
+    let mut planned = HashMap::new();
     // Ancestors first: a recursive ancestor added early covers descendants.
     let mut ordered: Vec<&(PathBuf, RecursiveMode)> = desired.iter().collect();
     ordered.sort_by_key(|(dir, _)| dir.components().count());
 
     let mut actions = Vec::new();
     for (dir, mode) in ordered {
-        if is_covered(dir, *mode, &sim) {
+        if is_covered(dir, *mode, registered) || is_covered(dir, *mode, &planned) {
             continue;
         }
-        let replace =
-            *mode == RecursiveMode::Recursive && sim.get(dir) == Some(&RecursiveMode::NonRecursive);
+        let replace = *mode == RecursiveMode::Recursive
+            && planned.get(dir).or_else(|| registered.get(dir))
+                == Some(&RecursiveMode::NonRecursive);
         actions.push(WatchAction {
             dir: dir.clone(),
             mode: *mode,
             replace,
         });
-        sim.insert(dir.clone(), *mode);
+        planned.insert(dir.clone(), *mode);
     }
     actions
 }
@@ -2021,6 +2022,27 @@ mod tests {
                 existing: vec![("/a/c", RecursiveMode::Recursive)],
                 expected: false,
             },
+            Case {
+                name: "shared string prefix is not an ancestor",
+                path: "/ab/c",
+                mode: RecursiveMode::NonRecursive,
+                existing: vec![("/a", RecursiveMode::Recursive)],
+                expected: false,
+            },
+            Case {
+                name: "empty recursive prefix covers an absolute path",
+                path: "/a/b",
+                mode: RecursiveMode::Recursive,
+                existing: vec![("", RecursiveMode::Recursive)],
+                expected: true,
+            },
+            Case {
+                name: "relative recursive ancestor covers its descendant",
+                path: "a/b/c",
+                mode: RecursiveMode::Recursive,
+                existing: vec![("a", RecursiveMode::Recursive)],
+                expected: true,
+            },
         ];
 
         for case in cases {
@@ -2102,6 +2124,35 @@ mod tests {
                 desired: vec![("/a/b", NonRecursive)],
                 registered: vec![("/a", Recursive)],
                 expected: vec![],
+            },
+            Case {
+                name: "duplicate new non-recursive requests register once",
+                desired: vec![("/a", NonRecursive), ("/a", NonRecursive)],
+                registered: vec![],
+                expected: vec![("/a", NonRecursive, false)],
+            },
+            Case {
+                name: "upgrade a planned watch and cover its descendants",
+                desired: vec![
+                    ("/a", NonRecursive),
+                    ("/a", Recursive),
+                    ("/a/b", NonRecursive),
+                    ("/a", Recursive),
+                ],
+                registered: vec![],
+                expected: vec![("/a", NonRecursive, false), ("/a", Recursive, true)],
+            },
+            Case {
+                name: "registered and planned watches both provide coverage",
+                desired: vec![
+                    ("/a/child", NonRecursive),
+                    ("/b/child", NonRecursive),
+                    ("/b", Recursive),
+                    ("/c", Recursive),
+                    ("/c", Recursive),
+                ],
+                registered: vec![("/a", Recursive), ("/b", NonRecursive)],
+                expected: vec![("/b", Recursive, true), ("/c", Recursive, false)],
             },
         ];
 
