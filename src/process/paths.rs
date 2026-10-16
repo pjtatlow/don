@@ -147,9 +147,10 @@ fn scan_changed_paths(
 
 fn is_ignored(path: &Path, patterns: &[glob::Pattern]) -> bool {
     let path = path.to_string_lossy();
-    patterns
-        .iter()
-        .any(|pattern| matches_ignore(pattern, &path))
+    patterns.iter().any(|pattern| {
+        matches_ignore(pattern, &path)
+            || pattern.as_str().strip_suffix("/**") == Some(path.as_ref())
+    })
 }
 
 fn scan_tree_for_changes(
@@ -163,13 +164,25 @@ fn scan_tree_for_changes(
         return false;
     }
     let Some(metadata) = scan.metadata(path) else {
+        // A directory removed before watches were installed has no metadata
+        // left to inspect. Its nearest surviving ancestor records the removal.
+        let mut ancestor = path.parent();
+        while let Some(parent) = ancestor {
+            if let Some(metadata) = scan.metadata(parent) {
+                return metadata.modified().is_ok_and(|modified| modified > since);
+            }
+            ancestor = parent.parent();
+        }
         return false;
     };
     let path_str = path.to_string_lossy();
-    if patterns
-        .iter()
-        .any(|pattern| matches_glob(pattern, &path_str))
-    {
+    if patterns.iter().any(|pattern| {
+        matches_glob(pattern, &path_str)
+                // `pkg/**` doesn't match `pkg` itself. Its mtime is the only
+                // remaining evidence when a direct child was deleted or renamed.
+                || (metadata.is_dir()
+                    && pattern.as_str().strip_suffix("/**") == Some(path_str.as_ref()))
+    }) {
         let Ok(modified) = metadata.modified() else {
             return false;
         };

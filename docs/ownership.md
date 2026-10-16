@@ -366,16 +366,22 @@ construction.
 Lazy services are the exception for the reason that makes the rule: nothing
 wants one yet, so its supervisor asks on first demand.
 
-One request is late by construction, and it is why nothing builds the instant
-`Runner::new` returns. Watch paths are resolved *by* these builds and have to
-reach the watcher before anything spawns — but the watcher does not exist
-until the runner has set it up. The build manager parks preparation requests
-until the runner says `WatchReady` and every task has finished its startup
-check. This keeps slow input hashing in the same initial batch. Later explicit
-task runs still request a fresh build. A supervisor then waits for its outcome
-before spawning, so the registrations are always in place first.
+The build manager parks preparation requests until the runner says `WatchReady`
+and every task has finished its startup check. The initial watcher covers
+explicit patterns and workspace graph sentinels; dependency graph discovery is
+not part of that barrier. After build and binary-path cquery, the manager
+releases services immediately. The same owned worker then queries dependencies,
+registers their watches, and checks the startup gap. Tasks retain their existing explicit input watches and auto-run policy; they
+do not request Bazel dependency watches. Missing executable paths wait for
+setup because their `bazel run` fallback can itself build.
 
-### Two rules that come with it
+The preparation slot stays occupied until watch setup finishes, even though
+services have already received their artifacts. The Bazel mutex covers the whole
+chain and graph requeries too, so a deferred query cannot contend with another
+Don build. Cancellation drops the owned worker and its Bazel client; XML parsing
+and filesystem scans run on blocking workers without blocking the runner.
+
+### Rules that come with it
 
 **Build failures do not retry; runtime failures do.** Retrying a compile that
 just failed recompiles the same broken code. The restart policy exists for
@@ -384,16 +390,19 @@ plausibly change the answer. A supervisor whose build fails withdraws its own
 demand, so the failure never reaches `RestartPolicy` at all; only an explicit
 request by name starts that process again.
 
-**The startup mtime scan survives.** `run_batch_build_chain` stamps a
-timestamp before building and afterwards checks whether any watched source or
-BUILD file is newer, reporting `PrepareOutcome::Stale` — "you edited a file
-while the build was running, so build again before starting". That looks like
-the rebuild cycle's staleness flag but cannot be merged with it: the cycle
-learns staleness from the *watcher*, and during this build nothing is watching
-those paths yet, because the watch paths are resolved **by that build**. The
-mtime scan is the only thing covering that bootstrap window. It lives in the
-build manager with the rest of the chain, and the supervisor answers it by
-asking again.
+**The startup mtime scan survives.** `run_batch_build_chain` stamps a timestamp
+before building and checks sources and graph definitions after every watch
+registration is acknowledged. An edit in that interval is either covered by
+this scan or queued by a live watch. Directory mtimes also cover deletion and
+rename. Services receive ordinary watch invalidations through the watcher. An artifact
+withheld because cquery did not resolve its executable receives
+`PrepareOutcome::Stale` and prepares again before running.
+The scan remains separate from a running service's rebuild-cycle stale flag.
+
+If the dependency query fails, the manager installs conservative workspace
+coverage so the next edit retries graph resolution, and asks Bazel whether each
+built target is still current. Successful resolution replaces that coverage with
+per-target patterns.
 
 **A re-query is a build too.** A changed BUILD file means the watch patterns
 resolved from it may be wrong, so the supervisor asks for a re-query the same

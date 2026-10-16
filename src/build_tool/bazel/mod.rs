@@ -5,6 +5,8 @@
 //! External dependencies and generated files are filtered out.
 
 mod graph;
+#[cfg(test)]
+mod profile;
 
 use super::{AbortOnDrop, BuildToolError, ResolvedBuildInfo};
 use std::collections::HashMap;
@@ -419,26 +421,60 @@ impl BazelResolver {
             .collect::<Vec<_>>()
             .join(" + ");
         let query = format!("deps({union_expr})");
+        let query_started = std::time::Instant::now();
         let xml = self.run_query(&query, "xml", working_dir).await?;
-
-        let graph = graph::BazelDepGraph::parse_xml(xml.as_bytes())?;
-
-        for target in targets {
-            let packages = graph.packages_for(target);
-            let watch_paths: Vec<String> = packages.iter().map(|p| format!("{p}/**")).collect();
-            let graph_definition_globs: Vec<String> = packages
-                .iter()
-                .flat_map(|p| [format!("{p}/BUILD"), format!("{p}/BUILD.bazel")])
-                .collect();
-            out.insert(
-                target.clone(),
-                ResolvedBuildInfo {
-                    watch_paths,
-                    graph_definition_globs,
-                },
-            );
+        if let Some(emitter) = &self.emitter {
+            emitter.debug_event(&format!(
+                "watch: dependency query bytes={} elapsed={:?}",
+                xml.len(),
+                query_started.elapsed()
+            ));
         }
-        Ok(out)
+
+        // Parsing and per-target DFS are CPU work. Keep them off runtime
+        // threads so the freshly released services and Ctrl+C remain responsive.
+        let targets = targets.to_vec();
+        let emitter = self.emitter.clone();
+        tokio::task::spawn_blocking(move || {
+            let parse_started = std::time::Instant::now();
+            let graph = graph::BazelDepGraph::parse_xml(xml.as_bytes())?;
+            if let Some(emitter) = &emitter {
+                emitter.debug_event(&format!(
+                    "watch: XML parse elapsed={:?}",
+                    parse_started.elapsed()
+                ));
+            }
+
+            let attribution_started = std::time::Instant::now();
+            for target in &targets {
+                let packages = graph.packages_for(target);
+                let watch_paths: Vec<String> = packages.iter().map(|p| format!("{p}/**")).collect();
+                let graph_definition_globs: Vec<String> = packages
+                    .iter()
+                    .flat_map(|p| [format!("{p}/BUILD"), format!("{p}/BUILD.bazel")])
+                    .collect();
+                out.insert(
+                    target.clone(),
+                    ResolvedBuildInfo {
+                        watch_paths,
+                        graph_definition_globs,
+                    },
+                );
+            }
+            if let Some(emitter) = &emitter {
+                emitter.debug_event(&format!(
+                    "watch: target attribution targets={} elapsed={:?}",
+                    targets.len(),
+                    attribution_started.elapsed()
+                ));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|error| BuildToolError::ParseError {
+            tool: "bazel".into(),
+            message: format!("dependency graph worker failed: {error}"),
+        })?
     }
 
     /// Resolve the output binary paths for a batch of Bazel targets in ONE

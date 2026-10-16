@@ -228,7 +228,16 @@ impl WindowTally {
 ///
 /// Sent from the runner to the watch manager after a build tool re-query
 /// completes, containing the new tier-2 watch patterns.
-pub(crate) struct WatchUpdate {
+pub(crate) enum WatchUpdate {
+    Register(WatchRegistration),
+    /// Replay a change found by the post-registration startup gap scan.
+    Changed {
+        name: String,
+        kind: WatchItemKind,
+    },
+}
+
+pub(crate) struct WatchRegistration {
     /// The service or task name (matches the key in `items`).
     pub name: String,
     /// What kind of item this is (Service or Task). Used when creating
@@ -751,7 +760,7 @@ impl WatchManager {
                         RecursiveMode::NonRecursive,
                         &mut registered_dirs,
                     ) {
-                        Ok(()) => {
+                        Ok(_) => {
                             emitter.debug_event(&format!(
                                 "watch: workspace graph backend registration complete root={} backend={} elapsed={:?}",
                                 base_dir.display(),
@@ -870,7 +879,10 @@ impl WatchManager {
                     self.fire_debounce_timers().await;
                 }
                 Some(update) = self.update_rx.recv() => {
-                    self.apply_watch_update(update);
+                    match update {
+                        WatchUpdate::Register(registration) => self.apply_watch_update(registration),
+                        WatchUpdate::Changed { name, kind } => self.dispatch.changed(&name, kind),
+                    }
                 }
                 Some(query) = self.query_rx.recv() => {
                     let _ = query.reply.send(self.snapshot());
@@ -883,7 +895,10 @@ impl WatchManager {
     ///
     /// Replaces the watch patterns for the named item and registers any
     /// new watch directories with the notify watcher.
-    fn apply_watch_update(&mut self, mut update: WatchUpdate) {
+    fn apply_watch_update(&mut self, mut update: WatchRegistration) {
+        let started = Instant::now();
+        let mut timings = RegistrationTimings::default();
+        let directories_before = self.registered_dirs.len();
         // Canonicalize the base so the compiled globs are absolute and match
         // the cwd-prefixed absolute paths that notify reports in events.
         // Without this, a runner base_dir of `.` produces patterns like
@@ -910,18 +925,22 @@ impl WatchManager {
                         // patterns (`<pkg>/BUILD`, `<pkg>/package.json`) — a
                         // non-recursive watch on the package directory is
                         // exactly right, no subtree walk.
-                        WatchItemKind::BuildGraph => register_single_dir(
-                            &mut self.watcher,
-                            &self.notify_tx,
-                            &watch_dir,
-                            RecursiveMode::NonRecursive,
-                            &mut self.registered_dirs,
-                        ),
+                        WatchItemKind::BuildGraph if !pattern_str.ends_with("/**") => {
+                            register_single_dir(
+                                &mut self.watcher,
+                                &self.notify_tx,
+                                &watch_dir,
+                                RecursiveMode::NonRecursive,
+                                &mut self.registered_dirs,
+                            )
+                        }
                         // Tier-2 Service/Task updates are directory-level globs
                         // (`<pkg>/**`) that need recursive coverage — routed
                         // through the same `watch_ignore`-aware registration as
                         // startup so ignored subtrees stay pruned on reload.
-                        WatchItemKind::Service | WatchItemKind::Task => register_dirs_ignoring(
+                        WatchItemKind::Service
+                        | WatchItemKind::Task
+                        | WatchItemKind::BuildGraph => register_dirs_ignoring(
                             &mut self.watcher,
                             &self.notify_tx,
                             &watch_dir,
@@ -929,6 +948,11 @@ impl WatchManager {
                             &mut self.registered_dirs,
                         ),
                     };
+                    if let Ok(measured) = &result {
+                        timings.traversal += measured.traversal;
+                        timings.reconcile += measured.reconcile;
+                        timings.backend += measured.backend;
+                    }
                     if let Err(e) = result {
                         self.record_item_error(
                             &update.name,
@@ -988,6 +1012,18 @@ impl WatchManager {
             );
         }
 
+        self.emitter.service_debug_event(
+            &update.name,
+            &format!(
+                "watch: registration patterns={} added_dirs={} traversal={:?} reconcile={:?} backend={:?} elapsed={:?}",
+                update.patterns.len(),
+                self.registered_dirs.len() - directories_before,
+                timings.traversal,
+                timings.reconcile,
+                timings.backend,
+                started.elapsed()
+            ),
+        );
         if let Some(applied_tx) = update.applied_tx.take() {
             let _ = applied_tx.send(());
         }
@@ -1532,30 +1568,60 @@ fn apply_initial_watch_batch(
 ///
 /// That reasoning does **not** transfer to macOS, where a per-directory scheme
 /// is pathologically slow — see [`desired_watches`].
+#[derive(Default)]
+struct RegistrationTimings {
+    traversal: Duration,
+    reconcile: Duration,
+    backend: Duration,
+}
+
 fn register_dirs_ignoring(
     watcher: &mut Option<NotifyBackend>,
     notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
     root: &Path,
     overrides: &Override,
     registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
-) -> Result<(), WatchError> {
+) -> Result<RegistrationTimings, WatchError> {
+    let started = Instant::now();
     let desired = desired_watches(root, overrides);
-    let actions = reconcile_watches(&desired, registered_dirs);
-    apply_watch_actions(watcher, notify_tx, actions, registered_dirs)
+    let traversal = started.elapsed();
+    let mut timings = register_desired(watcher, notify_tx, &desired, registered_dirs)?;
+    timings.traversal = traversal;
+    Ok(timings)
 }
 
-/// Register a single directory under `mode`, reconciling against existing
-/// watches (skip if already covered). Used for tier-1 build-graph patterns,
-/// which are exact filenames in a package dir and need no subtree walk.
+/// Register a single directory, skipping it if already covered.
 fn register_single_dir(
     watcher: &mut Option<NotifyBackend>,
     notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
     dir: &Path,
     mode: RecursiveMode,
     registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
-) -> Result<(), WatchError> {
-    let actions = reconcile_watches(&[(dir.to_path_buf(), mode)], registered_dirs);
-    apply_watch_actions(watcher, notify_tx, actions, registered_dirs)
+) -> Result<RegistrationTimings, WatchError> {
+    register_desired(
+        watcher,
+        notify_tx,
+        &[(dir.to_path_buf(), mode)],
+        registered_dirs,
+    )
+}
+
+fn register_desired(
+    watcher: &mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    desired: &[(PathBuf, RecursiveMode)],
+    registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
+) -> Result<RegistrationTimings, WatchError> {
+    let started = Instant::now();
+    let actions = reconcile_watches(desired, registered_dirs);
+    let reconcile = started.elapsed();
+    let started = Instant::now();
+    apply_watch_actions(watcher, notify_tx, actions, registered_dirs)?;
+    Ok(RegistrationTimings {
+        traversal: Duration::ZERO,
+        reconcile,
+        backend: started.elapsed(),
+    })
 }
 
 /// Compute the desired watch set for `root`'s subtree.
