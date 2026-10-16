@@ -1017,7 +1017,7 @@ impl WatchManager {
             &format!(
                 "watch: registration patterns={} added_dirs={} traversal={:?} reconcile={:?} backend={:?} elapsed={:?}",
                 update.patterns.len(),
-                self.registered_dirs.len() - directories_before,
+                self.registered_dirs.len().saturating_sub(directories_before),
                 timings.traversal,
                 timings.reconcile,
                 timings.backend,
