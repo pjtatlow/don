@@ -1,7 +1,8 @@
 # Deferred dependency watches
 
-Services with a resolved executable start after the initial Bazel build and
-binary-path cquery. Dependency query, XML parsing, per-target attribution, watch
+Services with a resolved executable start as soon as Bazel reports their own
+target complete (read from the build event file), not when the whole initial
+build ends; the binary-path cquery runs before the build. Dependency query, XML parsing, per-target attribution, watch
 registration, and the gap scan follow in the same owned preparation worker.
 All Don preparation, rebuild, and graph requery commands share the Bazel mutex.
 

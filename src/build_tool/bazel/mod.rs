@@ -4,6 +4,7 @@
 //! using `bazel query` with `--output=package` for directory-level granularity.
 //! External dependencies and generated files are filtered out.
 
+pub(crate) mod bep;
 mod graph;
 #[cfg(test)]
 mod profile;
@@ -60,12 +61,18 @@ pub(crate) struct BazelResolver {
 /// bazel-prefixed stream; the sanitize pass keeps SGR and strips only
 /// cursor/screen codes.
 ///
-/// A configured `--config` goes *after* both, so a workspace that deliberately
-/// sets either of them in its `.bazelrc` wins. That includes winning in ways
-/// that stop don reading this output as lines, which is the workspace's call
-/// to make.
-fn build_args(targets: &[String], config: Option<&str>) -> Vec<String> {
+/// `--build_event_json_file` is how don learns each target is done while the
+/// rest of the build runs; see [`bep`].
+///
+/// A configured `--config` goes *after* don's flags, so a workspace that
+/// deliberately sets either of the first two in its `.bazelrc` wins. That
+/// includes winning in ways that stop don reading this output as lines, which
+/// is the workspace's call to make.
+fn build_args(targets: &[String], config: Option<&str>, bep_file: Option<&Path>) -> Vec<String> {
     let mut args: Vec<String> = vec!["build".into(), "--curses=no".into(), "--color=yes".into()];
+    if let Some(bep_file) = bep_file {
+        args.push(format!("--build_event_json_file={}", bep_file.display()));
+    }
     if let Some(config) = config {
         args.push(format!("--config={config}"));
     }
@@ -124,8 +131,21 @@ impl BazelResolver {
         output_format: &str,
         working_dir: &Path,
     ) -> Result<String, BuildToolError> {
+        self.run_command(
+            &["query", query, &format!("--output={output_format}")],
+            working_dir,
+        )
+        .await
+    }
+
+    /// Run a quiet bazel command and return stdout as a string.
+    async fn run_command(
+        &self,
+        args: &[&str],
+        working_dir: &Path,
+    ) -> Result<String, BuildToolError> {
         let mut child = tokio::process::Command::new("bazel")
-            .args(["query", query, &format!("--output={output_format}")])
+            .args(args)
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -136,9 +156,9 @@ impl BazelResolver {
                 source: e,
             })?;
 
-        // Keep query progress quiet. The only live signal worth surfacing
-        // here is Bazel waiting behind another command; failures still
-        // come back with captured stderr in the returned error.
+        // Keep progress quiet. The only live signal worth surfacing here is
+        // Bazel waiting behind another command; failures still come back
+        // with captured stderr in the returned error.
         let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone(), true);
 
         // `wait_with_output` reads whatever pipes are still attached; we
@@ -181,6 +201,12 @@ impl BazelResolver {
     /// running separate builds per target. Returns which targets succeeded/failed.
     ///
     /// Build output is streamed line-by-line through the provided callback.
+    ///
+    /// With `bep`, each target's verdict is also sent the moment Bazel
+    /// reports it, and the returned result is settled from those verdicts:
+    /// they say exactly which targets were built, where the exit code and
+    /// `ERROR:` lines can only guess. A target the events never mention falls
+    /// back to the guess.
     pub(crate) async fn build_targets<F>(
         &self,
         targets: &[String],
@@ -188,6 +214,7 @@ impl BazelResolver {
         config: Option<&str>,
         mut on_line: F,
         emitter: Option<&crate::output::LifecycleEmitter>,
+        bep: Option<bep::BepOutput>,
     ) -> Result<super::BatchBuildResult, BuildToolError>
     where
         F: FnMut(&str) + Send + 'static,
@@ -203,7 +230,7 @@ impl BazelResolver {
 
         // Built once and used for both the spawn and the debug line, so the
         // two cannot describe different commands.
-        let args = build_args(targets, config);
+        let args = build_args(targets, config, bep.as_ref().map(|bep| bep.path.as_path()));
         let mut cmd = tokio::process::Command::new("bazel");
         cmd.args(&args);
         cmd.current_dir(working_dir)
@@ -217,6 +244,24 @@ impl BazelResolver {
         if let Some(em) = emitter {
             em.debug_spawn("bazel", "bazel", &args);
         }
+
+        // Created before the spawn so the follower has a file to open; Bazel
+        // truncates it and writes from the start.
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel();
+        let follower = match bep {
+            Some(bep) => {
+                let io = |e| BuildToolError::Io {
+                    tool: "bazel".to_string(),
+                    source: e,
+                };
+                if let Some(dir) = bep.path.parent() {
+                    tokio::fs::create_dir_all(dir).await.map_err(io)?;
+                }
+                tokio::fs::write(&bep.path, b"").await.map_err(io)?;
+                Some(AbortOnDrop::new(tokio::spawn(bep::follow(bep, exited_rx))))
+            }
+            None => None,
+        };
 
         let mut child = cmd.spawn().map_err(|e| BuildToolError::Io {
             tool: "bazel".to_string(),
@@ -298,39 +343,34 @@ impl BazelResolver {
             None => Vec::new(),
         };
 
-        if status.success() {
-            Ok(super::BatchBuildResult {
-                succeeded: targets.to_vec(),
-                failed: Vec::new(),
-            })
-        } else {
-            // Determine which targets failed. If we identified specific targets
-            // from ERROR lines, mark those as failed and the rest as succeeded.
-            // Otherwise, conservatively mark all as failed.
-            if failed_from_output.is_empty() {
-                let code = status.code().unwrap_or(-1);
-                Ok(super::BatchBuildResult {
-                    succeeded: Vec::new(),
-                    failed: targets
-                        .iter()
-                        .map(|t| (t.clone(), format!("bazel build failed (exit code {code})")))
-                        .collect(),
-                })
-            } else {
-                let failed_set: std::collections::HashSet<&str> =
-                    failed_from_output.iter().map(|s| s.as_str()).collect();
-                let succeeded: Vec<String> = targets
-                    .iter()
-                    .filter(|t| !failed_set.contains(t.as_str()))
-                    .cloned()
-                    .collect();
-                let failed: Vec<(String, String)> = failed_from_output
-                    .iter()
-                    .map(|t| (t.clone(), "bazel build failed".to_string()))
-                    .collect();
-                Ok(super::BatchBuildResult { succeeded, failed })
+        let _ = exited_tx.send(());
+        let verdicts = match follower.and_then(AbortOnDrop::into_inner) {
+            Some(h) => h.await.unwrap_or_default(),
+            None => HashMap::new(),
+        };
+
+        let guessed = guess_from_exit(targets, status, &failed_from_output);
+        let mut result = super::BatchBuildResult {
+            succeeded: Vec::new(),
+            failed: Vec::new(),
+        };
+        for target in targets {
+            match verdicts.get(&bep::normalize_label(target)) {
+                Some(Ok(())) => result.succeeded.push(target.clone()),
+                Some(Err(message)) => result.failed.push((target.clone(), message.clone())),
+                None if guessed.succeeded.contains(target) => {
+                    result.succeeded.push(target.clone());
+                }
+                None => {
+                    if let Some((_, message)) =
+                        guessed.failed.iter().find(|(failed, _)| failed == target)
+                    {
+                        result.failed.push((target.clone(), message.clone()));
+                    }
+                }
             }
         }
+        Ok(result)
     }
 
     /// Check if targets are already up to date without building.
@@ -489,18 +529,30 @@ impl BazelResolver {
     /// absent from the returned map; the caller should fall back to
     /// `bazel run` for those.
     ///
-    /// Keys are inserted in both canonical (`@@//pkg:name`) and stripped
-    /// (`//pkg:name`) forms so callers can look up using whichever form
-    /// the user wrote in `don.toml`.
+    /// Keys are spelled by [`bep::normalize_label`]; look up the same way.
+    /// Paths are absolute, under the execution root — where `bazel run`
+    /// launches them from. Not under the workspace's `bazel-out` symlink:
+    /// Bazel creates that only when a build finishes, and `bazel clean`
+    /// deletes it, so mid-build it can be missing.
+    ///
+    /// `config` must be the build's own. That is what makes the path the one
+    /// the build writes, and lets the build that follows reuse this analysis
+    /// rather than discard it for a changed configuration.
     pub(crate) async fn resolve_binary_paths(
         &self,
         targets: &[String],
         working_dir: &Path,
-    ) -> Result<HashMap<String, String>, BuildToolError> {
-        let mut out: HashMap<String, String> = HashMap::new();
+        config: Option<&str>,
+    ) -> Result<HashMap<String, PathBuf>, BuildToolError> {
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
         if targets.is_empty() {
             return Ok(out);
         }
+        let execution_root = PathBuf::from(
+            self.run_command(&["info", "execution_root"], working_dir)
+                .await?
+                .trim(),
+        );
 
         // `set(T1 T2 ... Tn)` is bazel's space-separated set literal.
         // `set` takes bare labels — no parenthesisation (unlike `+`,
@@ -514,8 +566,12 @@ impl BazelResolver {
         let starlark = r#"str(target.label) + "\t" + (target.files_to_run.executable.path if target.files_to_run.executable else "")"#;
         let starlark_arg = format!("--starlark:expr={starlark}");
 
-        let mut child = tokio::process::Command::new("bazel")
-            .args(["cquery", &query, "--output=starlark", &starlark_arg])
+        let mut cmd = tokio::process::Command::new("bazel");
+        cmd.args(["cquery", &query, "--output=starlark", &starlark_arg]);
+        if let Some(config) = config {
+            cmd.arg(format!("--config={config}"));
+        }
+        let mut child = cmd
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -560,13 +616,50 @@ impl BazelResolver {
             if !path.starts_with("bazel-out/") {
                 continue;
             }
-            let canonical = label.to_string();
-            let stripped = label.strip_prefix("@@").unwrap_or(label).to_string();
-            out.insert(canonical, path.to_string());
-            out.insert(stripped, path.to_string());
+            out.insert(bep::normalize_label(label), execution_root.join(path));
         }
 
         Ok(out)
+    }
+}
+
+/// Which targets a build without events built, judged from its exit status
+/// and the targets its `ERROR:` lines named. All of them on success; on
+/// failure, the named ones failed and the rest are assumed built, or all
+/// failed when none was named.
+fn guess_from_exit(
+    targets: &[String],
+    status: std::process::ExitStatus,
+    failed_from_output: &[String],
+) -> super::BatchBuildResult {
+    if status.success() {
+        return super::BatchBuildResult {
+            succeeded: targets.to_vec(),
+            failed: Vec::new(),
+        };
+    }
+    if failed_from_output.is_empty() {
+        let code = status.code().unwrap_or(-1);
+        return super::BatchBuildResult {
+            succeeded: Vec::new(),
+            failed: targets
+                .iter()
+                .map(|t| (t.clone(), format!("bazel build failed (exit code {code})")))
+                .collect(),
+        };
+    }
+    let failed_set: std::collections::HashSet<&str> =
+        failed_from_output.iter().map(|s| s.as_str()).collect();
+    super::BatchBuildResult {
+        succeeded: targets
+            .iter()
+            .filter(|t| !failed_set.contains(t.as_str()))
+            .cloned()
+            .collect(),
+        failed: failed_from_output
+            .iter()
+            .map(|t| (t.clone(), "bazel build failed".to_string()))
+            .collect(),
     }
 }
 
@@ -667,7 +760,7 @@ mod tests {
 
         for case in cases {
             let targets: Vec<String> = case.targets.iter().map(|t| (*t).to_string()).collect();
-            let got = build_args(&targets, case.config);
+            let got = build_args(&targets, case.config, None);
             assert_eq!(got, case.want, "{}", case.name);
         }
     }

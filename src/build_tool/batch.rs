@@ -192,6 +192,7 @@ pub(crate) async fn run_rebuild_batch_worker(
                             line_emitter.bazel_event(line);
                         },
                         Some(&emitter),
+                        None,
                     )
                     .await
                 {
@@ -413,9 +414,10 @@ pub(crate) async fn run_graph_requery_worker(
     delivered
 }
 
-/// Build and resolve executables, release their supervisors, then resolve and
-/// register dependency watches. The same owned worker and Bazel mutex cover
-/// both phases, so shutdown cancels them together and queries never race builds.
+/// Resolve executables and build, releasing each item's supervisor as Bazel
+/// reports its target, then resolve and register dependency watches. The same
+/// owned worker and Bazel mutex cover both phases, so shutdown cancels them
+/// together and queries never race builds.
 pub(crate) async fn run_batch_build_chain<F>(
     items: Vec<BatchBuildItem>,
     base_dir: PathBuf,
@@ -441,12 +443,10 @@ pub(crate) async fn run_batch_build_chain<F>(
     // rebuild batch must not interleave with a preparation — which used to be
     // true only because the scheduler serialised the two by construction.
     let _bazel_guard = bazel_build_mutex.lock().await;
-    let mut succeeded: HashSet<String> = HashSet::new();
-    let mut failed: HashMap<String, String> = HashMap::new();
-    let mut binary_paths: HashMap<String, String> = HashMap::new();
 
-    // Build artifacts first. Bazel groups run concurrently, but each group
-    // stays inside the working directory its labels belong to.
+    // Build artifacts first, releasing each item as Bazel reports its
+    // target. Bazel groups run concurrently, but each group stays inside the
+    // working directory its labels belong to.
     let mut bazel_by_dir: BazelPrepareGroups = HashMap::new();
 
     for item in &items {
@@ -461,194 +461,81 @@ pub(crate) async fn run_batch_build_chain<F>(
         }
     }
 
-    let mut build_set: JoinSet<crate::build_tool::BatchBuildResult> = JoinSet::new();
-
-    for ((working_dir, config), bazel_items) in bazel_by_dir {
-        let targets: Vec<String> = bazel_items.iter().map(|(_, t)| t.clone()).collect();
-        let target_to_names: HashMap<String, Vec<String>> = {
-            let mut m: HashMap<String, Vec<String>> = HashMap::new();
-            for (item, target) in &bazel_items {
-                m.entry(target.clone()).or_default().push(item.name.clone());
-            }
-            m
-        };
-        let count = targets.len();
-        let em = emitter.clone();
-        let em_spawn = emitter.clone();
-        emitter.bazel_event(&format!(
-            "building {count} target{}...",
-            if count == 1 { "" } else { "s" }
+    let (released_tx, mut released_rx) = mpsc::unbounded_channel();
+    let mut build_set: JoinSet<()> = JoinSet::new();
+    for (index, ((working_dir, config), group)) in bazel_by_dir.into_iter().enumerate() {
+        // One file per concurrent group; a later batch reuses the name.
+        // Absolute, because Bazel resolves it from the group's directory.
+        let bep_path = base_dir
+            .join(".don")
+            .join(format!("bazel-events-{index}.json"));
+        let bep_path = std::path::absolute(&bep_path).unwrap_or(bep_path);
+        build_set.spawn(build_group(
+            working_dir,
+            config,
+            group,
+            bep_path,
+            emitter.clone(),
+            released_tx.clone(),
         ));
-        build_set.spawn(async move {
-            let resolver = crate::build_tool::bazel::BazelResolver::new();
-            let result = resolver
-                .build_targets(
-                    &targets,
-                    &working_dir,
-                    config.as_deref(),
-                    move |line| {
-                        em.bazel_event(line);
-                    },
-                    Some(&em_spawn),
-                )
-                .await;
-            match result {
-                Ok(batch) => {
-                    let mut succeeded: Vec<String> = Vec::new();
-                    for target in &batch.succeeded {
-                        if let Some(names) = target_to_names.get(target) {
-                            succeeded.extend(names.clone());
-                        }
-                    }
-                    let mut failed: Vec<(String, String)> = Vec::new();
-                    for (target, msg) in &batch.failed {
-                        if let Some(names) = target_to_names.get(target) {
-                            for n in names {
-                                failed.push((n.clone(), msg.clone()));
-                            }
-                        }
-                    }
-                    crate::build_tool::BatchBuildResult { succeeded, failed }
-                }
-                // Resolver errored before producing per-target results
-                // (e.g. bazel client missing, I/O failure). Mark every item
-                // in this batch as failed so the runner doesn't leave them
-                // sitting in `Building` forever.
-                Err(e) => {
-                    let msg = format!("bazel build error: {e}");
-                    let failed: Vec<(String, String)> = target_to_names
-                        .values()
-                        .flatten()
-                        .map(|n| (n.clone(), msg.clone()))
-                        .collect();
-                    crate::build_tool::BatchBuildResult {
-                        succeeded: Vec::new(),
-                        failed,
-                    }
-                }
-            }
-        });
     }
+    drop(released_tx);
 
-    while let Some(result) = build_set.join_next().await {
-        match result {
-            Ok(batch) => {
-                for name in batch.succeeded {
-                    succeeded.insert(name);
-                }
-                for (name, msg) in batch.failed {
-                    failed.insert(name, msg);
+    // Every requested name gets exactly one outcome — a supervisor is waiting
+    // on it and silence would leave it parked forever. The channel closes
+    // once every group has finished, panicked ones included.
+    //
+    // Missing executable paths wait for watch setup: their `bazel run`
+    // fallback must not contend with our dependency query for the server lock.
+    let mut undecided: HashSet<String> = items.iter().map(|item| item.name.clone()).collect();
+    let mut pending_artifacts = HashMap::new();
+    let mut built_count = 0;
+    while let Some(burst) = released_rx.recv().await {
+        let mut released = PrepareBatchOutcome {
+            warnings: Vec::new(),
+            items: Vec::new(),
+        };
+        for (name, decided) in burst {
+            if !undecided.remove(&name) {
+                continue;
+            }
+            if let PrepareOutcome::Ready { binary_path } = &decided {
+                built_count += 1;
+                if binary_path.is_none() && watch_update_tx.is_some() {
+                    pending_artifacts.insert(name, decided);
+                    continue;
                 }
             }
-            Err(e) => outcome
-                .warnings
-                .push(format!("batch build task panicked: {e}")),
+            released.items.push((name, decided));
+        }
+        if !released.items.is_empty() {
+            artifacts_ready(released);
         }
     }
-
-    let built_count = succeeded.len();
+    while let Some(result) = build_set.join_next().await {
+        if let Err(e) = result {
+            outcome
+                .warnings
+                .push(format!("batch build task panicked: {e}"));
+        }
+    }
+    for item in &items {
+        if undecided.contains(&item.name) {
+            // The resolver returned neither a success nor a failure for this
+            // target — a panicked worker, or a target the batch never
+            // covered. Reporting it as failed is what keeps the process out
+            // of a permanent `Building`.
+            outcome.items.push((
+                item.name.clone(),
+                PrepareOutcome::Failed("build tool returned no result for this target".to_string()),
+            ));
+        }
+    }
     if built_count > 0 {
         emitter.lifecycle_event(&format!(
             "batch build complete: {built_count} item{} built",
             if built_count == 1 { "" } else { "s" }
         ));
-    }
-
-    // Resolve every succeeded bazel item's built-binary path, grouped
-    // by workspace. Lets a supervisor spawn the artifact directly instead of
-    // via `bazel run`.
-    //
-    // Services and tasks alike: a task defined by `bazel.target` rather than
-    // `cmd` has nothing else to spawn. One cquery answers for every label in
-    // a workspace, so including tasks costs a longer argument list and not an
-    // extra round trip. A task that *does* name its own `cmd` ignores the
-    // answer — deciding that here would mean this layer knowing what a task
-    // is configured with.
-    let bazel_services_to_resolve: Vec<&BatchBuildItem> = items
-        .iter()
-        .filter(|i| i.bazel.is_some() && succeeded.contains(&i.name))
-        .collect();
-
-    if !bazel_services_to_resolve.is_empty() {
-        let mut services_by_dir: HashMap<PathBuf, Vec<&BatchBuildItem>> = HashMap::new();
-        for item in &bazel_services_to_resolve {
-            services_by_dir
-                .entry(bazel_graph_requery_group_dir(&item.working_dir))
-                .or_default()
-                .push(*item);
-        }
-
-        for (working_dir, items_for_dir) in services_by_dir {
-            let targets: Vec<String> = items_for_dir
-                .iter()
-                .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
-                .collect();
-            emitter.bazel_event(&format!(
-                "resolving bazel binary paths for {} target{}...",
-                targets.len(),
-                if targets.len() == 1 { "" } else { "s" },
-            ));
-            let resolver =
-                crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
-            match resolver.resolve_binary_paths(&targets, &working_dir).await {
-                Ok(paths_by_label) => {
-                    for item in &items_for_dir {
-                        let Some(ref bazel) = item.bazel else {
-                            continue;
-                        };
-                        match paths_by_label.get(&bazel.target) {
-                            Some(rel_path) => {
-                                let abs_path =
-                                    resolve_bazel_binary_abs_path(&item.working_dir, rel_path);
-                                let path_str = abs_path.to_string_lossy().to_string();
-                                emitter.service_debug_event(
-                                    &item.name,
-                                    &format!("resolved binary {rel_path}"),
-                                );
-                                binary_paths.insert(item.name.clone(), path_str);
-                            }
-                            None => {
-                                outcome.warnings.push(format!(
-                                    "{}: no binary output for {} — falling back to bazel run",
-                                    item.name, bazel.target
-                                ));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    outcome.warnings.push(format!(
-                        "bazel cquery for binary paths failed in {}: {e} — falling back to bazel run for {} service{}",
-                        working_dir.display(),
-                        items_for_dir.len(),
-                        if items_for_dir.len() == 1 { "" } else { "s" },
-                    ));
-                }
-            }
-        }
-    }
-
-    // Missing executable paths wait for watch setup: their `bazel run`
-    // fallback must not contend with our dependency query for the server lock.
-    let mut pending_artifacts = HashMap::new();
-    for item in &items {
-        let decided = if let Some(message) = failed.get(&item.name) {
-            PrepareOutcome::Failed(message.clone())
-        } else if succeeded.contains(&item.name) {
-            PrepareOutcome::Ready {
-                binary_path: binary_paths.get(&item.name).cloned(),
-            }
-        } else {
-            PrepareOutcome::Failed("build tool returned no result for this target".to_string())
-        };
-        if watch_update_tx.is_some()
-            && succeeded.contains(&item.name)
-            && !binary_paths.contains_key(&item.name)
-        {
-            pending_artifacts.insert(item.name.clone(), decided);
-        } else {
-            outcome.items.push((item.name.clone(), decided));
-        }
     }
     artifacts_ready(outcome);
 
@@ -880,6 +767,195 @@ pub(crate) async fn run_batch_build_chain<F>(
     ));
 }
 
+/// Build one group's targets and send each item's outcome as Bazel reports
+/// its target, one message per burst of reports.
+///
+/// The binary paths are resolved *before* the build: once `bazel build`
+/// holds the server, a `cquery` would wait for the whole batch, and an item
+/// cannot be released without its path. Under the build's own `--config` it
+/// analyses exactly what the build will, so the build reuses the analysis.
+async fn build_group(
+    working_dir: PathBuf,
+    config: Option<String>,
+    group: Vec<(BatchBuildItem, String)>,
+    bep_path: PathBuf,
+    emitter: crate::output::LifecycleEmitter,
+    released: mpsc::UnboundedSender<Vec<(String, PrepareOutcome)>>,
+) {
+    let mut targets: Vec<String> = Vec::new();
+    for (_, target) in &group {
+        if !targets.contains(target) {
+            targets.push(target.clone());
+        }
+    }
+    let resolver = crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
+
+    emitter.bazel_event(&format!(
+        "resolving bazel binary paths for {} target{}...",
+        targets.len(),
+        if targets.len() == 1 { "" } else { "s" },
+    ));
+    let binary_paths = match resolver
+        .resolve_binary_paths(&targets, &working_dir, config.as_deref())
+        .await
+    {
+        Ok(paths) => paths,
+        Err(e) => {
+            emitter.error_event(&format!(
+                "bazel cquery for binary paths failed in {}: {e} — falling back to bazel run for {} service{}",
+                working_dir.display(),
+                group.len(),
+                if group.len() == 1 { "" } else { "s" },
+            ));
+            HashMap::new()
+        }
+    };
+
+    emitter.bazel_event(&format!(
+        "building {} target{}...",
+        targets.len(),
+        if targets.len() == 1 { "" } else { "s" }
+    ));
+    let (verdicts_tx, verdicts_rx) = mpsc::unbounded_channel();
+    let line_emitter = emitter.clone();
+    let build = async {
+        let result = crate::build_tool::bazel::BazelResolver::new()
+            .build_targets(
+                &targets,
+                &working_dir,
+                config.as_deref(),
+                move |line| line_emitter.bazel_event(line),
+                Some(&emitter),
+                Some(crate::build_tool::bazel::bep::BepOutput {
+                    path: bep_path.clone(),
+                    verdicts: verdicts_tx,
+                }),
+            )
+            .await;
+        let _ = tokio::fs::remove_file(&bep_path).await;
+        result
+    };
+    release_as_built(
+        group,
+        &binary_paths,
+        verdicts_rx,
+        build,
+        &emitter,
+        &released,
+    )
+    .await;
+}
+
+/// Release each item the moment Bazel reports its target, then settle every
+/// item the reports never reached from the build's final result.
+///
+/// Split from [`build_group`] so the release rules can be driven without a
+/// Bazel on `PATH`.
+async fn release_as_built<B>(
+    group: Vec<(BatchBuildItem, String)>,
+    binary_paths: &HashMap<String, PathBuf>,
+    mut verdicts: mpsc::UnboundedReceiver<Vec<crate::build_tool::bazel::bep::TargetVerdict>>,
+    build: B,
+    emitter: &crate::output::LifecycleEmitter,
+    released: &mpsc::UnboundedSender<Vec<(String, PrepareOutcome)>>,
+) where
+    B: std::future::Future<
+            Output = Result<crate::build_tool::BatchBuildResult, crate::build_tool::BuildToolError>,
+        >,
+{
+    use crate::build_tool::bazel::bep::normalize_label;
+
+    let mut by_label: HashMap<String, Vec<BatchBuildItem>> = HashMap::new();
+    for (item, target) in group {
+        by_label
+            .entry(normalize_label(&target))
+            .or_default()
+            .push(item);
+    }
+
+    // The build ends by dropping its sender, which ends this loop; polled
+    // together so items are released while the build is still running.
+    let release_reported = async {
+        while let Some(burst) = verdicts.recv().await {
+            let mut outcomes = Vec::new();
+            for verdict in burst {
+                for item in by_label.remove(&verdict.label).unwrap_or_default() {
+                    let outcome =
+                        built_outcome(&item, verdict.result.clone(), binary_paths, emitter);
+                    outcomes.push((item.name, outcome));
+                }
+            }
+            if !outcomes.is_empty() {
+                let _ = released.send(outcomes);
+            }
+        }
+        by_label
+    };
+    let (result, unreported) = tokio::join!(build, release_reported);
+
+    let mut outcomes = Vec::new();
+    for (label, items) in unreported {
+        let verdict = match &result {
+            Ok(batch) => {
+                if batch.succeeded.iter().any(|t| normalize_label(t) == label) {
+                    Some(Ok(()))
+                } else {
+                    batch
+                        .failed
+                        .iter()
+                        .find(|(t, _)| normalize_label(t) == label)
+                        .map(|(_, message)| Err(message.clone()))
+                }
+            }
+            // Resolver errored before producing per-target results (e.g.
+            // bazel client missing, I/O failure).
+            Err(e) => Some(Err(format!("bazel build error: {e}"))),
+        };
+        // Neither succeeded nor failed: the chain reports it as unanswered.
+        let Some(verdict) = verdict else { continue };
+        for item in items {
+            let outcome = built_outcome(&item, verdict.clone(), binary_paths, emitter);
+            outcomes.push((item.name, outcome));
+        }
+    }
+    if !outcomes.is_empty() {
+        let _ = released.send(outcomes);
+    }
+}
+
+/// One item's outcome, given what the build said about its target.
+fn built_outcome(
+    item: &BatchBuildItem,
+    verdict: Result<(), String>,
+    binary_paths: &HashMap<String, PathBuf>,
+    emitter: &crate::output::LifecycleEmitter,
+) -> PrepareOutcome {
+    if let Err(message) = verdict {
+        return PrepareOutcome::Failed(message);
+    }
+    let binary_path = item.bazel.as_ref().and_then(|bazel| {
+        match binary_paths.get(&crate::build_tool::bazel::bep::normalize_label(
+            &bazel.target,
+        )) {
+            Some(path) => {
+                emitter.service_debug_event(
+                    &item.name,
+                    &format!("resolved binary {}", path.display()),
+                );
+                Some(path.to_string_lossy().to_string())
+            }
+            None => {
+                emitter.error_event(&format!(
+                    "{}: no binary output for {} — falling back to bazel run",
+                    item.name, bazel.target
+                ));
+                None
+            }
+        }
+    });
+    PrepareOutcome::Ready { binary_path }
+}
+
 /// Whether an input changed while this item was being built, and how to say
 /// so. The timestamp predates the build and covers build → cquery → query →
 /// watch registration, including changes made before the watcher existed.
@@ -931,56 +1007,192 @@ fn check_stale_since(
     }
 }
 
-/// Resolve a bazel-reported executable path to an absolute path.
-///
-/// `bazel cquery` reports `target.files_to_run.executable.path` relative to the
-/// **workspace root** (e.g. `bazel-out/.../bin/...`), not relative to the
-/// service's working_dir. When a `don.toml` lives in a subdirectory of the
-/// workspace, the working_dir is below the root, so joining the path with the
-/// working_dir points at a non-existent `…/<subdir>/bazel-out/…`. Resolve
-/// against the workspace root instead; fall back to the working_dir if no
-/// workspace marker is found above it (no worse than the previous behaviour).
-fn resolve_bazel_binary_abs_path(working_dir: &Path, rel_path: &str) -> PathBuf {
-    let root = crate::build_tool::bazel::find_workspace_root(working_dir)
-        .unwrap_or_else(|| working_dir.to_path_buf());
-    root.join(rel_path)
-}
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::config::{BazelConfig, LogConfig};
 
-    #[test]
-    fn resolve_bazel_binary_abs_path_uses_workspace_root_not_working_dir() {
-        // workspace_root/ has the WORKSPACE marker; the service's working_dir
-        // is a subdirectory (as for a `sandbox/don.toml`).
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace_root = tmp.path();
-        std::fs::write(workspace_root.join("WORKSPACE.bazel"), "").unwrap();
-        let working_dir = workspace_root.join("sandbox");
-        std::fs::create_dir(&working_dir).unwrap();
+    type BuildResult =
+        Result<crate::build_tool::BatchBuildResult, crate::build_tool::BuildToolError>;
 
-        let rel = "bazel-out/k8-fastbuild/bin/sandbox/data_session";
-        let resolved = resolve_bazel_binary_abs_path(&working_dir, rel);
-
-        // Must resolve against the workspace root, not the subdir working_dir.
-        assert_eq!(resolved, workspace_root.join(rel));
-        assert_ne!(resolved, working_dir.join(rel));
+    fn verdict(
+        label: &str,
+        result: Result<(), &str>,
+    ) -> crate::build_tool::bazel::bep::TargetVerdict {
+        crate::build_tool::bazel::bep::TargetVerdict {
+            label: label.to_string(),
+            result: result.map_err(str::to_string),
+        }
     }
 
-    #[test]
-    fn resolve_bazel_binary_abs_path_falls_back_to_working_dir_without_marker() {
-        // No workspace marker anywhere above: fall back to working_dir.join,
-        // which is no worse than the previous behaviour.
-        let tmp = tempfile::tempdir().unwrap();
-        let working_dir = tmp.path().join("no-marker-here");
-        std::fs::create_dir(&working_dir).unwrap();
+    fn ready(name: &str) -> PrepareOutcome {
+        PrepareOutcome::Ready {
+            binary_path: Some(format!("/execroot/bazel-out/bin/services/{name}/{name}")),
+        }
+    }
 
-        let rel = "bazel-out/k8-fastbuild/bin/x";
-        let resolved = resolve_bazel_binary_abs_path(&working_dir, rel);
-        assert_eq!(resolved, working_dir.join(rel));
+    /// Drive [`release_as_built`] for `api`, `web` and `worker`, reporting
+    /// `reported` while the build is still running and then finishing it
+    /// with `result`. Returns what was released before the build finished
+    /// and what was released in total.
+    async fn release_with(
+        reported: Vec<crate::build_tool::bazel::bep::TargetVerdict>,
+        result: BuildResult,
+    ) -> (
+        HashMap<String, PrepareOutcome>,
+        HashMap<String, PrepareOutcome>,
+    ) {
+        let group: Vec<(BatchBuildItem, String)> = ["api", "web", "worker"]
+            .into_iter()
+            // Short form on purpose: Bazel reports `//services/api:api`.
+            .map(|name| (bazel_item(name, true), format!("//services/{name}")))
+            .collect();
+        let binary_paths: HashMap<String, PathBuf> = ["api", "web", "worker"]
+            .into_iter()
+            .map(|name| {
+                (
+                    format!("//services/{name}:{name}"),
+                    PathBuf::from(format!("/execroot/bazel-out/bin/services/{name}/{name}")),
+                )
+            })
+            .collect();
+        let output =
+            crate::output::OutputManager::new(&[("api", &LogConfig::Stdout)], tokio::io::sink())
+                .await
+                .unwrap();
+        let emitter = output.clone_lifecycle_emitter();
+        let (verdicts_tx, verdicts_rx) = mpsc::unbounded_channel();
+        let (finish_tx, finish_rx) = oneshot::channel::<BuildResult>();
+        let (released_tx, mut released_rx) = mpsc::unbounded_channel();
+        let releasing = tokio::spawn(async move {
+            let build = async { finish_rx.await.unwrap() };
+            release_as_built(
+                group,
+                &binary_paths,
+                verdicts_rx,
+                build,
+                &emitter,
+                &released_tx,
+            )
+            .await;
+        });
+
+        let mut early = HashMap::new();
+        let expected_early = reported.len();
+        verdicts_tx.send(reported).unwrap();
+        while early.len() < expected_early {
+            let burst = tokio::time::timeout(std::time::Duration::from_secs(5), released_rx.recv())
+                .await
+                .expect("a reported target is released while the build runs")
+                .unwrap();
+            early.extend(burst);
+        }
+
+        // Bazel exits: the event file is closed, and the build returns.
+        drop(verdicts_tx);
+        finish_tx.send(result).ok().unwrap();
+        releasing.await.unwrap();
+        let mut all = early.clone();
+        while let Ok(burst) = released_rx.try_recv() {
+            for (name, outcome) in burst {
+                assert!(
+                    all.insert(name.clone(), outcome).is_none(),
+                    "{name} released twice"
+                );
+            }
+        }
+        (early, all)
+    }
+
+    #[tokio::test]
+    async fn items_are_released_as_their_targets_complete() {
+        struct Case {
+            name: &'static str,
+            reported: Vec<crate::build_tool::bazel::bep::TargetVerdict>,
+            result: BuildResult,
+            want_early: Vec<(&'static str, PrepareOutcome)>,
+            want_all: Vec<(&'static str, PrepareOutcome)>,
+        }
+        let not_installed = "bazel build error: bazel not found on PATH — install it or remove the build tool config from don.toml";
+        let cases = vec![
+            Case {
+                name: "a target that completes first is released first",
+                reported: vec![verdict("//services/api:api", Ok(()))],
+                result: Ok(crate::build_tool::BatchBuildResult {
+                    succeeded: vec!["//services/web".into(), "//services/worker".into()],
+                    failed: Vec::new(),
+                }),
+                want_early: vec![("api", ready("api"))],
+                want_all: vec![
+                    ("api", ready("api")),
+                    ("web", ready("web")),
+                    ("worker", ready("worker")),
+                ],
+            },
+            Case {
+                name: "a failed target fails only its own items",
+                reported: vec![
+                    verdict("//services/api:api", Err("compile failed")),
+                    verdict("//services/web:web", Ok(())),
+                ],
+                result: Ok(crate::build_tool::BatchBuildResult {
+                    succeeded: vec!["//services/web".into(), "//services/worker".into()],
+                    failed: vec![("//services/api".into(), "bazel build failed".into())],
+                }),
+                want_early: vec![
+                    ("api", PrepareOutcome::Failed("compile failed".into())),
+                    ("web", ready("web")),
+                ],
+                want_all: vec![
+                    ("api", PrepareOutcome::Failed("compile failed".into())),
+                    ("web", ready("web")),
+                    ("worker", ready("worker")),
+                ],
+            },
+            Case {
+                name: "the build's result settles what the events never reached",
+                reported: Vec::new(),
+                result: Ok(crate::build_tool::BatchBuildResult {
+                    succeeded: vec!["//services/api".into()],
+                    failed: vec![(
+                        "//services/web".into(),
+                        "bazel build failed (exit code 1)".into(),
+                    )],
+                }),
+                want_early: Vec::new(),
+                // `worker` is in neither list: left for the chain, which
+                // reports it as unanswered.
+                want_all: vec![
+                    ("api", ready("api")),
+                    (
+                        "web",
+                        PrepareOutcome::Failed("bazel build failed (exit code 1)".into()),
+                    ),
+                ],
+            },
+            Case {
+                name: "a build that never ran fails everything unreported",
+                reported: vec![verdict("//services/api:api", Ok(()))],
+                result: Err(crate::build_tool::BuildToolError::NotInstalled {
+                    tool: "bazel".into(),
+                }),
+                want_early: vec![("api", ready("api"))],
+                want_all: vec![
+                    ("api", ready("api")),
+                    ("web", PrepareOutcome::Failed(not_installed.into())),
+                    ("worker", PrepareOutcome::Failed(not_installed.into())),
+                ],
+            },
+        ];
+        for case in cases {
+            let (early, all) = release_with(case.reported, case.result).await;
+            let to_map = |pairs: Vec<(&str, PrepareOutcome)>| -> HashMap<String, PrepareOutcome> {
+                pairs.into_iter().map(|(n, o)| (n.to_string(), o)).collect()
+            };
+            assert_eq!(early, to_map(case.want_early), "{}: early", case.name);
+            assert_eq!(all, to_map(case.want_all), "{}: all", case.name);
+        }
     }
 
     fn bazel_item(name: &str, watch_enabled: bool) -> BatchBuildItem {

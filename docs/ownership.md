@@ -369,8 +369,10 @@ wants one yet, so its supervisor asks on first demand.
 The build manager parks preparation requests until the runner says `WatchReady`
 and every task has finished its startup check. The initial watcher covers
 explicit patterns and workspace graph sentinels; dependency graph discovery is
-not part of that barrier. After build and binary-path cquery, the manager
-releases services immediately. The same owned worker then queries dependencies,
+not part of that barrier. The manager resolves binary paths with a cquery
+before the build, then releases each service as Bazel reports its target
+complete, while the rest of the batch builds. The same owned worker then
+queries dependencies,
 registers their watches, and checks the startup gap. Tasks retain their existing explicit input watches and auto-run policy; they
 do not request Bazel dependency watches. Missing executable paths wait for
 setup because their `bazel run` fallback can itself build.

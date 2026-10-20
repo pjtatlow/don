@@ -32,10 +32,19 @@ if ! mkdir .bazel-lock 2>/dev/null; then
 fi
 trap 'rmdir .bazel-lock' EXIT
 printf '%s\n' "$*" >> commands
+complete() {
+  [ -z "$events" ] || printf '{"id":{"targetCompleted":{"label":"%s"}},"completed":{"success":true}}\n' "$1" >> "$events"
+}
 case "$1" in
+  info)
+    [ "$2" = execution_root ] && pwd ;;
   build)
     check=false
-    for arg in "$@"; do [ "$arg" != --check_up_to_date ] || check=true; done
+    events=
+    for arg in "$@"; do
+      [ "$arg" != --check_up_to_date ] || check=true
+      case "$arg" in --build_event_json_file=*) events=${arg#--build_event_json_file=} ;; esac
+    done
     for arg in "$@"; do
       case "$arg" in
         //a:app|//b:app)
@@ -48,6 +57,14 @@ case "$1" in
           fi ;;
       esac
     done
+    # //b:app completes first; with hold-a, //a:app only once a-release exists.
+    if ! $check; then
+      for arg in "$@"; do [ "$arg" != //b:app ] || complete //b:app; done
+      if [ -f hold-a ]; then
+        while [ ! -f a-release ]; do sleep 0.02; done
+      fi
+      for arg in "$@"; do [ "$arg" != //a:app ] || complete //a:app; done
+    fi
     if ! $check; then
       touch build-started
       while [ ! -f build-release ]; do sleep 0.02; done
@@ -104,6 +121,7 @@ fn deferred_dependency_watches() {
         "gap-build-graph",
         "watch-disabled",
         "during-build",
+        "streams-per-target",
         "no-edit",
         "query-failure",
         "query-failure-recovery",
@@ -155,6 +173,9 @@ async fn run_case(case: &str) {
     }
     if case != "during-build" {
         fs::write(base.join("build-release"), "").unwrap();
+    }
+    if case == "streams-per-target" {
+        fs::write(base.join("hold-a"), "").unwrap();
     }
     if matches!(case, "query-failure" | "query-failure-recovery") {
         fs::write(base.join("fake-bin/query-fail"), "").unwrap();
@@ -220,7 +241,7 @@ ready.exec.cmd = "true"
         .to_string()
     };
     let mut config: Config = format!(
-        r#"watch_ignore = ["output", "commands", "*-built", "*-starts", "*-running", "query-*", "build-*", ".bazel-lock", "fake-bin/**", "gate-release"]
+        r#"watch_ignore = ["output", "commands", "*-built", "*-starts", "*-running", "query-*", "build-*", ".bazel-lock", "fake-bin/**", "gate-release", "hold-a", "a-release"]
 {config_text}"#
     )
     .parse()
@@ -266,6 +287,18 @@ ready.exec.cmd = "true"
         until(|| base.join("build-started").exists()).await;
         fs::write(base.join("a/source"), "v2").unwrap();
         fs::write(base.join("build-release"), "").unwrap();
+    }
+    if case == "streams-per-target" {
+        // The build is still running, holding //a:app back: b starts from its
+        // own event alone. Waiting for the whole build would time out here.
+        until(|| lines(&base.join("b-starts")) == 1).await;
+        assert_eq!(
+            lines(&base.join("a-starts")),
+            0,
+            "a started before its target"
+        );
+        assert!(!base.join("query-started").exists(), "build already over");
+        fs::write(base.join("a-release"), "").unwrap();
     }
     // The query remains blocked. Services and tasks can run; dependencies
     // retain their execution barriers.
@@ -411,12 +444,18 @@ ready.exec.cmd = "true"
     }
     let commands = fs::read_to_string(base.join("commands")).unwrap();
     let mut sequence = commands.lines();
+    // Executables are resolved before the build, which releases each one as
+    // its target completes.
     assert!(
-        sequence.next().unwrap().starts_with("build --curses"),
+        sequence.next().unwrap().starts_with("info execution_root"),
         "{commands}"
     );
     assert!(
         sequence.next().unwrap().starts_with("cquery "),
+        "{commands}"
+    );
+    assert!(
+        sequence.next().unwrap().starts_with("build --curses"),
         "{commands}"
     );
     assert!(sequence.next().unwrap().starts_with("query "), "{commands}");
