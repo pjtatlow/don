@@ -65,15 +65,32 @@ pub(crate) fn normalize_label(label: &str) -> String {
 /// The verdict in one line of the JSON event file, if it is a target's.
 ///
 /// `success` is omitted when false, as proto3 JSON omits every default.
-/// An `aborted` event is Bazel closing out a target it announced but never
-/// finished — what a build that stops at its first failure leaves behind.
+/// An `aborted` `targetCompleted` is Bazel closing out a target it announced
+/// but never finished. A target that fails analysis never gets a
+/// `targetCompleted` at all: its only verdict is the `aborted` on its
+/// `configuredLabel` (which carries the reason) or `targetConfigured`.
 pub(crate) fn parse_line(line: &str) -> Option<TargetVerdict> {
     let event: serde_json::Value = serde_json::from_str(line).ok()?;
-    let label = event
-        .get("id")?
-        .get("targetCompleted")?
-        .get("label")?
-        .as_str()?;
+    let id = event.get("id")?;
+    if let Some(aborted) = event.get("aborted")
+        && let Some(configured) = id
+            .get("configuredLabel")
+            .or_else(|| id.get("targetConfigured"))
+    {
+        let label = configured.get("label")?.as_str()?;
+        let description = aborted
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .filter(|description| !description.is_empty());
+        return Some(TargetVerdict {
+            label: normalize_label(label),
+            result: Err(match description {
+                Some(description) => format!("bazel could not analyze this target: {description}"),
+                None => "bazel could not analyze this target".to_string(),
+            }),
+        });
+    }
+    let label = id.get("targetCompleted")?.get("label")?.as_str()?;
     let result = if let Some(completed) = event.get("completed") {
         if completed
             .get("success")
@@ -145,7 +162,11 @@ pub(crate) async fn follow(
                 Ok(_) => {
                     let text = String::from_utf8_lossy(&line);
                     if let Some(verdict) = parse_line(&text) {
-                        seen.insert(verdict.label.clone(), verdict.result.clone());
+                        // The first verdict is the one acted on, and the
+                        // most specific: an analysis failure's
+                        // `configuredLabel` precedes its `targetConfigured`.
+                        seen.entry(verdict.label.clone())
+                            .or_insert_with(|| verdict.result.clone());
                         burst.push(verdict);
                     }
                     finished = is_last_message(&text);
@@ -262,6 +283,19 @@ mod tests {
                     "//c:c",
                     "bazel stopped before building this target: not built because of an earlier error",
                 ),
+            },
+            Case {
+                name: "analysis failure, with its reason",
+                line: r#"{"id":{"configuredLabel":{"label":"//d:d","configuration":{"id":"x"}}},"aborted":{"reason":"ANALYSIS_FAILURE","description":"rule '//d:missing' does not exist"}}"#,
+                want: err(
+                    "//d:d",
+                    "bazel could not analyze this target: rule '//d:missing' does not exist",
+                ),
+            },
+            Case {
+                name: "analysis failure, without one",
+                line: r#"{"id":{"targetConfigured":{"label":"//d:d"}},"aborted":{"reason":"ANALYSIS_FAILURE"}}"#,
+                want: err("//d:d", "bazel could not analyze this target"),
             },
             Case {
                 name: "another event",

@@ -64,12 +64,21 @@ pub(crate) struct BazelResolver {
 /// `--build_event_json_file` is how don learns each target is done while the
 /// rest of the build runs; see [`bep`].
 ///
+/// `--keep_going` so one broken target fails only the processes built from
+/// it: without it Bazel stops at the first failure and every target it had
+/// not finished fails with it.
+///
 /// A configured `--config` goes *after* don's flags, so a workspace that
 /// deliberately sets either of the first two in its `.bazelrc` wins. That
 /// includes winning in ways that stop don reading this output as lines, which
 /// is the workspace's call to make.
 fn build_args(targets: &[String], config: Option<&str>, bep_file: Option<&Path>) -> Vec<String> {
-    let mut args: Vec<String> = vec!["build".into(), "--curses=no".into(), "--color=yes".into()];
+    let mut args: Vec<String> = vec![
+        "build".into(),
+        "--curses=no".into(),
+        "--color=yes".into(),
+        "--keep_going".into(),
+    ];
     if let Some(bep_file) = bep_file {
         args.push(format!("--build_event_json_file={}", bep_file.display()));
     }
@@ -349,28 +358,7 @@ impl BazelResolver {
             None => HashMap::new(),
         };
 
-        let guessed = guess_from_exit(targets, status, &failed_from_output);
-        let mut result = super::BatchBuildResult {
-            succeeded: Vec::new(),
-            failed: Vec::new(),
-        };
-        for target in targets {
-            match verdicts.get(&bep::normalize_label(target)) {
-                Some(Ok(())) => result.succeeded.push(target.clone()),
-                Some(Err(message)) => result.failed.push((target.clone(), message.clone())),
-                None if guessed.succeeded.contains(target) => {
-                    result.succeeded.push(target.clone());
-                }
-                None => {
-                    if let Some((_, message)) =
-                        guessed.failed.iter().find(|(failed, _)| failed == target)
-                    {
-                        result.failed.push((target.clone(), message.clone()));
-                    }
-                }
-            }
-        }
-        Ok(result)
+        Ok(settle(targets, &verdicts, status, &failed_from_output))
     }
 
     /// Check if targets are already up to date without building.
@@ -599,14 +587,17 @@ impl BazelResolver {
             None => String::new(),
         };
 
-        if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // A target that fails analysis fails the cquery, but every other
+        // target's line is still printed. Keep those: that target's build
+        // fails anyway, and losing the rest would send them to `bazel run`.
+        if !output.status.success() && stdout.trim().is_empty() {
             return Err(BuildToolError::QueryFailed {
                 tool: "bazel".to_string(),
                 message: format!("cquery failed: {}", stderr_collected.trim()),
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             let line = line.trim();
             let Some((label, path)) = line.split_once('\t') else {
@@ -621,6 +612,49 @@ impl BazelResolver {
 
         Ok(out)
     }
+}
+
+/// Which targets a build built: from each target's own event where there is
+/// one, else from the exit status.
+///
+/// A build that wrote events and failed did not build a target its events
+/// never completed: `--keep_going` builds every target it can, so the
+/// exit-code guess, which assumes the unnamed rest succeeded, would start a
+/// stale artifact. Without events (rebuilds write none) the guess is all
+/// there is.
+fn settle(
+    targets: &[String],
+    verdicts: &HashMap<String, Result<(), String>>,
+    status: std::process::ExitStatus,
+    failed_from_output: &[String],
+) -> super::BatchBuildResult {
+    let guessed = guess_from_exit(targets, status, failed_from_output);
+    let mut result = super::BatchBuildResult {
+        succeeded: Vec::new(),
+        failed: Vec::new(),
+    };
+    for target in targets {
+        match verdicts.get(&bep::normalize_label(target)) {
+            Some(Ok(())) => result.succeeded.push(target.clone()),
+            Some(Err(message)) => result.failed.push((target.clone(), message.clone())),
+            None if !verdicts.is_empty() && !status.success() => result.failed.push((
+                target.clone(),
+                format!(
+                    "bazel build failed (exit code {}) without reporting this target",
+                    status.code().unwrap_or(-1)
+                ),
+            )),
+            None if guessed.succeeded.contains(target) => result.succeeded.push(target.clone()),
+            None => {
+                if let Some((_, message)) =
+                    guessed.failed.iter().find(|(failed, _)| failed == target)
+                {
+                    result.failed.push((target.clone(), message.clone()));
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Which targets a build without events built, judged from its exit status
@@ -742,19 +776,39 @@ mod tests {
                 name: "no configuration named",
                 targets: &["//a", "//b"],
                 config: None,
-                want: &["build", "--curses=no", "--color=yes", "//a", "//b"],
+                want: &[
+                    "build",
+                    "--curses=no",
+                    "--color=yes",
+                    "--keep_going",
+                    "//a",
+                    "//b",
+                ],
             },
             Case {
                 name: "a configuration is the last flag before the targets",
                 targets: &["//a"],
                 config: Some("don"),
-                want: &["build", "--curses=no", "--color=yes", "--config=don", "//a"],
+                want: &[
+                    "build",
+                    "--curses=no",
+                    "--color=yes",
+                    "--keep_going",
+                    "--config=don",
+                    "//a",
+                ],
             },
             Case {
                 name: "no targets is still a well-formed command",
                 targets: &[],
                 config: Some("don"),
-                want: &["build", "--curses=no", "--color=yes", "--config=don"],
+                want: &[
+                    "build",
+                    "--curses=no",
+                    "--color=yes",
+                    "--keep_going",
+                    "--config=don",
+                ],
             },
         ];
 
@@ -762,6 +816,94 @@ mod tests {
             let targets: Vec<String> = case.targets.iter().map(|t| (*t).to_string()).collect();
             let got = build_args(&targets, case.config, None);
             assert_eq!(got, case.want, "{}", case.name);
+        }
+    }
+
+    /// With `--keep_going` a partial failure exits 1. Each target is settled
+    /// by its own event; one the events never complete did not build.
+    #[test]
+    fn settle_trusts_each_targets_own_event_over_the_exit_code() {
+        use std::os::unix::process::ExitStatusExt;
+        struct Case {
+            name: &'static str,
+            verdicts: Vec<(&'static str, Result<(), &'static str>)>,
+            exit_code: i32,
+            error_lines_named: &'static [&'static str],
+            want_succeeded: &'static [&'static str],
+            want_failed: &'static [(&'static str, &'static str)],
+        }
+        let cases = vec![
+            Case {
+                name: "partial failure: the built target is not failed with the rest",
+                verdicts: vec![
+                    ("//a:a", Ok(())),
+                    ("//b:b", Err("compile failed")),
+                    ("//c:c", Ok(())),
+                ],
+                exit_code: 1,
+                error_lines_named: &["//a"],
+                want_succeeded: &["//a", "//c"],
+                want_failed: &[("//b", "compile failed")],
+            },
+            Case {
+                name: "an unreported target in a failed build did not build",
+                verdicts: vec![("//a:a", Ok(()))],
+                exit_code: 1,
+                error_lines_named: &["//c"],
+                want_succeeded: &["//a"],
+                want_failed: &[
+                    (
+                        "//b",
+                        "bazel build failed (exit code 1) without reporting this target",
+                    ),
+                    (
+                        "//c",
+                        "bazel build failed (exit code 1) without reporting this target",
+                    ),
+                ],
+            },
+            Case {
+                name: "no events at all: the exit-code guess",
+                verdicts: Vec::new(),
+                exit_code: 1,
+                error_lines_named: &["//b"],
+                want_succeeded: &["//a", "//c"],
+                want_failed: &[("//b", "bazel build failed")],
+            },
+            Case {
+                name: "success",
+                verdicts: vec![("//a:a", Ok(()))],
+                exit_code: 0,
+                error_lines_named: &[],
+                want_succeeded: &["//a", "//b", "//c"],
+                want_failed: &[],
+            },
+        ];
+        let targets: Vec<String> = ["//a", "//b", "//c"].map(str::to_string).to_vec();
+        for case in cases {
+            let verdicts: HashMap<String, Result<(), String>> = case
+                .verdicts
+                .into_iter()
+                .map(|(label, result)| (label.to_string(), result.map_err(str::to_string)))
+                .collect();
+            let named: Vec<String> = case
+                .error_lines_named
+                .iter()
+                .map(|t| t.to_string())
+                .collect();
+            let got = settle(
+                &targets,
+                &verdicts,
+                std::process::ExitStatus::from_raw(case.exit_code << 8),
+                &named,
+            );
+            assert_eq!(got.succeeded, case.want_succeeded, "{}", case.name);
+            let failed: Vec<(&str, &str)> = got
+                .failed
+                .iter()
+                .map(|(t, m)| (t.as_str(), m.as_str()))
+                .collect();
+            assert_eq!(failed, case.want_failed, "{}", case.name);
         }
     }
 
