@@ -18,14 +18,17 @@
 //! This module deliberately knows nothing about the runner — see
 //! [`signal`] for why the two vocabularies are separate.
 
+mod patterns;
 pub(crate) mod report;
 pub(crate) mod signal;
 
 pub(crate) use signal::WatchDispatch;
 
+use patterns::WatchPatterns;
+
 use crate::config::{Config, Platform};
 use crate::duration::parse_duration;
-use crate::globwalk::{matches_glob, matches_ignore};
+use crate::globwalk::matches_ignore;
 use crate::output::LifecycleEmitter;
 use glob::Pattern;
 use ignore::overrides::{Override, OverrideBuilder};
@@ -172,7 +175,7 @@ struct WatchedItem {
     /// What kind of item this is — determines who is told.
     kind: WatchItemKind,
     /// Glob patterns for matching file events.
-    patterns: Vec<Pattern>,
+    patterns: WatchPatterns,
     /// Glob patterns for ignoring file events (checked before watch patterns).
     ignore_patterns: Vec<Pattern>,
     /// What this item has seen since its debounce window opened, narrated when
@@ -577,7 +580,7 @@ impl WatchManager {
                     debounce_duration: debounce,
                     debounce_deadline: None,
                     kind: WatchItemKind::Service,
-                    patterns: compiled_patterns,
+                    patterns: WatchPatterns::new(compiled_patterns),
                     ignore_patterns: compiled_ignore,
                     window: WindowTally::default(),
                     last_error: None,
@@ -674,7 +677,7 @@ impl WatchManager {
                     debounce_duration: task_debounce,
                     debounce_deadline: None,
                     kind: WatchItemKind::Task,
-                    patterns: compiled_patterns,
+                    patterns: WatchPatterns::new(compiled_patterns),
                     ignore_patterns: compiled_ignore,
                     window: WindowTally::default(),
                     last_error: None,
@@ -783,7 +786,7 @@ impl WatchManager {
                             debounce_duration: DEFAULT_DEBOUNCE,
                             debounce_deadline: None,
                             kind: WatchItemKind::BuildGraph,
-                            patterns: compiled_patterns,
+                            patterns: WatchPatterns::new(compiled_patterns),
                             ignore_patterns: compiled_ignore,
                             window: WindowTally::default(),
                             last_error: None,
@@ -1004,7 +1007,7 @@ impl WatchManager {
                     debounce_duration: DEFAULT_DEBOUNCE,
                     debounce_deadline: None,
                     kind: update.kind,
-                    patterns: compiled_patterns,
+                    patterns: WatchPatterns::new(compiled_patterns),
                     ignore_patterns: compiled_ignore,
                     window: WindowTally::default(),
                     last_error: None,
@@ -1127,11 +1130,7 @@ impl WatchManager {
                     ignored_here.push(name.clone());
                     continue;
                 }
-                if let Some(pattern) = item
-                    .patterns
-                    .iter()
-                    .find(|pattern| matches_glob(pattern, &path_str))
-                {
+                if let Some(pattern) = item.patterns.find_match(&path_str) {
                     if item.window.example.is_none() {
                         item.window.example =
                             Some((path_str.to_string(), pattern.as_str().to_string()));
@@ -1812,7 +1811,7 @@ fn refresh_item_definition(
     // patterns that no longer apply.
     item.debounce_deadline = None;
     item.kind = kind;
-    item.patterns = patterns;
+    item.patterns = WatchPatterns::new(patterns);
     item.ignore_patterns = ignore_patterns;
     item.last_error = None;
 }
@@ -1975,6 +1974,7 @@ async fn sleep_until_or_pending(deadline: Option<Instant>) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::globwalk::matches_glob;
 
     #[test]
     fn test_glob_base_dir() {
@@ -2653,7 +2653,9 @@ debounce = "1500ms"
             debounce_duration: debounce,
             debounce_deadline: None,
             kind,
-            patterns: patterns.iter().map(|p| Pattern::new(p).unwrap()).collect(),
+            patterns: WatchPatterns::new(
+                patterns.iter().map(|p| Pattern::new(p).unwrap()).collect(),
+            ),
             ignore_patterns: vec![],
             window: WindowTally::default(),
             last_error: None,
@@ -3014,7 +3016,7 @@ debounce = "1500ms"
             debounce_duration: Duration::from_millis(200),
             debounce_deadline: Some(Instant::now() + Duration::from_millis(50)),
             kind: WatchItemKind::Service,
-            patterns: original_patterns,
+            patterns: WatchPatterns::new(original_patterns),
             ignore_patterns: vec![],
             window: WindowTally::default(),
             last_error: None,
@@ -3029,8 +3031,8 @@ debounce = "1500ms"
 
         assert_eq!(item.debounce_deadline, None);
         assert_eq!(item.kind, WatchItemKind::Task);
-        assert_eq!(item.patterns.len(), 1);
-        assert_eq!(item.patterns[0].as_str(), "pkg/**");
+        assert_eq!(item.patterns.iter().count(), 1);
+        assert_eq!(item.patterns.iter().next().unwrap().as_str(), "pkg/**");
         assert_eq!(item.ignore_patterns.len(), 1);
         assert_eq!(item.ignore_patterns[0].as_str(), "pkg/generated/**");
     }
