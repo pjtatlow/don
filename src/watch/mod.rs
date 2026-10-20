@@ -1172,7 +1172,11 @@ impl WatchManager {
     /// path isn't a directory, is already covered by an existing watch, or is
     /// itself ignored — so a fresh `node_modules` is never watched.
     fn register_new_directory(&mut self, path: &Path) {
-        let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+        // Not `metadata`: a symlink is never walked. Bazel's `bazel-*`
+        // symlinks lead into output trees of tens of thousands of dirs.
+        let is_dir = std::fs::symlink_metadata(path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         if !is_dir {
             return;
         }
@@ -2583,6 +2587,85 @@ debounce = "1500ms"
             last_notify_error: None,
             global_ignore: Vec::new(),
             overrides: OverrideBuilder::new(".").build().unwrap(),
+        }
+    }
+
+    /// A directory appearing at runtime is watched and its files replayed;
+    /// a symlink to one is neither, wherever it points.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_new_directory_backstop_never_follows_symlinks() {
+        struct Case {
+            name: &'static str,
+            symlink: bool,
+            want_registered: Vec<&'static str>,
+            want_matched: usize,
+        }
+        let cases = [
+            Case {
+                name: "created directory is watched and replayed",
+                symlink: false,
+                want_registered: vec!["", "new", "new/deep"],
+                want_matched: 2,
+            },
+            Case {
+                name: "symlink to a directory is ignored",
+                symlink: true,
+                want_registered: vec![""],
+                want_matched: 0,
+            },
+        ];
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap().join("repo");
+            let outside = temp.path().join("bazel-out");
+            std::fs::create_dir_all(outside.join("deep")).unwrap();
+            std::fs::write(outside.join("a.js"), "").unwrap();
+            std::fs::write(outside.join("deep/b.js"), "").unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            let created = root.join("new");
+            if case.symlink {
+                std::os::unix::fs::symlink(&outside, &created).unwrap();
+            } else {
+                std::fs::rename(&outside, &created).unwrap();
+            }
+
+            let mut items = HashMap::new();
+            let pattern = format!("{}/**", root.display());
+            items.insert(
+                "api".to_string(),
+                watched(WatchItemKind::Service, Duration::ZERO, &[&pattern]),
+            );
+            let mut manager = test_manager(
+                items,
+                std::sync::Arc::new(signal::RecordingDispatch::default()),
+            )
+            .await;
+            manager
+                .registered_dirs
+                .insert(root.clone(), RecursiveMode::NonRecursive);
+
+            manager.register_new_directory(&created);
+
+            let mut got: Vec<PathBuf> = manager.registered_dirs.keys().cloned().collect();
+            got.sort();
+            let want: Vec<PathBuf> = case
+                .want_registered
+                .iter()
+                .map(|rel| {
+                    if rel.is_empty() {
+                        root.clone()
+                    } else {
+                        root.join(rel)
+                    }
+                })
+                .collect();
+            assert_eq!(got, want, "case: {}", case.name);
+            assert_eq!(
+                manager.items["api"].window.matched, case.want_matched,
+                "case: {}",
+                case.name
+            );
         }
     }
 
