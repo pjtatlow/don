@@ -1063,13 +1063,6 @@ async fn supervise(
                         match trigger {
                             Some(_) => {
                                 demand = demand.max(super::Demand::Scheduled);
-                                if owner.phase == super::ServiceState::Lazy {
-                                    owner.set(super::ServiceState::Pending);
-                                }
-                                let _ = report_tx.send(super::ProcessReport::Demand {
-                                    name: name.clone(),
-                                    demand,
-                                });
                                 // A lazy service is the one thing that does
                                 // not build at construction: nobody had asked
                                 // for it yet. Now somebody has — and it still
@@ -1087,6 +1080,22 @@ async fn supervise(
                                         &name, &resolved, &env, &prepare_tx,
                                     );
                                 }
+                                // `Building` like the startup batch, so state-change
+                                // consumers can time it; the artifact returns it to `Pending`.
+                                if awaiting_artifact
+                                    && matches!(
+                                        owner.phase,
+                                        super::ServiceState::Lazy | super::ServiceState::Pending
+                                    )
+                                {
+                                    owner.set(super::ServiceState::Building);
+                                } else if owner.phase == super::ServiceState::Lazy {
+                                    owner.set(super::ServiceState::Pending);
+                                }
+                                let _ = report_tx.send(super::ProcessReport::Demand {
+                                    name: name.clone(),
+                                    demand,
+                                });
                             }
                             // Every trigger sender is gone (proxy shut down);
                             // stop selecting on a closed channel.
@@ -3742,5 +3751,77 @@ mod tests {
             "supervisor must survive its demand channel closing"
         );
         harness.handle.abort();
+    }
+
+    /// A lazy service's first-connection build is `Building`, as the startup
+    /// batch's is, and the artifact landing returns it to `Pending`.
+    #[tokio::test]
+    async fn a_lazy_first_connection_build_is_building() {
+        use crate::facts::Phase;
+        use crate::process::ServiceState;
+
+        let (env, mut batcher_rx) = test_env_with_batcher().await;
+        let (lazy_tx, demand_rx) = mpsc::channel(16);
+        let proxy = bind_env_proxy(Some(lazy_tx.clone())).await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (report_tx, _report_rx) = mpsc::unbounded_channel::<super::super::ProcessReport>();
+        let (mut aggregator, mut publishers, _reader) = crate::facts::channel(std::iter::once((
+            "svc".to_string(),
+            crate::facts::ProcessFacts::for_service("svc", ServiceState::Lazy, None, Vec::new()),
+        )));
+        let handle = tokio::spawn(supervise(
+            "svc".to_string(),
+            rx,
+            env,
+            None,
+            report_tx,
+            Arc::new(AtomicBool::new(false)),
+            Some(ProxyAssets {
+                proxy,
+                demand_rx: Some(demand_rx),
+            }),
+            Some(bazel_resolved(true)),
+            Vec::new(),
+            publishers.remove("svc"),
+        ));
+
+        async fn wait_for(
+            aggregator: &mut crate::facts::Aggregator,
+            phases: &mut Vec<Phase>,
+            want: ServiceState,
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                while let Ok((_, facts)) = aggregator.try_recv() {
+                    phases.push(facts.phase);
+                }
+                if phases.last() == Some(&Phase::Service(want)) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "never reached {want:?}; saw {phases:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let mut phases = Vec::new();
+        lazy_tx.send("svc".to_string()).await.unwrap();
+        let (_, outcome) = next_prepare(&mut batcher_rx)
+            .await
+            .expect("a first connection must ask for the artifact");
+        wait_for(&mut aggregator, &mut phases, ServiceState::Building).await;
+        assert_eq!(
+            phases,
+            vec![Phase::Service(ServiceState::Building)],
+            "straight from Lazy to Building"
+        );
+
+        outcome
+            .send(PrepareOutcome::Ready { binary_path: None })
+            .unwrap();
+        wait_for(&mut aggregator, &mut phases, ServiceState::Pending).await;
+        handle.abort();
     }
 }
