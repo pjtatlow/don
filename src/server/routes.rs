@@ -128,23 +128,40 @@ async fn get_ready(State(state): State<Arc<ApiState>>) -> Response {
 
 /// `GET /events` — stream runner state changes as newline-delimited JSON.
 ///
-/// The first record is always `{"type":"snapshot","processes":[...],
-/// "startup_complete":bool}` — the full current state, so a client that
-/// connects (or reconnects) starts consistent instead of stale-until-the-
-/// next-event. Existing consumers that switch on `type` ignore it.
+/// Without `since`, the first record is always `{"type":"snapshot",
+/// "processes":[...],"startup_complete":bool}` — the full current state, so a
+/// client that connects (or reconnects) starts consistent instead of
+/// stale-until-the-next-event. Existing consumers that switch on `type`
+/// ignore it.
 ///
-/// Each line is a serialized [`RunnerEvent`] (`{"type": "...", ...}`). The
-/// stream stays open until the client disconnects or the runner shuts down;
-/// consumers should treat `shutdown_complete` as the terminator.
+/// `since=<seq>` first replays every recorded event numbered above `seq`
+/// (`since=0` is the whole run, within [`crate::runner::EventLog`]'s bound),
+/// then the snapshot, then live events. A client that started late sees the
+/// transitions it missed, in order and with their original times; one that
+/// reconnects passes the last `seq` it saw.
+///
+/// Each line is a serialized [`RunnerEvent`] (`{"type": "...", ...}`) plus
+/// `seq` (its place in the run's event stream) and `wall_clock` (Unix
+/// milliseconds when the runner sent it). The stream stays open until the
+/// client disconnects or the runner shuts down; consumers should treat
+/// `shutdown_complete` as the terminator.
 ///
 /// A consumer too slow to keep up with the broadcast gets
 /// `{"type":"lagged","skipped":N}` instead of silently missing transitions —
 /// the correct response is to refetch `GET /status` and resync.
-async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
+async fn get_events(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<EventsQuery>,
+) -> Response {
     // Subscribe *before* reading the snapshot: an event that fires between
     // the two lands in the subscription and is applied after the snapshot —
     // replay-safe. The other order loses it entirely.
-    let mut events_rx = state.event_tx.subscribe();
+    let crate::runner::EventSubscription {
+        replay,
+        next_seq,
+        live: mut events_rx,
+    } = state.event_tx.subscribe_since(query.since);
+    let event_log = state.event_tx.clone();
     let snapshot = state.state.snapshot();
     let preamble = serde_json::json!({
         "type": "snapshot",
@@ -158,18 +175,22 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
     let mut shutdown = state.shutdown.clone();
     tokio::spawn(async move {
-        let mut chunk = serde_json::to_vec(&preamble).unwrap_or_default();
-        chunk.push(b'\n');
-        if tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+        for recorded in replay {
+            let value = stamped_event(&recorded.event, recorded.seq, recorded.wall_clock);
+            if tx.send(ndjson(&value)).await.is_err() {
+                return;
+            }
+        }
+        if tx.send(ndjson(&preamble)).await.is_err() {
             return;
         }
+        let mut seq = next_seq;
         loop {
             let value = tokio::select! {
                 process = events_rx.recv() => match process {
-                    Ok(event) => serde_json::to_value(&event).unwrap_or_else(|_| {
-                        serde_json::json!({ "type": "error", "message": "event serialization failed" })
-                    }),
+                    Ok(event) => stamp_live(&event_log, &mut seq, &event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        seq += skipped;
                         serde_json::json!({ "type": "lagged", "skipped": skipped })
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -181,11 +202,8 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
                         // (the runner flips it after the output flush) —
                         // then end the stream.
                         while let Ok(event) = events_rx.try_recv() {
-                            let value = serde_json::to_value(&event)
-                                .unwrap_or_else(|_| serde_json::json!({ "type": "error" }));
-                            let mut chunk = serde_json::to_vec(&value).unwrap_or_default();
-                            chunk.push(b'\n');
-                            if tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+                            let value = stamp_live(&event_log, &mut seq, &event);
+                            if tx.send(ndjson(&value)).await.is_err() {
                                 return;
                             }
                         }
@@ -194,9 +212,7 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
                     continue;
                 }
             };
-            let mut chunk = serde_json::to_vec(&value).unwrap_or_default();
-            chunk.push(b'\n');
-            if tx.send(bytes::Bytes::from(chunk)).await.is_err() {
+            if tx.send(ndjson(&value)).await.is_err() {
                 return;
             }
         }
@@ -213,6 +229,52 @@ async fn get_events(State(state): State<Arc<ApiState>>) -> Response {
         Ok(resp) => resp,
         Err(_) => runner_unavailable(),
     }
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    /// Replay recorded events numbered above this before the snapshot.
+    #[serde(default)]
+    since: Option<u64>,
+}
+
+fn stamped_event(
+    event: &crate::runner::RunnerEvent,
+    seq: u64,
+    wall_clock: u64,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(event).unwrap_or_else(
+        |_| serde_json::json!({ "type": "error", "message": "event serialization failed" }),
+    );
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.insert("seq".to_string(), seq.into());
+        fields.insert("wall_clock".to_string(), wall_clock.into());
+    }
+    value
+}
+
+fn stamp_live(
+    event_log: &crate::runner::EventLog,
+    seq: &mut u64,
+    event: &crate::runner::RunnerEvent,
+) -> serde_json::Value {
+    let wall_clock = event_log.wall_clock(*seq).unwrap_or_else(unix_millis);
+    let value = stamped_event(event, *seq, wall_clock);
+    *seq += 1;
+    value
+}
+
+fn ndjson(value: &serde_json::Value) -> bytes::Bytes {
+    let mut chunk = serde_json::to_vec(value).unwrap_or_default();
+    chunk.push(b'\n');
+    bytes::Bytes::from(chunk)
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// `GET /watch` — global file-watch state (inotify dirs + per-process patterns).
@@ -625,9 +687,12 @@ mod tests {
     /// Any handler that reaches for `cmd_tx` answers 503 here, so a 200 is
     /// proof the response came from the state projection alone.
     fn router_without_a_runner(state: StateReader) -> Router {
+        router_with_events(state, crate::runner::EventLog::new())
+    }
+
+    fn router_with_events(state: StateReader, event_tx: crate::runner::EventLog) -> Router {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(cmd_rx);
-        let (event_tx, _) = tokio::sync::broadcast::channel(16);
         let log_tap = crate::output::MergedLogTap::for_tests();
         let logs = crate::output::LogReader::for_tests();
         let completions = crate::param_completions::CompletionResolver::for_tests();
@@ -777,5 +842,107 @@ mod tests {
 
         let (_, after) = get(router, "/status?name=web").await;
         assert_eq!(after["processes"][0]["state"], "ready");
+    }
+
+    /// Read NDJSON records off a streaming body until `count` have arrived.
+    async fn read_records(body: Body, count: usize) -> Vec<serde_json::Value> {
+        use tokio_stream::StreamExt;
+        let mut stream = body.into_data_stream();
+        let mut buffer = Vec::new();
+        let mut records = Vec::new();
+        while records.len() < count {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("record within 5s")
+                .expect("stream open")
+                .expect("chunk");
+            buffer.extend_from_slice(&chunk);
+            while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=end).collect();
+                records.push(serde_json::from_slice(&line).expect("json record"));
+            }
+        }
+        records
+    }
+
+    /// A late subscriber asking `since=0` gets the transitions it missed, in
+    /// order and with their original times, then the snapshot, then live.
+    #[tokio::test]
+    async fn events_since_replays_what_a_late_subscriber_missed() {
+        let (_writer, reader) = state_store::channel(snapshot());
+        let events = crate::runner::EventLog::new();
+        let building = |name: &str| crate::runner::RunnerEvent::ServiceStateChanged {
+            name: name.to_string(),
+            state: ServiceState::Building,
+            pid: None,
+            failed_dependencies: Vec::new(),
+        };
+        events.send(building("api"));
+        events.send(building("web"));
+        let router = router_with_events(reader, events.clone());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/events?since=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let reading = tokio::spawn(read_records(body, 3));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        events.send(crate::runner::RunnerEvent::StartupSettled { elapsed_ms: 7 });
+        let records = reading.await.unwrap();
+
+        let summary: Vec<(String, Option<String>, Option<u64>)> = records
+            .iter()
+            .map(|record| {
+                (
+                    record["type"].as_str().unwrap_or_default().to_string(),
+                    record["name"].as_str().map(String::from),
+                    record["seq"].as_u64(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "service_state_changed".to_string(),
+                    Some("web".to_string()),
+                    Some(2)
+                ),
+                ("snapshot".to_string(), None, None),
+                ("startup_settled".to_string(), None, Some(3)),
+            ]
+        );
+        assert_eq!(records[0]["state"], "building");
+        assert!(records[0]["wall_clock"].as_u64().is_some_and(|ms| ms > 0));
+        assert!(records[2]["wall_clock"].as_u64().is_some_and(|ms| ms > 0));
+    }
+
+    /// Without `since` the stream starts at the snapshot, as before.
+    #[tokio::test]
+    async fn events_without_since_start_at_the_snapshot() {
+        let (_writer, reader) = state_store::channel(snapshot());
+        let events = crate::runner::EventLog::new();
+        events.send(crate::runner::RunnerEvent::StartupSettled { elapsed_ms: 1 });
+        let router = router_with_events(reader, events);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let records = read_records(response.into_body(), 1).await;
+
+        assert_eq!(records[0]["type"], "snapshot");
     }
 }

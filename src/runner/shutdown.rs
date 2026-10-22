@@ -34,7 +34,7 @@ impl Runner {
             .map(str::to_string)
             .collect();
 
-        let _ = self.event_tx.send(super::RunnerEvent::ShutdownStarted);
+        self.event_tx.send(super::RunnerEvent::ShutdownStarted);
         let _ = self.shutdown_flag_tx.send(true);
         self.output_manager
             .lifecycle_event("shutting down gracefully... (Ctrl+C again to force)");
