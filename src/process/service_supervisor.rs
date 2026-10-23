@@ -1146,6 +1146,21 @@ async fn supervise(
                     }
                     continue;
                 }
+                // The first build failed, so no artifact path was ever resolved: prepare again, as
+                // at startup, instead of restarting into `bazel run`.
+                if resolved.is_build_tool_managed()
+                    && !batch_built
+                    && !awaiting_artifact
+                    && owner.phase == super::ServiceState::Failed
+                {
+                    demand = super::Demand::Scheduled;
+                    owner.set(super::ServiceState::Building);
+                    awaiting_artifact = request_artifact(&name, &resolved, &env, &prepare_tx);
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                    continue;
+                }
                 // A change that arrives while a cycle is running does not
                 // start a second one: the artifact this cycle is about to
                 // produce is already out of date, so the cycle records that
@@ -3164,6 +3179,76 @@ mod tests {
             }
             handle.abort();
         }
+    }
+
+    /// A service whose first build failed has no artifact path, so a fix must re-prepare it rather
+    /// than rebuild and restart it into `bazel run`.
+    #[tokio::test]
+    async fn a_file_change_prepares_a_service_whose_first_build_failed() {
+        let (env, mut batcher_rx) = released_env_with_batcher().await;
+        let (mut facts, mut publishers, _world) = crate::facts::channel(std::iter::once((
+            "svc".to_string(),
+            crate::facts::ProcessFacts::for_service(
+                "svc",
+                super::super::ServiceState::Pending,
+                None,
+                Vec::new(),
+            ),
+        )));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+        let handle = tokio::spawn(supervise(
+            "svc".to_string(),
+            rx,
+            env,
+            None,
+            report_tx,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Some(bazel_resolved(false)),
+            Vec::new(),
+            publishers.remove("svc"),
+        ));
+
+        let (_, outcome) = next_prepare(&mut batcher_rx)
+            .await
+            .expect("a bazel service must ask for its artifact");
+        outcome
+            .send(PrepareOutcome::Failed("boom".to_string()))
+            .unwrap();
+        let failed = crate::facts::Phase::Service(super::super::ServiceState::Failed);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while facts.recv().await.unwrap().1.phase != failed {}
+        })
+        .await
+        .expect("a failed build should land the service in Failed");
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(ServiceCommand::Rebuild(RebuildRequest {
+            forced: false,
+            source: RebuildSource::FileChange,
+            reply: Some(reply_tx),
+        }))
+        .unwrap();
+        assert!(reply_rx.await.unwrap().is_ok());
+
+        let outcome = match tokio::time::timeout(Duration::from_secs(2), batcher_rx.recv()).await {
+            Ok(Some(BatchRequest::QueuePrepare { outcome, .. })) => outcome,
+            Ok(Some(_)) => panic!("a service with no artifact yet must be prepared, not rebuilt"),
+            _ => panic!("the file change must ask for the artifact again"),
+        };
+        outcome
+            .send(PrepareOutcome::Ready {
+                binary_path: Some("/usr/bin/true".to_string()),
+            })
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), report_rx.recv()).await {
+            Ok(Some(super::super::ProcessReport::ServiceStartPrepared { result, .. })) => {
+                assert!(result.is_ok(), "the prepared artifact should start");
+            }
+            _ => panic!("the service should start once its artifact is prepared"),
+        }
+        handle.abort();
     }
 
     /// An artifact is as much a precondition as a dependency, and it is the
