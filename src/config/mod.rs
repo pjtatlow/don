@@ -10,6 +10,8 @@ pub(crate) mod param;
 mod platform;
 pub(crate) mod ports;
 pub(crate) mod profile;
+#[cfg(test)]
+mod secret_args_file_tests;
 mod secrets;
 pub(crate) mod service;
 pub(crate) mod task;
@@ -272,6 +274,13 @@ impl Config {
         profile: Option<&str>,
     ) -> Result<Self, ConfigError> {
         let mut config: Self = Self::merged_toml(path, profile)?.try_into()?;
+        for (i, source) in config.secrets.iter_mut().enumerate() {
+            source
+                .load_args_file(path.parent().unwrap_or_else(|| Path::new("")))
+                .map_err(|error| ConfigError::Validation {
+                    errors: vec![format!("[[secrets]] #{}: {error}", i + 1)],
+                })?;
+        }
         config.apply_global_env();
         Ok(config)
     }

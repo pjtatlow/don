@@ -1074,6 +1074,7 @@ See [`examples/`](examples/) for complete working configs.
 | `secrets.provider` | string | `"aws-ssm"` |
 | `secrets.region` | string | AWS region |
 | `secrets.profile` | string | AWS CLI / SSO profile |
+| `secrets.aws-ssm.args-file` | {path, group} | Load region, variable mappings and complete group membership from an SSM argument file; path is relative to `don.toml` |
 | `secrets.vars` | {name: path} | Env name → SSM parameter path |
 | `secrets.groups` | {name: [string]} | Named bundles of vars |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
