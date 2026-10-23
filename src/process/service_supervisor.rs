@@ -1146,6 +1146,17 @@ async fn supervise(
                     }
                     continue;
                 }
+                // Nothing connected yet: a rebuild would start it unasked, via `bazel run`.
+                // Clearing `batch_built` makes the first connection prepare these sources.
+                if request.source == RebuildSource::FileChange
+                    && owner.phase == super::ServiceState::Lazy
+                {
+                    batch_built = false;
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                    continue;
+                }
                 // A change that arrives while a cycle is running does not
                 // start a second one: the artifact this cycle is about to
                 // produce is already out of date, so the cycle records that
@@ -3164,6 +3175,51 @@ mod tests {
             }
             handle.abort();
         }
+    }
+
+    /// A file change must not build-and-start an unconnected lazy service: that
+    /// start has no prepared artifact path, so it spawns through `bazel run`.
+    #[tokio::test]
+    async fn a_file_change_leaves_an_unconnected_lazy_service_to_its_first_connection() {
+        let (env, mut batcher_rx) = test_env_with_batcher().await;
+        let (lazy_tx, demand_rx) = mpsc::channel(16);
+        let proxy = bind_env_proxy(Some(lazy_tx.clone())).await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (report_tx, _report_rx) = mpsc::unbounded_channel::<super::super::ProcessReport>();
+        let handle = tokio::spawn(supervise(
+            "svc".to_string(),
+            rx,
+            env,
+            None,
+            report_tx,
+            Arc::new(AtomicBool::new(false)),
+            Some(ProxyAssets {
+                proxy,
+                demand_rx: Some(demand_rx),
+            }),
+            Some(bazel_resolved(true)),
+            Vec::new(),
+            Some(test_publisher()),
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(ServiceCommand::Rebuild(RebuildRequest {
+            forced: false,
+            source: RebuildSource::FileChange,
+            reply: Some(reply_tx),
+        }))
+        .unwrap();
+        assert!(reply_rx.await.unwrap().is_ok());
+        lazy_tx.send("svc".to_string()).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), batcher_rx.recv()).await {
+            Ok(Some(BatchRequest::QueuePrepare { item, .. })) => assert_eq!(item.name, "svc"),
+            Ok(Some(_)) => {
+                panic!("a file change must not build a lazy service nobody connected to")
+            }
+            _ => panic!("the first connection must ask for the artifact"),
+        }
+        handle.abort();
     }
 
     /// An artifact is as much a precondition as a dependency, and it is the
