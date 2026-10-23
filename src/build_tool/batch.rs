@@ -103,11 +103,7 @@ pub(crate) enum PrepareOutcome {
     /// absolute executable `bazel cquery --output=files` reported; `None`
     /// means fall back to `bazel run`.
     Ready { binary_path: Option<String> },
-    /// The build succeeded, but a watched source or BUILD file changed while
-    /// it was running — the artifact is already out of date, so ask again
-    /// before starting. This is the *only* cover for that window: the watcher
-    /// is not yet watching those paths, because this build is what resolves
-    /// them.
+    /// A deferred artifact changed before watches became live; prepare again.
     Stale,
     /// The build tool refused. Never retried — recompiling unchanged sources
     /// cannot change the answer.
@@ -258,14 +254,16 @@ pub(crate) async fn send_watch_update(
 ) {
     let (applied_tx, applied_rx) = oneshot::channel();
     if tx
-        .send(crate::watch::WatchUpdate {
-            name,
-            kind,
-            patterns,
-            ignore_patterns,
-            base_dir,
-            applied_tx: Some(applied_tx),
-        })
+        .send(crate::watch::WatchUpdate::Register(
+            crate::watch::WatchRegistration {
+                name,
+                kind,
+                patterns,
+                ignore_patterns,
+                base_dir,
+                applied_tx: Some(applied_tx),
+            },
+        ))
         .is_ok()
     {
         let _ = applied_rx.await;
@@ -415,29 +413,28 @@ pub(crate) async fn run_graph_requery_worker(
     delivered
 }
 
-/// Run the full artifact-preparation chain: optional watch resolution →
-/// batch build → bazel binary-path cquery → the mtime scan that catches an
-/// edit made while the build ran. Pure off-task function that takes owned
-/// inputs and returns one [`PrepareOutcome`] per item.
-///
-/// Sends [`crate::watch::WatchUpdate`]s directly to the watch manager as they
-/// resolve — before the builds complete, and therefore before any supervisor
-/// waiting on an outcome can spawn.
-pub(crate) async fn run_batch_build_chain(
+/// Build and resolve executables, release their supervisors, then resolve and
+/// register dependency watches. The same owned worker and Bazel mutex cover
+/// both phases, so shutdown cancels them together and queries never race builds.
+pub(crate) async fn run_batch_build_chain<F>(
     items: Vec<BatchBuildItem>,
     base_dir: PathBuf,
     emitter: crate::output::LifecycleEmitter,
     watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
     global_watch_ignore: Vec<String>,
     bazel_build_mutex: Arc<tokio::sync::Mutex<()>>,
-) -> PrepareBatchOutcome {
+    mut artifacts_ready: F,
+) where
+    F: FnMut(PrepareBatchOutcome),
+{
     let scan_since = SystemTime::now();
     let mut outcome = PrepareBatchOutcome {
         warnings: Vec::new(),
         items: Vec::new(),
     };
     if items.is_empty() {
-        return outcome;
+        artifacts_ready(outcome);
+        return;
     }
     // Held for the whole chain. `bazel query`, `bazel build` and
     // `bazel cquery` all contend for the same workspace analysis lock, so a
@@ -448,119 +445,7 @@ pub(crate) async fn run_batch_build_chain(
     let mut failed: HashMap<String, String> = HashMap::new();
     let mut binary_paths: HashMap<String, String> = HashMap::new();
 
-    // Step 1: resolve watch paths with one query per build-tool working set.
-    //
-    // Previously we ran N parallel `bazel query` subprocesses, one per item.
-    // Bazel's server has a workspace-wide analysis lock, so those parallel
-    // queries mostly serialised inside bazel anyway — and each process
-    // startup cost stacked. Now we issue one
-    // `deps(T1 + ... + Tn) --output=xml` per Bazel workspace and DFS-walk per
-    // target client-side to keep accurate per-service attribution.
-
-    // Partition items by tool. Each item keeps its own ignore patterns
-    // (configured per service/task) but gets the same tier-1/tier-2 globs.
-    let bazel_items = watch_resolution_items(&items);
-
-    let mut resolved_info_by_item: HashMap<String, crate::build_tool::ResolvedBuildInfo> =
-        HashMap::new();
-
-    if !bazel_items.is_empty() {
-        let mut bazel_by_dir: HashMap<PathBuf, Vec<&BatchBuildItem>> = HashMap::new();
-        for item in &bazel_items {
-            bazel_by_dir
-                .entry(bazel_graph_requery_group_dir(&item.working_dir))
-                .or_default()
-                .push(*item);
-        }
-
-        for (working_dir, items_for_dir) in bazel_by_dir {
-            let targets: Vec<String> = items_for_dir
-                .iter()
-                .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
-                .collect();
-            emitter.bazel_event(&format!(
-                "querying bazel watch paths for {} target{}...",
-                targets.len(),
-                if targets.len() == 1 { "" } else { "s" },
-            ));
-            let resolver =
-                crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
-            match resolver.resolve_per_target(&targets, &working_dir).await {
-                Ok(info_by_target) => {
-                    let unique: HashSet<&String> = info_by_target
-                        .values()
-                        .flat_map(|i| i.watch_paths.iter())
-                        .collect();
-                    emitter.bazel_event(&format!(
-                        "resolved {} unique watch path{} across {} target{}",
-                        unique.len(),
-                        if unique.len() == 1 { "" } else { "s" },
-                        targets.len(),
-                        if targets.len() == 1 { "" } else { "s" },
-                    ));
-                    for item in items_for_dir {
-                        let Some(target) = item.bazel.as_ref().map(|b| &b.target) else {
-                            continue;
-                        };
-                        if let Some(info) = info_by_target.get(target) {
-                            resolved_info_by_item.insert(item.name.clone(), info.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    outcome.warnings.push(format!(
-                        "bazel query failed in {}: {e}",
-                        working_dir.display()
-                    ));
-                }
-            }
-        }
-    }
-
-    // Attribute resolved watch paths to each item. Bazel items get their
-    // own per-target result (computed by DFS from the unified XML graph).
-    // Each item emits its own
-    // `WatchUpdate` so the watch manager keeps a per-service/task
-    // `WatchedItem` entry keyed by name. Directories in the watcher dedup
-    // via `registered_dirs`, so the actual inotify cost is paid once per
-    // directory regardless of how many items claim it.
-    for item in &items {
-        let info = resolved_info_by_item.get(&item.name);
-        let Some(info) = info else {
-            continue; // query failed for this tool — warning already pushed
-        };
-
-        if item.watch_enabled
-            && let Some(ref tx) = watch_update_tx
-        {
-            let watch_kind = match item.kind {
-                ProcessKind::Service => crate::watch::WatchItemKind::Service,
-                ProcessKind::Task => crate::watch::WatchItemKind::Task,
-            };
-            send_watch_update(
-                tx,
-                item.name.clone(),
-                watch_kind,
-                info.watch_paths.clone(),
-                item.ignore.clone(),
-                base_dir.clone(),
-            )
-            .await;
-            if !info.graph_definition_globs.is_empty() {
-                send_watch_update(
-                    tx,
-                    format!("{}__graph", item.name),
-                    crate::watch::WatchItemKind::BuildGraph,
-                    info.graph_definition_globs.clone(),
-                    global_watch_ignore.clone(),
-                    base_dir.clone(),
-                )
-                .await;
-            }
-        }
-    }
-
-    // Step 2: batch builds. Bazel groups run concurrently, but each group
+    // Build artifacts first. Bazel groups run concurrently, but each group
     // stays inside the working directory its labels belong to.
     let mut bazel_by_dir: BazelPrepareGroups = HashMap::new();
 
@@ -669,7 +554,7 @@ pub(crate) async fn run_batch_build_chain(
         ));
     }
 
-    // Step 3: resolve every succeeded bazel item's built-binary path, grouped
+    // Resolve every succeeded bazel item's built-binary path, grouped
     // by workspace. Lets a supervisor spawn the artifact directly instead of
     // via `bazel run`.
     //
@@ -743,20 +628,209 @@ pub(crate) async fn run_batch_build_chain(
         }
     }
 
-    // Step 4: decide each item, newest-mtime scan included. Every requested
-    // name gets exactly one outcome — a supervisor is waiting on it and
-    // silence would leave it parked forever.
-    let checks_started = Instant::now();
-    let mut scan = FileChangeScan::default();
-    if built_count > 0 {
-        emitter.lifecycle_event("checking for files changed during build...");
-    }
+    // Missing executable paths wait for watch setup: their `bazel run`
+    // fallback must not contend with our dependency query for the server lock.
+    let mut pending_artifacts = HashMap::new();
     for item in &items {
         let decided = if let Some(message) = failed.get(&item.name) {
             PrepareOutcome::Failed(message.clone())
         } else if succeeded.contains(&item.name) {
-            let check_started = Instant::now();
-            let checked = stale_since(
+            PrepareOutcome::Ready {
+                binary_path: binary_paths.get(&item.name).cloned(),
+            }
+        } else {
+            PrepareOutcome::Failed("build tool returned no result for this target".to_string())
+        };
+        if watch_update_tx.is_some()
+            && succeeded.contains(&item.name)
+            && !binary_paths.contains_key(&item.name)
+        {
+            pending_artifacts.insert(item.name.clone(), decided);
+        } else {
+            outcome.items.push((item.name.clone(), decided));
+        }
+    }
+    artifacts_ready(outcome);
+
+    let Some(ref watch_tx) = watch_update_tx else {
+        return;
+    };
+    let mut warnings = Vec::new();
+    // Resolve dependency watches after releasing artifacts to supervisors.
+    //
+    // Previously we ran N parallel `bazel query` subprocesses, one per item.
+    // Bazel's server has a workspace-wide analysis lock, so those parallel
+    // queries mostly serialised inside bazel anyway — and each process
+    // startup cost stacked. Now we issue one
+    // `deps(T1 + ... + Tn) --output=xml` per Bazel workspace and DFS-walk per
+    // target client-side to keep accurate per-service attribution.
+
+    // Partition items by tool. Each item keeps its own ignore patterns
+    // (configured per service/task) but gets the same tier-1/tier-2 globs.
+    let bazel_items = watch_resolution_items(&items);
+
+    let mut resolved_info_by_item: HashMap<String, crate::build_tool::ResolvedBuildInfo> =
+        HashMap::new();
+
+    if !bazel_items.is_empty() {
+        let mut bazel_by_dir: HashMap<PathBuf, Vec<&BatchBuildItem>> = HashMap::new();
+        for item in &bazel_items {
+            bazel_by_dir
+                .entry(bazel_graph_requery_group_dir(&item.working_dir))
+                .or_default()
+                .push(*item);
+        }
+
+        for (working_dir, items_for_dir) in bazel_by_dir {
+            let targets: Vec<String> = items_for_dir
+                .iter()
+                .filter_map(|i| i.bazel.as_ref().map(|b| b.target.clone()))
+                .collect();
+            emitter.bazel_event(&format!(
+                "querying bazel watch paths for {} target{}...",
+                targets.len(),
+                if targets.len() == 1 { "" } else { "s" },
+            ));
+            let resolver =
+                crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
+            match resolver.resolve_per_target(&targets, &working_dir).await {
+                Ok(info_by_target) => {
+                    let unique: HashSet<&String> = info_by_target
+                        .values()
+                        .flat_map(|i| i.watch_paths.iter())
+                        .collect();
+                    emitter.bazel_event(&format!(
+                        "resolved {} unique watch path{} across {} target{}",
+                        unique.len(),
+                        if unique.len() == 1 { "" } else { "s" },
+                        targets.len(),
+                        if targets.len() == 1 { "" } else { "s" },
+                    ));
+                    for item in items_for_dir {
+                        let Some(target) = item.bazel.as_ref().map(|b| &b.target) else {
+                            continue;
+                        };
+                        if let Some(info) = info_by_target.get(target) {
+                            resolved_info_by_item.insert(item.name.clone(), info.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    warnings.push(format!(
+                        "bazel query failed in {}: {e}",
+                        working_dir.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // If resolution failed, temporarily watch the workspace conservatively.
+    // Any subsequent edit retries graph resolution, including a fix to a broken
+    // BUILD file. Successful requery replaces this fallback with precise paths.
+    // Probe Bazel below instead of scanning this broad pattern for gap changes:
+    // Bazel's own outputs may have been written after our initial timestamp.
+    let mut unresolved = HashSet::new();
+    for item in &bazel_items {
+        if !resolved_info_by_item.contains_key(&item.name) {
+            unresolved.insert(item.name.clone());
+            let root = bazel_graph_requery_group_dir(&item.working_dir);
+            resolved_info_by_item.insert(
+                item.name.clone(),
+                crate::build_tool::ResolvedBuildInfo {
+                    watch_paths: Vec::new(),
+                    graph_definition_globs: vec![format!("{}/**", root.display())],
+                },
+            );
+            emitter.service_error_event(
+                &item.name,
+                "dependency watches unavailable — watching workspace edits to retry",
+            );
+        }
+    }
+
+    // Attribute resolved watch paths to each item. Bazel items get their
+    // own per-target result (computed by DFS from the unified XML graph).
+    // Each item emits its own
+    // `WatchUpdate` so the watch manager keeps a per-service/task
+    // `WatchedItem` entry keyed by name. Directories in the watcher dedup
+    // via `registered_dirs`, so the actual inotify cost is paid once per
+    // directory regardless of how many items claim it.
+    for item in &items {
+        let info = resolved_info_by_item.get(&item.name);
+        let Some(info) = info else {
+            continue; // query failed for this tool — warning already pushed
+        };
+
+        if item.watch_enabled
+            && let Some(ref tx) = watch_update_tx
+        {
+            let watch_kind = match item.kind {
+                ProcessKind::Service => crate::watch::WatchItemKind::Service,
+                ProcessKind::Task => crate::watch::WatchItemKind::Task,
+            };
+            send_watch_update(
+                tx,
+                item.name.clone(),
+                watch_kind,
+                info.watch_paths.clone(),
+                item.ignore.clone(),
+                base_dir.clone(),
+            )
+            .await;
+            if !info.graph_definition_globs.is_empty() {
+                send_watch_update(
+                    tx,
+                    format!("{}__graph", item.name),
+                    crate::watch::WatchItemKind::BuildGraph,
+                    info.graph_definition_globs.clone(),
+                    global_watch_ignore
+                        .iter()
+                        .cloned()
+                        .chain(["bazel-*/**", ".git/**", ".don/**"].map(String::from))
+                        .collect(),
+                    base_dir.clone(),
+                )
+                .await;
+            }
+        }
+    }
+
+    for warning in warnings {
+        emitter.error_event(&warning);
+    }
+
+    // Every registration is acknowledged before scanning. An edit since the
+    // pre-build timestamp is either found here or queued by the live watcher.
+    // Share observations only within this scan; later builds must see fresh data.
+    let checks_started = Instant::now();
+    let mut scan = FileChangeScan::default();
+    let mut deferred_outcome = PrepareBatchOutcome {
+        warnings: Vec::new(),
+        items: Vec::new(),
+    };
+    for item in &items {
+        let checked = if unresolved.contains(&item.name) {
+            let resolver =
+                crate::build_tool::bazel::BazelResolver::new().with_emitter(emitter.clone());
+            let up_to_date = match &item.bazel {
+                Some(bazel) => resolver
+                    .check_up_to_date(
+                        std::slice::from_ref(&bazel.target),
+                        &item.working_dir,
+                        bazel.config.as_deref(),
+                    )
+                    .await
+                    .unwrap_or(false),
+                None => true,
+            };
+            Ok((
+                std::mem::take(&mut scan),
+                (!up_to_date && item.kind == ProcessKind::Service)
+                    .then_some(crate::watch::WatchItemKind::Service),
+            ))
+        } else {
+            stale_since(
                 item,
                 resolved_info_by_item.get(&item.name),
                 &base_dir,
@@ -764,49 +838,51 @@ pub(crate) async fn run_batch_build_chain(
                 std::mem::take(&mut scan),
             )
             .await
-            .map(|(returned_scan, reason)| {
-                scan = returned_scan;
-                reason
-            });
-            emitter.service_debug_event(
-                &item.name,
-                &format!(
-                    "file change check ({:.3}s)",
-                    check_started.elapsed().as_secs_f64()
-                ),
-            );
-            match checked {
-                Ok(Some(reason)) => {
-                    emitter.service_event(&item.name, reason);
-                    PrepareOutcome::Stale
-                }
-                Ok(None) => PrepareOutcome::Ready {
-                    binary_path: binary_paths.get(&item.name).cloned(),
-                },
-                Err(error) => PrepareOutcome::Failed(format!("file change check failed: {error}")),
-            }
-        } else {
-            // The resolver returned neither a success nor a failure for this
-            // target — a panicked worker, or a target the batch never
-            // covered. Reporting it as failed is what keeps the process out
-            // of a permanent `Building`.
-            PrepareOutcome::Failed("build tool returned no result for this target".to_string())
         };
-        outcome.items.push((item.name.clone(), decided));
+        match checked {
+            Ok((returned_scan, changed)) => {
+                scan = returned_scan;
+                if let Some(ready) = pending_artifacts.remove(&item.name) {
+                    deferred_outcome.items.push((
+                        item.name.clone(),
+                        if changed.is_some() {
+                            PrepareOutcome::Stale
+                        } else {
+                            ready
+                        },
+                    ));
+                } else if let Some(kind) = changed {
+                    emitter.service_event(
+                        &item.name,
+                        "files changed before dependency watches were ready",
+                    );
+                    let _ = watch_tx.send(crate::watch::WatchUpdate::Changed {
+                        name: item.name.clone(),
+                        kind,
+                    });
+                }
+            }
+            Err(error) => {
+                let message = format!("watch gap check failed: {error}");
+                emitter.error_event(&message);
+                if pending_artifacts.remove(&item.name).is_some() {
+                    deferred_outcome
+                        .items
+                        .push((item.name.clone(), PrepareOutcome::Failed(message)));
+                }
+            }
+        }
     }
-    if built_count > 0 {
-        emitter.lifecycle_event(&format!(
-            "file change check complete ({:.2}s)",
-            checks_started.elapsed().as_secs_f64()
-        ));
-    }
-
-    outcome
+    artifacts_ready(deferred_outcome);
+    emitter.debug_event(&format!(
+        "watch: startup gap check elapsed={:?}",
+        checks_started.elapsed()
+    ));
 }
 
 /// Whether an input changed while this item was being built, and how to say
-/// so. The scan is against the timestamp taken *before* the chain started, so
-/// it covers the whole query → build → cquery pipeline.
+/// so. The timestamp predates the build and covers build → cquery → query →
+/// watch registration, including changes made before the watcher existed.
 ///
 /// This is not the rebuild cycle's staleness flag and cannot be merged with
 /// it: that one is learned from the watcher, and during this build nothing is
@@ -817,7 +893,7 @@ async fn stale_since(
     base_dir: &Path,
     scan_since: SystemTime,
     mut scan: FileChangeScan,
-) -> Result<(FileChangeScan, Option<&'static str>), tokio::task::JoinError> {
+) -> Result<(FileChangeScan, Option<crate::watch::WatchItemKind>), tokio::task::JoinError> {
     if !item.watch_enabled {
         return Ok((scan, None));
     }
@@ -827,8 +903,7 @@ async fn stale_since(
     let item = item.clone();
     let info = info.clone();
     let base_dir = base_dir.to_path_buf();
-    // A cancelled prepare discards this read-only result without blocking
-    // the runner's shutdown or allowing a supervisor to start the artifact.
+    // A cancelled setup discards this read-only result without blocking shutdown.
     tokio::task::spawn_blocking(move || {
         let reason = check_stale_since(&item, &info, &base_dir, scan_since, &mut scan);
         (scan, reason)
@@ -842,30 +917,16 @@ fn check_stale_since(
     base_dir: &Path,
     scan_since: SystemTime,
     scan: &mut FileChangeScan,
-) -> Option<&'static str> {
+) -> Option<crate::watch::WatchItemKind> {
     let source_changed =
         scan.any_changed_since(base_dir, &info.watch_paths, &item.ignore, scan_since);
     let graph_changed =
         scan.any_changed_since(base_dir, &info.graph_definition_globs, &[], scan_since);
+    use crate::watch::WatchItemKind;
     match (source_changed, graph_changed, item.kind) {
-        (true, true, ProcessKind::Service) => {
-            Some("files changed during build — rebuilding before start")
-        }
-        (true, false, ProcessKind::Service) => {
-            Some("source files changed during build — rebuilding before start")
-        }
-        (false, true, ProcessKind::Service) => {
-            Some("build graph changed during build — rebuilding before start")
-        }
-        (true, true, ProcessKind::Task) => {
-            Some("files changed during build — re-running build before start")
-        }
-        (true, false, ProcessKind::Task) => {
-            Some("source files changed during build — re-running build before start")
-        }
-        (false, true, ProcessKind::Task) => {
-            Some("build graph changed during build — re-running build before start")
-        }
+        (_, true, _) => Some(WatchItemKind::BuildGraph),
+        (true, false, ProcessKind::Service) => Some(WatchItemKind::Service),
+        (true, false, ProcessKind::Task) => Some(WatchItemKind::Task),
         (false, false, _) => None,
     }
 }
@@ -944,7 +1005,7 @@ mod tests {
             watch: bool,
             ignore_source: bool,
             changed: &'static [&'static str],
-            want: Option<&'static str>,
+            want: Option<crate::watch::WatchItemKind>,
         }
         let cases = [
             Case {
@@ -959,21 +1020,21 @@ mod tests {
                 watch: true,
                 ignore_source: false,
                 changed: &["src/app.rs"],
-                want: Some("source files changed during build — rebuilding before start"),
+                want: Some(crate::watch::WatchItemKind::Service),
             },
             Case {
                 kind: ProcessKind::Service,
                 watch: true,
                 ignore_source: false,
                 changed: &["BUILD.bazel"],
-                want: Some("build graph changed during build — rebuilding before start"),
+                want: Some(crate::watch::WatchItemKind::BuildGraph),
             },
             Case {
                 kind: ProcessKind::Service,
                 watch: true,
                 ignore_source: false,
                 changed: &["src/app.rs", "BUILD.bazel"],
-                want: Some("files changed during build — rebuilding before start"),
+                want: Some(crate::watch::WatchItemKind::BuildGraph),
             },
             Case {
                 kind: ProcessKind::Service,
@@ -994,7 +1055,7 @@ mod tests {
                 watch: true,
                 ignore_source: false,
                 changed: &["BUILD.bazel"],
-                want: Some("build graph changed during build — re-running build before start"),
+                want: Some(crate::watch::WatchItemKind::BuildGraph),
             },
         ];
         for case in cases {
@@ -1064,21 +1125,21 @@ mod tests {
                 true,
                 true,
                 ProcessKind::Service,
-                Some("build graph changed during build — rebuilding before start"),
+                Some(crate::watch::WatchItemKind::BuildGraph),
             ),
             (
                 "api",
                 true,
                 false,
                 ProcessKind::Service,
-                Some("files changed during build — rebuilding before start"),
+                Some(crate::watch::WatchItemKind::BuildGraph),
             ),
             (
                 "worker",
                 true,
                 false,
                 ProcessKind::Task,
-                Some("files changed during build — re-running build before start"),
+                Some(crate::watch::WatchItemKind::BuildGraph),
             ),
         ] {
             let mut item = bazel_item(name, watch);
