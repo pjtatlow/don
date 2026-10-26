@@ -29,6 +29,7 @@ pub mod sys;
 pub mod task_state;
 pub(crate) mod tui;
 pub(crate) mod update;
+pub(crate) mod version;
 pub(crate) mod watch;
 pub mod web;
 

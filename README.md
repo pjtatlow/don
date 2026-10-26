@@ -877,6 +877,17 @@ appears only in an overrides block is configured but not started, because the
 profile's `services` list is what picks the run set. Add the name there too if
 you mean to run it.
 
+### Minimum binary version
+
+This don requires a top-level floor:
+
+```toml
+min_version = "0.8.1"
+```
+
+`don start` and `don validate` fail without it, or if this binary is older than that floor.
+Older don binaries ignore unknown keys, so they skip the field. `don init` writes it.
+
 ### Config Auto-Reload
 
 Edit `don.toml` while don is running. Don detects the change, diffs it, and applies it live:
@@ -1077,6 +1088,7 @@ See [`examples/`](examples/) for complete working configs.
 | `secrets.vars` | {name: path} | Env name → SSM parameter path |
 | `secrets.groups` | {name: [string]} | Named bundles of vars |
 | `default_profile` | string | Top-level: profile used by bare `don start` |
+| `min_version` | string | Required. Minimum don binary version; start/validate fail if unset or if this binary is older |
 | `profiles.<name>.overrides` | table | Config fragment merged over the base file while that profile is active |
 | `fallback_ports` | bool | Top-level: use an OS-assigned proxy/Docker host port when the preferred port is in use |
 

@@ -1,5 +1,7 @@
 # Basic don example — run with: cargo run -- -c examples/basic/don.toml
 
+min_version = "0.8.1"
+
 [services.api]
 run.cmd = "python3"
 run.args = ["-m", "http.server", "8080"]

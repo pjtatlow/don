@@ -579,6 +579,7 @@ fn validate_show_prints_the_merged_config() {
         std::fs::write(
             &config_path,
             r#"
+min_version = "0.0.0"
 default_profile = "dev"
 
 [services.api]

@@ -21,6 +21,8 @@
 # the address you opened survives the daemon restarting under you on every
 # save.
 
+min_version = "0.8.1"
+
 default_profile = "all"
 
 # Take the nice ports when they're free, an OS-assigned one when they aren't.

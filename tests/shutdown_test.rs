@@ -897,6 +897,7 @@ fn shutdown_signals_unhealthy_services() {
 
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.svc]
 run.cmd = "sleep"
 run.args = ["300"]

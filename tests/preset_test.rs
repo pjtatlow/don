@@ -204,6 +204,7 @@ func main() {
         // stamping so the test isn't subject to the host's temp-parent
         // VCS state — see the matching note in `go_preset_builds_and_runs`.
         let toml = r#"
+min_version = "0.0.0"
 [services.api]
 go.package = "."
 go.ldflags = "-X main.version=1.2.3"

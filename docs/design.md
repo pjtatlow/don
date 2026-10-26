@@ -44,8 +44,8 @@ This is not an implementation detail. "Can the user still exit right here?" is p
 ## Config File (`don.toml`)
 
 The config has `[services]`, `[tasks]`, `[service_groups]`, and `[profiles]`
-sections, plus a few optional top-level keys such as `default_profile`,
-`watch_ignore`, and `fallback_ports`.
+sections, plus top-level keys such as `min_version`, `default_profile`,
+`watch_ignore`, and `fallback_ports`. `min_version` is required.
 
 Don also loads a sibling local override file when it exists. For the default
 config path, that file is `don.local.toml`; for `--config workspace.toml`, it is

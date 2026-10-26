@@ -65,10 +65,9 @@ fn validate_malformed_toml_body() {
     assert!(matches!(err, ConfigError::Parse(_)));
 }
 
-fn validate_empty_config_is_valid_body() {
+fn validate_config_with_only_min_version_is_valid_body() {
     let dir = TempDir::new("validate-empty");
-    let config_path = dir.child("don.toml");
-    std::fs::write(&config_path, "").unwrap();
+    let config_path = ConfigBuilder::new().write_to(dir.path());
 
     let config = Config::from_file(&config_path).unwrap();
     assert!(config.validate(TEST_PLATFORM).is_ok());
@@ -96,6 +95,7 @@ fn validate_config_with_tasks_and_profiles_body() {
 
 fn validate_shutdown_graceful_flags_body() {
     let toml = r#"
+min_version = "0.0.0"
 [shutdown]
 graceful = false
 
@@ -132,6 +132,7 @@ shutdown.signal = "SIGINT"
 
 fn validate_log_filter_keep_regex_body() {
     let toml = r#"
+min_version = "0.0.0"
 log_filter = ["^global keep"]
 
 [services.api]
@@ -153,6 +154,7 @@ log_filter = ["service keep [0-9]+"]
 
 fn validate_log_filter_rejects_invalid_regex_body() {
     let toml = r#"
+min_version = "0.0.0"
 [services.api]
 run.cmd = "api"
 log_filter = ["["]
@@ -197,6 +199,7 @@ fn config_from_file_merges_local_override_body() {
         std::fs::write(
             &config_path,
             r#"
+min_version = "0.0.0"
 default_profile = "base"
 watch_ignore = ["target/**"]
 
@@ -219,6 +222,7 @@ tasks = ["migrate"]
         std::fs::write(
             dir.child(case.local_name),
             r#"
+min_version = "0.0.0"
 default_profile = "local"
 watch_ignore = ["node_modules/**"]
 
@@ -283,8 +287,7 @@ tasks = ["migrate"]
 
 fn malformed_local_override_is_parse_error_body() {
     let dir = TempDir::new("local-override-malformed");
-    let config_path = dir.child("don.toml");
-    std::fs::write(&config_path, "").unwrap();
+    let config_path = ConfigBuilder::new().write_to(dir.path());
     std::fs::write(dir.child("don.local.toml"), "this is not [valid toml").unwrap();
 
     let err = Config::from_file(&config_path).unwrap_err();
@@ -293,6 +296,7 @@ fn malformed_local_override_is_parse_error_body() {
 
 fn validate_task_params_reject_run_flag_collisions_body() {
     let toml = r#"
+min_version = "0.0.0"
 [tasks.sync]
 cmd = "true"
 
@@ -499,11 +503,110 @@ fn don_validate_cli_missing_config_body() {
     assert!(stderr.contains("failed to read config file"));
 }
 
+fn don_validate_cli_min_version_ok_body() {
+    let dir = TempDir::new("cli-validate-min-version-ok");
+    ConfigBuilder::new()
+        .min_version(env!("CARGO_PKG_VERSION"))
+        .add_custom_service("api", "mybin", &[])
+        .done()
+        .write_to(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
+        .args([
+            "--config",
+            dir.child("don.toml").to_str().unwrap(),
+            "validate",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn don_validate_cli_min_version_mismatch_body() {
+    let dir = TempDir::new("cli-validate-min-version-mismatch");
+    ConfigBuilder::new()
+        .min_version("99.0.0")
+        .add_custom_service("api", "mybin", &[])
+        .done()
+        .write_to(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
+        .args([
+            "--config",
+            dir.child("don.toml").to_str().unwrap(),
+            "validate",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Required: Don >= 99.0.0"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("Current: Don {}", env!("CARGO_PKG_VERSION"))),
+        "{stderr}"
+    );
+    assert!(stderr.contains("brew upgrade pjtatlow/tap/don"), "{stderr}");
+    assert!(stderr.contains("don-installer.sh | sh"), "{stderr}");
+}
+
+fn don_start_cli_min_version_mismatch_body() {
+    let dir = TempDir::new("cli-start-min-version-mismatch");
+    ConfigBuilder::new()
+        .min_version("99.0.0")
+        .add_custom_service("api", "mybin", &[])
+        .done()
+        .write_to(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
+        .args(["--config", dir.child("don.toml").to_str().unwrap(), "start"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Required: Don >= 99.0.0"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("Current: Don {}", env!("CARGO_PKG_VERSION"))),
+        "{stderr}"
+    );
+    assert!(stderr.contains("brew upgrade pjtatlow/tap/don"), "{stderr}");
+    assert!(stderr.contains("don-installer.sh | sh"), "{stderr}");
+}
+
+fn don_validate_cli_min_version_missing_body() {
+    let dir = TempDir::new("cli-validate-min-version-missing");
+    ConfigBuilder::new()
+        .omit_min_version()
+        .add_custom_service("api", "mybin", &[])
+        .done()
+        .write_to(dir.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_don"))
+        .args([
+            "--config",
+            dir.child("don.toml").to_str().unwrap(),
+            "validate",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("min_version is required"), "{stderr}");
+}
+
 // --- Download validation ---
 
 fn download_toml(extra_lines: &str) -> String {
     format!(
         r#"
+min_version = "0.0.0"
 [services.tool]
 run.cmd = "tool"
 
@@ -518,6 +621,7 @@ path = "tool"
 
 fn validate_download_bad_sha256_length_body() {
     let toml = r#"
+min_version = "0.0.0"
 [services.tool]
 run.cmd = "tool"
 
@@ -538,6 +642,7 @@ sha256 = "tooshort"
 
 fn validate_download_bad_url_scheme_body() {
     let toml = r#"
+min_version = "0.0.0"
 [services.tool]
 run.cmd = "tool"
 
@@ -559,6 +664,7 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 fn validate_download_without_run_cmd_body() {
     // Download but no run.cmd → should error.
     let toml = r#"
+min_version = "0.0.0"
 [services.tool]
 
 [services.tool.download.platform.linux-x86_64]
@@ -588,6 +694,7 @@ fn validate_download_bin_name_collision_body() {
     // Two services download different binaries that would both link to
     // `.don/bin/cockroach` — must error unless disambiguated.
     let toml = r#"
+min_version = "0.0.0"
 [services.crdb_v25]
 run.cmd = "cockroach"
 [services.crdb_v25.download.platform.linux-x86_64]
@@ -618,6 +725,7 @@ path = "cockroach-v24/cockroach"
 fn validate_download_bin_name_override_resolves_collision_body() {
     // Same two-crdb setup but with explicit bin_names → passes.
     let toml = r#"
+min_version = "0.0.0"
 [services.crdb_v25]
 run.cmd = "cockroach"
 [services.crdb_v25.download]
@@ -646,6 +754,7 @@ path = "cockroach-v24/cockroach"
 fn validate_download_missing_current_platform_warns_body() {
     // TEST_PLATFORM is LinuxX86_64. Provide only macos entries — should warn.
     let toml = r#"
+min_version = "0.0.0"
 [services.tool]
 run.cmd = "tool"
 
@@ -675,8 +784,8 @@ bounded_test!(
 );
 bounded_test!(validate_malformed_toml, validate_malformed_toml_body);
 bounded_test!(
-    validate_empty_config_is_valid,
-    validate_empty_config_is_valid_body
+    validate_config_with_only_min_version_is_valid,
+    validate_config_with_only_min_version_is_valid_body
 );
 bounded_test!(
     validate_config_with_tasks_and_profiles,
@@ -696,6 +805,7 @@ bounded_test!(
 );
 fn global_env_reaches_every_process_body() {
     let toml = r#"
+min_version = "0.0.0"
 env = { CONF_PATH = "conf.sh.dev", SHARED = "global" }
 
 [services.api]
@@ -772,6 +882,22 @@ bounded_test!(
 bounded_test!(
     don_validate_cli_missing_config,
     don_validate_cli_missing_config_body
+);
+bounded_test!(
+    don_validate_cli_min_version_ok,
+    don_validate_cli_min_version_ok_body
+);
+bounded_test!(
+    don_validate_cli_min_version_mismatch,
+    don_validate_cli_min_version_mismatch_body
+);
+bounded_test!(
+    don_start_cli_min_version_mismatch,
+    don_start_cli_min_version_mismatch_body
+);
+bounded_test!(
+    don_validate_cli_min_version_missing,
+    don_validate_cli_min_version_missing_body
 );
 bounded_test!(
     validate_download_bad_sha256_length,

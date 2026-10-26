@@ -272,6 +272,7 @@ fn integration_headless_task_uses_command_override_and_is_not_interactive() {
         let output_path = dir.path().join("task-output.txt");
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [tasks.push]
 cmd = "sh"
 args = ["-c", "printf interactive > {}"]
@@ -682,6 +683,7 @@ fn integration_health_monitor_marks_unhealthy_and_auto_restarts() {
         // ConfigBuilder doesn't expose monitor fields — drop to raw TOML.
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.svc]
 run.cmd = "sleep"
 run.args = ["300"]
@@ -864,6 +866,7 @@ fn integration_clean_exit_status_zero_marks_stopped_not_failed() {
         // policy entirely, so we should *not* see auto-restart fire.
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.cleanly]
 run.cmd = "{}"
 log = "ignore"
@@ -936,6 +939,7 @@ fn integration_crash_triggers_auto_restart_when_on_failure_restart() {
 
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.crashy]
 run.cmd = "{}"
 log = "ignore"
@@ -1255,6 +1259,7 @@ fn integration_startup_failures_backoff_then_give_up() {
 
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.flaky]
 run.cmd = "{}"
 log = "ignore"
@@ -1358,6 +1363,7 @@ fn integration_rapid_crash_loop_gives_up_after_two_starts() {
 
         let toml = format!(
             r#"
+min_version = "0.0.0"
 [services.crasher]
 run.cmd = "{}"
 log = "ignore"
