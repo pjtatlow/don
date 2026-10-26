@@ -1206,3 +1206,78 @@ ready.exec.cmd = "true"
         handle.await.unwrap();
     });
 }
+
+#[test]
+fn integration_task_watch_rerun_waits_for_its_rerunning_dependency() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("watch-task-waits-for-dependency");
+        std::fs::write(dir.path().join("feeds.ts"), "v1").unwrap();
+        let toml = r#"
+[services.keeper]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+log = "ignore"
+ready.exec.cmd = "true"
+
+[tasks.schema]
+cmd = "bash"
+args = ["-c", "rm -f schema-applied; sleep 2; touch schema-applied"]
+log = "ignore"
+
+[tasks.feeds]
+cmd = "bash"
+args = ["-c", "test -f schema-applied && echo ran >> feeds-runs"]
+depends_on = ["schema"]
+watch = ["feeds.ts"]
+debounce = "100ms"
+log = "ignore"
+"#;
+
+        let (runner, shutdown_tx, buf) = make_runner(toml, dir.path()).await;
+        let control = runner.process_control();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+        assert!(
+            wait_for_output(&buf, "feeds: complete", Duration::from_secs(10)).await,
+            "feeds should run after schema at startup. output: {}",
+            read_buf(&buf)
+        );
+
+        control
+            .run_task("schema", std::collections::HashMap::new(), false, None)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(dir.path().join("feeds.ts"), "v2").unwrap();
+
+        assert!(
+            wait_for_output(
+                &buf,
+                "feeds: re-running (dependency re-ran)",
+                Duration::from_secs(10)
+            )
+            .await,
+            "feeds should re-run once schema completes. output: {}",
+            read_buf(&buf)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let output = read_buf(&buf);
+        assert!(
+            output.contains("feeds: waiting for dependencies before running")
+                && !output.contains("feeds: failed"),
+            "feeds must not start while schema is re-running. output: {output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("feeds-runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "output: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}

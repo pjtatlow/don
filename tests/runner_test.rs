@@ -2100,6 +2100,92 @@ fn integration_task_watch_run_on_change() {
     });
 }
 
+#[test]
+fn integration_dependent_task_reruns_after_its_dependency_reruns() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("dependent-task-rerun");
+        let schema_runs = dir.path().join("schema-runs");
+        let feeds_runs = dir.path().join("feeds-runs");
+        let schema_watch = format!("{}/schema.sql", dir.path().display());
+        let feeds_watch = format!("{}/feeds.ts", dir.path().display());
+        let task_state = TaskStateStore::new(dir.path().join(".don").join("task-state"));
+        for (task, watch) in [("schema", &schema_watch), ("feeds", &feeds_watch)] {
+            std::fs::write(watch, task).unwrap();
+            task_state
+                .record_success(task, std::slice::from_ref(watch), &[], None)
+                .await
+                .unwrap();
+        }
+        let schema_cmd = format!(
+            "N=$(cat {runs} 2>/dev/null || echo 0); N=$((N + 1)); echo $N > {runs}; [ $N -ne 2 ]",
+            runs = schema_runs.display()
+        );
+        let toml = ConfigBuilder::new()
+            .add_custom_service("keeper", "sleep", &["300"])
+            .log("ignore")
+            .done()
+            .add_task("schema", "bash", &["-c", &schema_cmd])
+            .watch(&[&schema_watch])
+            .log("ignore")
+            .done()
+            .add_task(
+                "feeds",
+                "bash",
+                &["-c", &format!("echo ran >> {}", feeds_runs.display())],
+            )
+            .depends_on(&["schema"])
+            .watch(&[&feeds_watch])
+            .log("ignore")
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path(), true).await;
+        let control = runner.process_control();
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+        let feeds_run_count = || {
+            std::fs::read_to_string(&feeds_runs)
+                .map(|runs| runs.lines().count())
+                .unwrap_or(0)
+        };
+        let wait_for_feeds_runs = async |count: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while feeds_run_count() < count {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "feeds should have run {count} times. output: {}",
+                    read_buf(&buf)
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let run_schema =
+            || control.run_task("schema", std::collections::HashMap::new(), false, None);
+
+        wait_for_substr(&buf, "feeds: skipped (no changes)", Duration::from_secs(8)).await;
+        run_schema().await.unwrap().unwrap();
+        wait_for_feeds_runs(1).await;
+
+        run_schema().await.unwrap().unwrap();
+        wait_for_substr(
+            &buf,
+            "feeds: skipped (dependency 'schema' failed)",
+            Duration::from_secs(8),
+        )
+        .await;
+        assert_eq!(feeds_run_count(), 1, "output: {}", read_buf(&buf));
+
+        run_schema().await.unwrap().unwrap();
+        wait_for_feeds_runs(2).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(feeds_run_count(), 2, "output: {}", read_buf(&buf));
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- Task timeout ---
 
 #[test]

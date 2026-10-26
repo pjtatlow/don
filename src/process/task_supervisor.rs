@@ -545,7 +545,7 @@ fn resolve_command(
                 } else {
                     super::task_worker::TaskRunMode::Triggered
                 },
-                intent: super::TaskRunIntent::Background,
+                intent: super::TaskRunIntent::Rerun,
                 reply: None,
                 start_message: Some("re-running (file changed)".to_string()),
             })
@@ -694,6 +694,7 @@ async fn supervise(
     // When the last run finished, for `is_self_write_suspect`. Only a run that
     // actually spawned sets it — nothing else of this task's wrote anything.
     let mut last_run_ended: Option<std::time::Instant> = None;
+    let mut ran_against: Option<Vec<Option<TaskRunInfo>>> = None;
     // The parameters the last run used, for a restart to reuse. Held here
     // because a restart is executed here; the scheduler kept a copy only to
     // hand it back on the way in.
@@ -719,6 +720,7 @@ async fn supervise(
     // across runs so a re-run that skips the build still knows what to spawn.
     // Per-process runtime state, so it lives here rather than on the config.
     let mut bazel_binary: Option<String> = None;
+    let checked_against = dependency_runs(&task_cfg.depends_on, &world.snapshot());
     let decision = tokio::select! {
         decision = super::task_worker::check_startup_task(
             &ctx, &name, &task_cfg, startup_cfg.has_dependents,
@@ -738,6 +740,7 @@ async fn supervise(
             None
         }
         super::task_worker::StartupTaskDecision::Skip { message } => {
+            ran_against = Some(checked_against);
             Some(NoSpawnOutcome::skipped(message.to_string()))
         }
         super::task_worker::StartupTaskDecision::PendingRun { message } => {
@@ -918,6 +921,30 @@ async fn supervise(
                                     }
                                     None => {}
                                 }
+                                let runs = dependency_runs(&task_cfg.depends_on, &world.snapshot());
+                                if ran_against.as_ref().is_some_and(|seen| *seen != runs) {
+                                    ran_against = Some(runs);
+                                    if let Ask::Run(request) = resolve_command(
+                                        TaskCommand::Rerun,
+                                        &name,
+                                        startup.as_ref(),
+                                        &last_params,
+                                        RunContext {
+                                            awaiting_artifact,
+                                            phase: owner.phase,
+                                            spawned: false,
+                                            self_write_suspect: false,
+                                        },
+                                    ) {
+                                        demand = super::Demand::None;
+                                        pending = Some(RunRequest {
+                                            start_message: Some(
+                                                "re-running (dependency re-ran)".to_string(),
+                                            ),
+                                            ..request
+                                        });
+                                    }
+                                }
                                 continue;
                             }
                             released = released_rx.changed(), if !stack_released => {
@@ -1032,6 +1059,21 @@ async fn supervise(
             }
         };
 
+        if !matches!(request.intent, super::TaskRunIntent::Background)
+            && !super::Demand::Scheduled.permitted_by(current_level(
+                stack_released,
+                &world,
+                &task_cfg.depends_on,
+            ))
+        {
+            ctx.emitter
+                .service_event(&name, "waiting for dependencies before running");
+            demand = super::Demand::Scheduled;
+            owner.set_needs_run_now(true);
+            owner.set(crate::process::TaskState::Pending);
+            continue;
+        }
+
         // Build before running. `bazel run` did this on every invocation and
         // don has to as well, or a task spawns whatever was built the last
         // time anything asked. Bazel decides whether that is real work; when
@@ -1052,6 +1094,7 @@ async fn supervise(
             owner.set(crate::process::TaskState::Pending);
         }
         build_done_for_run = false;
+        ran_against = Some(dependency_runs(&task_cfg.depends_on, &world.snapshot()));
 
         let RunRequest {
             params,
@@ -1538,7 +1581,10 @@ impl TaskPhaseOwner {
         use crate::config::TaskAutoRun;
         use crate::process::TaskState;
 
-        if self.phase == TaskState::DependencyFailed {
+        if matches!(
+            self.phase,
+            TaskState::DependencyFailed | TaskState::Building | TaskState::Running
+        ) {
             return false;
         }
         if !self.evaluated && self.phase == TaskState::Pending {
@@ -1680,6 +1726,19 @@ fn current_level(
         return crate::gate::Gate::Blocked;
     }
     crate::gate::level(depends_on, &world.snapshot())
+}
+
+fn dependency_runs(
+    depends_on: &[crate::config::Dependency],
+    snapshot: &crate::facts::FactsSnapshot,
+) -> Vec<Option<TaskRunInfo>> {
+    depends_on
+        .iter()
+        .map(|dep| match &snapshot.get(&dep.name)?.detail {
+            crate::facts::Detail::Task { last_run, .. } => last_run.clone(),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Join the finished reader, bounded — a wedged sink must not hold the

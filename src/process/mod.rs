@@ -97,6 +97,9 @@ pub(crate) enum TaskRunIntent {
     /// The dependency sweep asked for this run; its exit report drives the
     /// sweep-visible transition.
     Scheduled,
+    /// A file change or a dependency's re-run asked for this run. Like a
+    /// scheduled run, it waits for its dependencies.
+    Rerun,
     Background,
 }
 

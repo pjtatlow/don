@@ -200,7 +200,7 @@ watch = ["services/api/**/*.py"]
 
 ### Tasks
 
-One-shot commands that run to completion (migrations, codegen, seeding). Only re-run when watched files change.
+One-shot commands that run to completion (migrations, codegen, seeding). Only re-run when watched files change or a task they depend on runs again, and wait for their dependencies before they do.
 
 ```toml
 [tasks.migrate]
