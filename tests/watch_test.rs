@@ -1213,6 +1213,7 @@ fn integration_task_watch_rerun_waits_for_its_rerunning_dependency() {
         let dir = TempDir::new("watch-task-waits-for-dependency");
         std::fs::write(dir.path().join("feeds.ts"), "v1").unwrap();
         let toml = r#"
+min_version = "0.0.0"
 [services.keeper]
 run.cmd = "bash"
 run.args = ["-c", "sleep 60"]
