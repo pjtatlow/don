@@ -42,6 +42,25 @@ pub fn still_alive(ident: &ProcessIdentity) -> bool {
     }
 }
 
+/// Check whether a recorded group has outlived its leader.
+///
+/// A wrapper like `bazel run` is the group leader, and `kill_on_drop` kills
+/// only the leader, so the real workload keeps running in a group whose
+/// leader pid no longer exists. [`still_alive`] cannot see that — it matches
+/// on the leader's start time. A process group id is never reused while any
+/// member remains, so a vanished leader pid together with a group that still
+/// has members is exactly the old group, not a recycled pid.
+///
+/// Returns `false` for an old-format record (`start_time` 0), and whenever the
+/// leader pid exists again: that may be a recycled pid, so it is not touched.
+pub fn orphaned_group(ident: &ProcessIdentity) -> bool {
+    if ident.start_time == 0 {
+        return false;
+    }
+    matches!(read_start_time(ident.pgid), Ok(None))
+        && nix::sys::signal::killpg(nix::unistd::Pid::from_raw(ident.pgid), None).is_ok()
+}
+
 // --- Platform-specific start_time readers ---
 
 /// Read the start_time of a process by PID/PGID. Returns `Ok(None)` if the

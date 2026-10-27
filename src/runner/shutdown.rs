@@ -152,9 +152,26 @@ impl Runner {
                 }
             }
         }
-        // Every stop has been executed and joined, and the task pgid sweep
-        // has run; both supervisor sets are idle (or their waits have
-        // completed against killed processes) and can end now.
+        // A task that is still holding a group here missed its own kill: the
+        // backstop fired, or its supervisor is wedged. Aborting the supervisor
+        // below only drops the handle, and `kill_on_drop` signals the direct
+        // child alone — wrappers like `bazel run` leave the real workload
+        // behind in the group, so kill the groups explicitly first.
+        let live_groups: Vec<(String, i32)> = self
+            .facts_snapshot()
+            .live_task_groups()
+            .into_iter()
+            .map(|(name, pgid)| (name.to_string(), pgid))
+            .collect();
+        for (name, pgid) in live_groups {
+            if crate::sys::kill_group(pgid) {
+                self.output_manager
+                    .service_event(&name, &format!("send SIGKILL to task pgid {pgid}"));
+            }
+        }
+        // Every stop has been executed and joined; both supervisor sets are
+        // idle (or their waits have completed against killed processes) and
+        // can end now.
         // Abort-all-then-await keeps the 1s bound paid once, not once per
         // process.
         let supervisors = self.service_starts.abort_all();

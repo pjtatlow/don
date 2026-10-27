@@ -64,6 +64,13 @@ pub struct ProcessHandle {
     pgid_file_path: Option<PathBuf>,
 }
 
+/// SIGKILL a process group by id, for callers that no longer hold its
+/// [`ProcessHandle`]. Returns whether any member was signalled; a group that
+/// is already gone is not an error.
+pub fn kill_group(pgid: i32) -> bool {
+    killpg(Pid::from_raw(pgid), Signal::SIGKILL).is_ok()
+}
+
 /// Configuration for spawning a process.
 pub struct SpawnConfig<'a> {
     /// The executable to run.
@@ -75,7 +82,7 @@ pub struct SpawnConfig<'a> {
     /// Environment variables (complete set for the child).
     /// Must include PATH and other essentials — the child's env is fully replaced.
     pub env: HashMap<String, String>,
-    /// Path for the PGID file. None = no PGID file (e.g., for tasks).
+    /// Path for the PGID file. None = no PGID file.
     pub pgid_file_path: Option<PathBuf>,
     /// Force pipe-based spawning instead of PTY (for testing fallback).
     pub force_pipe: bool,

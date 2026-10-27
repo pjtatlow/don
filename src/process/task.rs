@@ -1,7 +1,9 @@
 //! Task execution — run one-shot commands with skip detection and timeout.
 //!
-//! Tasks are short-lived: no PID files, no ready checks. They check
+//! Tasks are short-lived: no ready checks. They check
 //! `TaskStateStore::needs_run()`, spawn the command, and report success/failure.
+//! Each run records its process group in `.don/pids/<name>` like a service, so
+//! a crashed don's orphaned task groups are swept by cleanup.
 
 use nix::sys::signal::Signal;
 use tokio::time;
@@ -64,6 +66,8 @@ pub(crate) async fn spawn_task(
     bazel_binary: Option<&str>,
     secrets: &crate::secrets::SecretStore,
 ) -> Result<TaskSpawn, TaskError> {
+    let pid_dir = base_dir.join(".don").join("pids");
+    std::fs::create_dir_all(&pid_dir).map_err(crate::sys::ProcessError::Io)?;
     let prepared = prepare_task_command(
         task,
         task_name,
@@ -79,7 +83,7 @@ pub(crate) async fn spawn_task(
         args: &prepared.args,
         dir: Some(prepared.work_dir.as_path()),
         env: prepared.env,
-        pgid_file_path: None,
+        pgid_file_path: Some(pid_dir.join(task_name)),
         force_pipe: false,
         listen_fds: vec![],
     })
@@ -248,7 +252,7 @@ pub(crate) async fn wait_for_task(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -350,6 +354,157 @@ mod tests {
         assert!(
             err.to_string().contains("no `cmd`"),
             "unexpected error: {err}"
+        );
+    }
+
+    fn process_is_gone(pid: i32) -> bool {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            return true;
+        }
+        // A killed orphan can linger as a zombie when nothing reaps it.
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|r| r.trim_start().starts_with('Z'))
+        })
+    }
+
+    async fn wait_gone(pid: i32) -> bool {
+        for _ in 0..50 {
+            if process_is_gone(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// A task run is recorded in `.don/pids` like a service, so cleanup after
+    /// a crashed don kills the whole group — including grandchildren that a
+    /// wrapper (`bazel run`) leaves behind when only the wrapper is killed.
+    #[tokio::test]
+    async fn a_task_group_is_recorded_for_cleanup_and_swept_with_its_grandchildren() {
+        let dir = crate::sys::test_util::TempDir::new("task-pgid");
+        let base = dir.path();
+        let grandchild_pid = base.join("grandchild.pid");
+        let task = task_from(&format!(
+            "[tasks.t]\ncmd = \"sh\"\nargs = [\"-c\", \"sleep 300 & echo $! > {}; wait\"]\n",
+            grandchild_pid.display()
+        ));
+
+        let mut spawn = spawn_task(
+            &task,
+            "t",
+            base,
+            Platform::LinuxX86_64,
+            &HashMap::new(),
+            None,
+            &crate::secrets::SecretStore::empty(),
+        )
+        .await
+        .unwrap();
+
+        let recorded = crate::sys::read_pgid_file(&base.join(".don").join("pids").join("t"))
+            .await
+            .unwrap();
+        assert_eq!(recorded, Some(spawn.handle.pgid()));
+
+        let mut grandchild = None;
+        for _ in 0..50 {
+            if let Some(pid) = std::fs::read_to_string(&grandchild_pid)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                grandchild = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let grandchild = grandchild.unwrap();
+        assert!(!process_is_gone(grandchild));
+
+        // The crashed-daemon case: nothing holds the handle, only the file.
+        let report = crate::sys::cleanup::run_cleanup(base, &[]).await;
+        assert_eq!(report.pids_killed, 1);
+        assert!(wait_gone(grandchild).await, "grandchild survived cleanup");
+        let _ = spawn.handle.wait().await;
+    }
+
+    /// Shutdown's backstop kills a task group by id once its handle is gone.
+    #[tokio::test]
+    async fn kill_group_takes_the_grandchild_with_it() {
+        let dir = crate::sys::test_util::TempDir::new("task-kill-group");
+        let base = dir.path();
+        let grandchild_pid = base.join("grandchild.pid");
+        let task = task_from(&format!(
+            "[tasks.t]\ncmd = \"sh\"\nargs = [\"-c\", \"sleep 300 & echo $! > {}; wait\"]\n",
+            grandchild_pid.display()
+        ));
+        let mut spawn = spawn_task(
+            &task,
+            "t",
+            base,
+            Platform::LinuxX86_64,
+            &HashMap::new(),
+            None,
+            &crate::secrets::SecretStore::empty(),
+        )
+        .await
+        .unwrap();
+        let mut grandchild = None;
+        for _ in 0..50 {
+            if let Some(pid) = std::fs::read_to_string(&grandchild_pid)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                grandchild = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let grandchild = grandchild.unwrap();
+
+        assert!(crate::sys::kill_group(spawn.handle.pgid()));
+        assert!(wait_gone(grandchild).await, "grandchild survived killpg");
+        let _ = spawn.handle.wait().await;
+    }
+
+    /// The `bazel run` shape: the recorded leader is gone but its child, the
+    /// real workload, is still running in the group. Cleanup must find it.
+    #[tokio::test]
+    async fn cleanup_sweeps_a_group_whose_leader_has_exited() {
+        let dir = crate::sys::test_util::TempDir::new("task-orphaned-group");
+        let base = dir.path();
+        let grandchild_pid = base.join("grandchild.pid");
+        let task = task_from(&format!(
+            "[tasks.t]\ncmd = \"sh\"\nargs = [\"-c\", \"trap '' HUP; sleep 300 & echo $! > {}\"]\n",
+            grandchild_pid.display()
+        ));
+        let mut spawn = spawn_task(
+            &task,
+            "t",
+            base,
+            Platform::LinuxX86_64,
+            &HashMap::new(),
+            None,
+            &crate::secrets::SecretStore::empty(),
+        )
+        .await
+        .unwrap();
+        // Reaps the leader; the handle stays alive so its pid file does too.
+        spawn.handle.wait().await.unwrap();
+        let grandchild: i32 = std::fs::read_to_string(&grandchild_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!process_is_gone(grandchild));
+
+        let report = crate::sys::cleanup::run_cleanup(base, &[]).await;
+        assert_eq!(report.pids_killed, 1);
+        assert!(
+            wait_gone(grandchild).await,
+            "orphaned group survived cleanup"
         );
     }
 }

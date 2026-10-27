@@ -214,6 +214,14 @@ impl ProcessFacts {
             Detail::None => true,
         }
     }
+
+    /// The process group of the task run this supervisor is holding, if any.
+    pub(crate) fn task_pgid(&self) -> Option<i32> {
+        match &self.detail {
+            Detail::Task { pid, .. } => *pid,
+            _ => None,
+        }
+    }
 }
 
 /// Every process's facts, as of one instant.
@@ -262,6 +270,14 @@ impl FactsSnapshot {
     /// Every process, for the whole-stack questions no single one can answer.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &ProcessFacts)> {
         self.processes.iter()
+    }
+
+    /// Every task run still holding a process group, by task name.
+    pub(crate) fn live_task_groups(&self) -> Vec<(&str, i32)> {
+        self.processes
+            .iter()
+            .filter_map(|(name, facts)| Some((name.as_str(), facts.task_pgid()?)))
+            .collect()
     }
 
     /// Whether every one of `names` is holding nothing.
@@ -448,6 +464,20 @@ mod tests {
             failed_roots: roots.iter().map(|r| (*r).to_string()).collect(),
             ..ProcessFacts::for_service("dep", phase, None, Vec::new())
         }
+    }
+
+    #[test]
+    fn live_task_groups_lists_only_tasks_holding_a_pid() {
+        let task = |phase, pid| ProcessFacts::for_task("t", phase, false, pid, None, Vec::new());
+        let snapshot = FactsSnapshot::from_pairs([
+            ("running".to_string(), task(TaskState::Running, Some(4242))),
+            ("done".to_string(), task(TaskState::Completed, None)),
+            (
+                "svc".to_string(),
+                ProcessFacts::for_service("svc", ServiceState::Ready, None, Vec::new()),
+            ),
+        ]);
+        assert_eq!(snapshot.live_task_groups(), vec![("running", 4242)]);
     }
 
     #[test]
