@@ -5,6 +5,7 @@
 //! It owns all service/task state in a plain `HashMap` — no `Arc<Mutex<>>`.
 //! Communication uses channels: `mpsc` for commands in, `broadcast` for events out.
 
+mod event_log;
 mod events;
 mod graph;
 mod lazy;
@@ -25,6 +26,7 @@ mod task_commands;
 // These aliases keep the runner's internal paths stable and the shared state
 // vocabulary on its public `don::runner::…` path.
 pub use crate::command::{CommandError, CommandResult};
+pub use event_log::{EventLog, EventSubscription, RecordedEvent};
 
 // The batch-build workers and the batcher actor live in `crate::build_tool`;
 // the state projection and its `ProcessStatus` vocabulary at the crate root.
@@ -206,7 +208,7 @@ pub struct Runner {
     /// manager.
     update_tx: mpsc::Sender<Option<crate::update::UpdateAvailable>>,
     update_rx: mpsc::Receiver<Option<crate::update::UpdateAvailable>>,
-    event_tx: broadcast::Sender<RunnerEvent>,
+    event_tx: EventLog,
 
     /// The write half of the globally-readable state projection.
     ///
@@ -322,7 +324,7 @@ impl Runner {
     ) -> Result<Self, RunnerError> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (update_tx, update_rx) = mpsc::channel(64);
-        let (event_tx, _) = broadcast::channel(256);
+        let event_tx = EventLog::new();
         let (state, state_reader) = state_store::channel(state_store::StateSnapshot::default());
 
         let (report_tx, report_rx) = mpsc::unbounded_channel();
@@ -797,7 +799,7 @@ impl Runner {
         self.publish_state();
         // The pid comes from the projection the custody funnels write, so the
         // event and the snapshot cannot disagree about what is running.
-        let _ = self.event_tx.send(RunnerEvent::ServiceStateChanged {
+        self.event_tx.send(RunnerEvent::ServiceStateChanged {
             name: name.to_string(),
             state,
             pid: self.service_runtime(name).and_then(|runtime| runtime.pid),
@@ -810,7 +812,7 @@ impl Runner {
             return;
         };
         self.publish_state();
-        let _ = self.event_tx.send(RunnerEvent::TaskStateChanged {
+        self.event_tx.send(RunnerEvent::TaskStateChanged {
             name: name.to_string(),
             state,
             last_run: rt.last_run.clone(),
@@ -893,7 +895,7 @@ impl Runner {
 
     /// The event sender, for a server that hands out a subscription per
     /// connection rather than holding one.
-    pub fn subscribe_sender(&self) -> broadcast::Sender<RunnerEvent> {
+    pub fn subscribe_sender(&self) -> EventLog {
         self.event_tx.clone()
     }
 
@@ -964,7 +966,7 @@ impl Runner {
         let current_version = update
             .map(|u| u.current_version)
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-        let _ = self.event_tx.send(RunnerEvent::UpdateCheck {
+        self.event_tx.send(RunnerEvent::UpdateCheck {
             current_version,
             latest_version,
         });
@@ -1162,7 +1164,7 @@ impl Runner {
                     // issuing a command — see `StateReader::
                     // wait_for_startup_complete`.
                     self.state.set_startup_complete(true);
-                    let _ = self.event_tx.send(RunnerEvent::StartupSettled {
+                    self.event_tx.send(RunnerEvent::StartupSettled {
                         elapsed_ms: self.started_at.elapsed().as_millis() as u64,
                     });
                     let starts = self.service_starts.registry();
@@ -1335,8 +1337,7 @@ impl Runner {
             // and an attached client stops at the end of the *log* stream — so
             // the further ahead of the flush this goes, the less often the
             // client has to fall back on waiting for it.
-            let _ = self
-                .event_tx
+            self.event_tx
                 .send(RunnerEvent::ShutdownComplete { summary });
             self.output_manager.lifecycle_event(&summary.to_string());
         }

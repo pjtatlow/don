@@ -8,13 +8,13 @@
 pub(crate) mod attach;
 pub(crate) mod routes;
 
-use crate::runner::{RunnerCommand, RunnerEvent};
+use crate::runner::{EventLog, RunnerCommand};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 /// Server errors.
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +55,7 @@ pub(crate) struct ApiState {
     /// Runner event broadcast, used by `GET /events` to stream state changes.
     /// Subscribing per-request keeps the API decoupled from the runner loop —
     /// a slow HTTP client lags its own receiver and nobody else's.
-    pub event_tx: broadcast::Sender<RunnerEvent>,
+    pub event_tx: EventLog,
     /// Read-only view of runner state, updated on every transition.
     ///
     /// Handlers read it without touching `cmd_tx`, so a status query stays
@@ -144,7 +144,7 @@ pub async fn serve_api(
     listener: UnixListener,
     socket_path: PathBuf,
     cmd_tx: mpsc::UnboundedSender<RunnerCommand>,
-    event_tx: broadcast::Sender<RunnerEvent>,
+    event_tx: EventLog,
     state: crate::runner::StateReader,
     emulator: crate::output::emulator::EmulatorHandle,
     log_tap: crate::output::MergedLogTap,
