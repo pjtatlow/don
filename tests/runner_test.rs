@@ -2400,3 +2400,127 @@ fn integration_task_that_never_spawns_records_its_failure() {
         );
     });
 }
+
+#[test]
+fn integration_manual_run_waits_for_its_running_dependency() {
+    struct Case {
+        name: &'static str,
+        dep_exit: u8,
+        wait_timeout: Option<&'static str>,
+        want: Result<(), &'static str>,
+        child_runs: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "runs once the dependency completes",
+            dep_exit: 0,
+            wait_timeout: None,
+            want: Ok(()),
+            child_runs: "after\n",
+        },
+        Case {
+            name: "a dependency that fails ends the wait with an error",
+            dep_exit: 1,
+            wait_timeout: None,
+            want: Err("child: dependency 'dep' failed"),
+            child_runs: "",
+        },
+        Case {
+            name: "the --timeout covers the wait, and the run still happens",
+            dep_exit: 0,
+            wait_timeout: Some("200ms"),
+            want: Err("child: did not finish within 200ms"),
+            child_runs: "after\n",
+        },
+    ];
+
+    for case in cases {
+        run_with_timeout(Duration::from_secs(20), async {
+            let dir = TempDir::new("manual-run-waits");
+            let path = |file: &str| dir.path().join(file).display().to_string();
+            let dep_cmd = format!(
+                "touch {started}; while [ ! -f {release} ]; do sleep 0.05; done; touch {done}; exit {code}",
+                started = path("started"),
+                release = path("release"),
+                done = path("dep-done"),
+                code = case.dep_exit,
+            );
+            let child_cmd = format!(
+                "if [ -f {done} ]; then echo after; else echo early; fi >> {runs}",
+                done = path("dep-done"),
+                runs = path("child-runs"),
+            );
+            let toml = ConfigBuilder::new()
+                .add_task("dep", "sh", &["-c", &dep_cmd])
+                .log("ignore")
+                .done()
+                .add_task("child", "sh", &["-c", &child_cmd])
+                .depends_on(&["dep"])
+                .auto_run(false)
+                .log("ignore")
+                .done()
+                .build();
+
+            let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+            let control = runner.process_control();
+            let handle = tokio::spawn(async move {
+                runner.run().await.unwrap();
+            });
+            let child_runs = || std::fs::read_to_string(path("child-runs")).unwrap_or_default();
+
+            while !std::path::Path::new(&path("started")).exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let wait_timeout = case.wait_timeout.map(str::to_string);
+            let run = tokio::spawn(async move {
+                control
+                    .run_task(
+                        "child",
+                        std::collections::HashMap::new(),
+                        true,
+                        wait_timeout,
+                    )
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                child_runs(),
+                "",
+                "{}: child ran while dep was still running. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            std::fs::write(path("release"), "").unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(8), run)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .map_err(|e| e.to_string());
+            assert_eq!(
+                got,
+                case.want.map_err(str::to_string),
+                "{}. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while child_runs() != case.child_runs && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                child_runs(),
+                case.child_runs,
+                "{}. output: {}",
+                case.name,
+                read_buf(&buf)
+            );
+
+            let _ = shutdown_tx.send(()).await;
+            handle.await.unwrap();
+        });
+    }
+}
