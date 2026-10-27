@@ -2186,6 +2186,73 @@ fn integration_dependent_task_reruns_after_its_dependency_reruns() {
     });
 }
 
+#[test]
+fn integration_skipped_task_holds_dependents_until_its_dependencies_are_up() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("skipped-task-waits-for-deps");
+        let ready = dir.path().join("db-ready");
+        let seen = dir.path().join("seed-saw");
+        let watch = format!("{}/schema.sql", dir.path().display());
+        std::fs::write(&watch, "CREATE TABLE test;").unwrap();
+        TaskStateStore::new(dir.path().join(".don").join("task-state"))
+            .record_success("migrate", std::slice::from_ref(&watch), &[], None)
+            .await
+            .unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_custom_service(
+                "db",
+                "bash",
+                &[
+                    "-c",
+                    &format!("sleep 1; touch {}; exec sleep 300", ready.display()),
+                ],
+            )
+            .ready_exec_with("test", &["-f", ready.to_str().unwrap()], "100ms", 100)
+            .log("ignore")
+            .done()
+            .add_task("migrate", "echo", &["running migration"])
+            .depends_on(&["db"])
+            .watch(&[&watch])
+            .done()
+            .add_task(
+                "seed",
+                "bash",
+                &[
+                    "-c",
+                    &format!(
+                        "if [ -f {} ]; then echo up; else echo down; fi > {}",
+                        ready.display(),
+                        seen.display()
+                    ),
+                ],
+            )
+            .depends_on(&["migrate"])
+            .done()
+            .build();
+
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        wait_for_substr(&buf, "seed: complete", Duration::from_secs(10)).await;
+        let output = read_buf(&buf);
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap().trim(),
+            "up",
+            "seed should wait for db behind the skipped migrate: {output}"
+        );
+        assert!(
+            !output.contains("migrate: running"),
+            "migrate's inputs are unchanged, so it should still be skipped: {output}"
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 // --- Task timeout ---
 
 #[test]
