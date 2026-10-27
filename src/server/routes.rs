@@ -146,9 +146,10 @@ async fn get_ready(State(state): State<Arc<ApiState>>) -> Response {
 /// client disconnects or the runner shuts down; consumers should treat
 /// `shutdown_complete` as the terminator.
 ///
-/// A consumer too slow to keep up with the broadcast gets
-/// `{"type":"lagged","skipped":N}` instead of silently missing transitions —
-/// the correct response is to refetch `GET /status` and resync.
+/// Events a slow consumer falls behind on are re-sent from history. Only
+/// events that have left history arrive as `{"type":"lagged","skipped":N}`,
+/// including ahead of a replay whose start has left it — the correct response
+/// is to refetch `GET /status` and resync.
 async fn get_events(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<EventsQuery>,
@@ -157,6 +158,7 @@ async fn get_events(
     // the two lands in the subscription and is applied after the snapshot —
     // replay-safe. The other order loses it entirely.
     let crate::runner::EventSubscription {
+        skipped,
         replay,
         next_seq,
         live: mut events_rx,
@@ -175,6 +177,9 @@ async fn get_events(
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
     let mut shutdown = state.shutdown.clone();
     tokio::spawn(async move {
+        if skipped > 0 && tx.send(ndjson(&lagged(skipped))).await.is_err() {
+            return;
+        }
         for recorded in replay {
             let value = stamped_event(&recorded.event, recorded.seq, recorded.wall_clock);
             if tx.send(ndjson(&value)).await.is_err() {
@@ -186,12 +191,16 @@ async fn get_events(
         }
         let mut seq = next_seq;
         loop {
-            let value = tokio::select! {
+            let values = tokio::select! {
                 process = events_rx.recv() => match process {
-                    Ok(event) => stamp_live(&event_log, &mut seq, &event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        seq += skipped;
-                        serde_json::json!({ "type": "lagged", "skipped": skipped })
+                    Ok(event) => vec![stamp_live(&event_log, &mut seq, &event)],
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        let (gone, kept) = event_log.recorded(seq, seq + missed);
+                        seq += missed;
+                        let resent = kept.iter().map(|recorded| {
+                            stamped_event(&recorded.event, recorded.seq, recorded.wall_clock)
+                        });
+                        (gone > 0).then(|| lagged(gone)).into_iter().chain(resent).collect()
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
@@ -212,8 +221,10 @@ async fn get_events(
                     continue;
                 }
             };
-            if tx.send(ndjson(&value)).await.is_err() {
-                return;
+            for value in values {
+                if tx.send(ndjson(&value)).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -236,6 +247,10 @@ struct EventsQuery {
     /// Replay recorded events numbered above this before the snapshot.
     #[serde(default)]
     since: Option<u64>,
+}
+
+fn lagged(skipped: u64) -> serde_json::Value {
+    serde_json::json!({ "type": "lagged", "skipped": skipped })
 }
 
 fn stamped_event(

@@ -25,6 +25,8 @@ pub struct RecordedEvent {
 
 /// A live receiver plus whatever history the caller asked to replay first.
 pub struct EventSubscription {
+    /// Requested events no longer in history, which precede `replay`.
+    pub skipped: u64,
     pub replay: Vec<RecordedEvent>,
     /// Sequence number of the first event `live` will yield.
     pub next_seq: u64,
@@ -42,6 +44,20 @@ struct History {
     next_seq: u64,
     capacity: usize,
     entries: VecDeque<RecordedEvent>,
+}
+
+impl History {
+    fn recorded(&self, from: u64, to: u64) -> (u64, Vec<RecordedEvent>) {
+        let kept: Vec<RecordedEvent> = self
+            .entries
+            .iter()
+            .filter(|recorded| recorded.seq >= from && recorded.seq < to)
+            .cloned()
+            .collect();
+        let wanted = to.saturating_sub(from);
+        let kept_count = u64::try_from(kept.len()).unwrap_or(wanted);
+        (wanted.saturating_sub(kept_count), kept)
+    }
 }
 
 impl Default for EventLog {
@@ -89,24 +105,30 @@ impl EventLog {
     }
 
     /// Subscribe, replaying recorded events with `seq > since` first (`None`
-    /// replays nothing). History is bounded; check the first replayed `seq`.
+    /// replays nothing). A `since` at or past this run's next `seq` can only
+    /// come from an earlier run, so it replays the whole history.
     pub fn subscribe_since(&self, since: Option<u64>) -> EventSubscription {
         let history = self.lock();
         let live = self.tx.subscribe();
-        let replay = match since {
-            Some(since) => history
-                .entries
-                .iter()
-                .filter(|recorded| recorded.seq > since)
-                .cloned()
-                .collect(),
-            None => Vec::new(),
+        let (skipped, replay) = match since {
+            Some(since) if since < history.next_seq => {
+                history.recorded(since + 1, history.next_seq)
+            }
+            Some(_) => history.recorded(1, history.next_seq),
+            None => (0, Vec::new()),
         };
         EventSubscription {
+            skipped,
             replay,
             next_seq: history.next_seq,
             live,
         }
+    }
+
+    /// Recorded events with `from <= seq < to`, and how many of those are no
+    /// longer in history.
+    pub fn recorded(&self, from: u64, to: u64) -> (u64, Vec<RecordedEvent>) {
+        self.lock().recorded(from, to)
     }
 
     /// When the event numbered `seq` was sent, if it is still in history.
@@ -210,13 +232,37 @@ mod tests {
             log.send(settled(n));
         }
 
-        let seqs: Vec<u64> = log
-            .subscribe_since(Some(0))
-            .replay
-            .iter()
-            .map(|recorded| recorded.seq)
-            .collect();
+        let sub = log.subscribe_since(Some(0));
+        let seqs: Vec<u64> = sub.replay.iter().map(|recorded| recorded.seq).collect();
         assert_eq!(seqs, vec![4, 5]);
+        assert_eq!(sub.skipped, 3);
         assert_eq!(log.wall_clock(1), None);
+    }
+
+    #[test]
+    fn a_since_from_an_earlier_run_replays_the_whole_history() {
+        let log = EventLog::new();
+        log.send(settled(1));
+        log.send(settled(2));
+
+        let sub = log.subscribe_since(Some(50));
+
+        let seqs: Vec<u64> = sub.replay.iter().map(|recorded| recorded.seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(sub.skipped, 0);
+    }
+
+    #[test]
+    fn recorded_counts_what_left_history() {
+        let log = EventLog::with_capacity(16, 2);
+        for n in 1..=5 {
+            log.send(settled(n));
+        }
+
+        let (gone, kept) = log.recorded(2, 6);
+
+        assert_eq!(gone, 2);
+        let seqs: Vec<u64> = kept.iter().map(|recorded| recorded.seq).collect();
+        assert_eq!(seqs, vec![4, 5]);
     }
 }
