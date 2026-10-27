@@ -776,11 +776,14 @@ async fn supervise(
                 // Idle only here: everywhere else there is work in hand.
                 busy.store(false, Ordering::Relaxed);
                 if let Some(outcome) = startup_skip.take_if(|_| {
-                    super::Demand::Scheduled.permitted_by(current_level(
-                        stack_released,
-                        &world,
-                        &task_cfg.depends_on,
-                    ))
+                    match current_level(stack_released, &world, &task_cfg.depends_on) {
+                        crate::gate::Gate::Open => true,
+                        crate::gate::Gate::Degraded => {
+                            crate::gate::failed_roots(&task_cfg.depends_on, &world.snapshot())
+                                .is_empty()
+                        }
+                        crate::gate::Gate::Blocked => false,
+                    }
                 }) {
                     outcome.emit(&ctx.emitter, &name);
                     owner.set_needs_run_now(false);

@@ -2253,6 +2253,31 @@ fn integration_skipped_task_holds_dependents_until_its_dependencies_are_up() {
     });
 }
 
+#[test]
+fn integration_skipped_task_behind_a_task_nobody_ran_lets_startup_settle() {
+    run_with_timeout(Duration::from_secs(15), async {
+        let dir = TempDir::new("skipped-task-behind-manual");
+        let toml = ConfigBuilder::new()
+            .add_task("migrate", "echo", &["running migration"])
+            .auto_run(false)
+            .done()
+            .add_task("seed", "echo", &["seeding"])
+            .auto_run(false)
+            .depends_on(&["migrate"])
+            .done()
+            .build();
+
+        let (runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        runner.run().await.unwrap();
+
+        let output = read_buf(&buf);
+        assert!(
+            !output.contains("seeding"),
+            "seed is manual and must not run: {output}"
+        );
+    });
+}
+
 // --- Task timeout ---
 
 #[test]
