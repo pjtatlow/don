@@ -39,7 +39,55 @@ use tokio::sync::oneshot;
 /// a dependent whose supervisor has already ended publishes nothing further,
 /// which is why the predicate is *holds nothing* rather than a phase: it stays
 /// true of a process that is simply gone.
+///
+/// A third escape bounds the wait: a dependent that never lets go must not
+/// hold every process beneath it until the runner's own backstop gives up on
+/// the whole stack. After [`DEPENDENTS_GONE_BOUND`] this stops waiting, which
+/// leaves the runner's 30 s backstop room to kill what is left.
 pub(crate) async fn await_dependents_gone(
+    name: &str,
+    emitter: &crate::output::LifecycleEmitter,
+    world: &mut crate::facts::FactsReader,
+    dependents: &[String],
+    force: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    await_dependents_gone_within(
+        name,
+        emitter,
+        world,
+        dependents,
+        force,
+        DEPENDENTS_GONE_BOUND,
+    )
+    .await;
+}
+
+/// Longest a process waits for its dependents during teardown.
+pub(crate) const DEPENDENTS_GONE_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
+async fn await_dependents_gone_within(
+    name: &str,
+    emitter: &crate::output::LifecycleEmitter,
+    world: &mut crate::facts::FactsReader,
+    dependents: &[String],
+    force: &mut tokio::sync::watch::Receiver<bool>,
+    bound: std::time::Duration,
+) {
+    if tokio::time::timeout(
+        bound,
+        wait_dependents_gone(name, emitter, world, dependents, force),
+    )
+    .await
+    .is_err()
+    {
+        emitter.service_event(
+            name,
+            "gave up waiting for dependents to stop; stopping anyway",
+        );
+    }
+}
+
+async fn wait_dependents_gone(
     name: &str,
     emitter: &crate::output::LifecycleEmitter,
     world: &mut crate::facts::FactsReader,
@@ -174,4 +222,43 @@ pub(crate) enum ProcessReport {
         intent: TaskRunIntent,
         result: Result<task_supervisor::TaskRunReport, String>,
     },
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::facts::ProcessFacts;
+    use std::time::Duration;
+
+    fn held_service() -> ProcessFacts {
+        ProcessFacts::for_service(
+            "dep",
+            ServiceState::Ready,
+            Some(crate::state_store::ServiceRuntime::default()),
+            Vec::new(),
+        )
+    }
+
+    /// A dependent that never lets go must not park its dependency forever.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_stuck_dependent_gives_up_at_the_bound() {
+        let (_aggregator, _publishers, mut reader) =
+            crate::facts::channel([("dep".to_string(), held_service())].into_iter());
+        let (_force_tx, mut force_rx) = tokio::sync::watch::channel(false);
+        let emitter = crate::output::LifecycleEmitter::discarding();
+        let dependents = vec!["dep".to_string()];
+
+        let started = tokio::time::Instant::now();
+        await_dependents_gone_within(
+            "base",
+            &emitter,
+            &mut reader,
+            &dependents,
+            &mut force_rx,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
 }
