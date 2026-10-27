@@ -31,11 +31,10 @@
 //! for its artifact before it starts, so every one of them is `Building` by
 //! the time the window closes, and deferring would deadlock startup.
 //!
-//! One request is late by construction. Watch paths are resolved *by* the
-//! preparation build and must reach the watcher before anything spawns, but
-//! the watcher does not exist until the runner has finished setting it up.
-//! So preparation requests that arrive before [`BatchRequest::WatchReady`] are
-//! parked here rather than queued. The first batch also waits for every task's
+//! Preparation waits for the initial explicit watches and the update receiver.
+//! Dependency watches are resolved after build + cquery have released processes
+//! to start. The preparation slot stays owned through that background setup,
+//! so shutdown cancels it too. The first batch also waits for every task's
 //! startup check, so hashing inputs cannot split runnable tasks into later builds.
 
 use std::collections::{HashMap, HashSet};
@@ -134,7 +133,8 @@ pub(crate) enum BatchRequest {
 
 /// What the detached workers hand back to the actor.
 enum WorkerDone {
-    Prepares(PrepareBatchOutcome),
+    ArtifactsReady(PrepareBatchOutcome),
+    PreparesFinished,
     Rebuilds(RebuildBatchOutcome),
     Requeries(Vec<(String, RequeryOutcome)>),
 }
@@ -261,13 +261,13 @@ async fn run(
                 }
             },
             Some(done) = worker_rx.recv() => {
-                // Release the slot before forwarding: anything the
-                // application enqueues must see a free batcher.
+                // Artifact readiness releases supervisors while this worker
+                // still owns dependency setup. The other outcomes finish work.
                 match done {
-                    WorkerDone::Prepares(outcome) => {
-                        scheduler.finish_prepare_batch();
+                    WorkerDone::ArtifactsReady(outcome) => {
                         deliver_prepares(outcome, &emitter, &mut prepare_outcomes);
                     }
+                    WorkerDone::PreparesFinished => scheduler.finish_prepare_batch(),
                     WorkerDone::Rebuilds(outcome) => {
                         scheduler.finish_rebuild_batch();
                         deliver_rebuilds(outcome, &mut rebuild_outcomes);
@@ -390,16 +390,20 @@ fn flush_prepares(
     let bazel_build_mutex = scheduler.bazel_mutex();
     let worker_tx = worker_tx.clone();
     scheduler.set_prepare_batch(tokio::spawn(async move {
-        let outcome = run_batch_build_chain(
+        let ready_tx = worker_tx.clone();
+        run_batch_build_chain(
             items,
             base_dir,
             emitter,
             watch_updates,
             global_watch_ignore,
             bazel_build_mutex,
+            move |outcome| {
+                let _ = ready_tx.send(WorkerDone::ArtifactsReady(outcome));
+            },
         )
         .await;
-        let _ = worker_tx.send(WorkerDone::Prepares(outcome));
+        let _ = worker_tx.send(WorkerDone::PreparesFinished);
     }));
 }
 
@@ -525,7 +529,9 @@ fn flush_requeries(
     let emitter = emitter.clone();
     let worker_tx = worker_tx.clone();
     let base_dir = workspace.base_dir.clone();
+    let bazel_mutex = scheduler.bazel_mutex();
     scheduler.set_requery_batch(tokio::spawn(async move {
+        let _guard = bazel_mutex.lock().await;
         let outcomes = run_graph_requery_worker(items, emitter, watch_updates, base_dir).await;
         let _ = worker_tx.send(WorkerDone::Requeries(outcomes));
     }));

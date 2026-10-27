@@ -1022,8 +1022,9 @@ impl Runner {
         // no demand is exactly what the phase means.
         self.refresh_runtime_port_manifest();
 
-        // Start file watchers before spawning services so we don't miss
-        // changes that happen during startup (slow ready checks, long builds, etc.).
+        // Install explicit watches and the workspace sentinel before startup.
+        // The expensive dependency query and its watch registrations follow
+        // build + cquery, with a scan covering changes before registration.
         let mut watch_handle: Option<tokio::task::JoinHandle<()>> = None;
         let (watch_update_tx, watch_update_rx) = mpsc::unbounded_channel();
         let (watch_query_tx, watch_query_rx) = mpsc::channel(8);
@@ -1118,9 +1119,8 @@ impl Runner {
 
         // Release the build manager. Every supervisor asked for its artifact
         // as it was constructed, and the manager has been holding those
-        // requests for exactly this moment: watch paths are resolved *by*
-        // those builds and must reach the watcher, so nothing may build until
-        // there is (or provably is not) a watcher to receive them. Holding
+        // requests until the update receiver is ready for the dependency
+        // watches they will install after releasing the built artifacts. Holding
         // them this long is also what makes the whole startup burst one
         // `bazel build`.
         let _ = self

@@ -862,8 +862,7 @@ async fn supervise(
                     }
                     // This service's artifact, from the build manager.
                     // Nothing has spawned yet, and nothing can until this
-                    // lands — which is also what puts the watch registrations
-                    // this build resolved in place before the first start.
+                    // lands. Dependency watches follow in the background.
                     outcome = prepare_rx.recv() => {
                         use crate::build_tool::batch::PrepareOutcome;
                         let Some(outcome) = outcome else { continue };
@@ -884,11 +883,6 @@ async fn supervise(
                                     owner.set(super::ServiceState::Pending);
                                 }
                             }
-                            // A watched file changed while the build ran, so
-                            // the artifact is already out of date. The build
-                            // manager narrated why; ask again. The service
-                            // stays `Building` throughout, so nothing starts
-                            // against it.
                             PrepareOutcome::Stale => {
                                 awaiting_artifact = request_artifact(
                                     &name, &resolved, &env, &prepare_tx,
@@ -924,6 +918,15 @@ async fn supervise(
                                 .service_event(&name, "build graph changed — rebuilding");
                             busy.store(true, Ordering::Relaxed);
                             break rebuild_again();
+                        }
+                        if outcome == RequeryOutcome::Updated && batch_built && !awaiting_artifact
+                            && demand != super::Demand::None
+                        {
+                            batch_built = false;
+                            owner.set(super::ServiceState::Building);
+                            awaiting_artifact = request_artifact(
+                                &name, &resolved, &env, &prepare_tx,
+                            );
                         }
                         continue;
                     }
