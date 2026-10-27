@@ -6,6 +6,7 @@
 //! (macOS).
 
 use std::io;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Identity of a child process group at the time it was spawned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,23 +43,56 @@ pub fn still_alive(ident: &ProcessIdentity) -> bool {
     }
 }
 
-/// Check whether a recorded group has outlived its leader.
-///
-/// A wrapper like `bazel run` is the group leader, and `kill_on_drop` kills
-/// only the leader, so the real workload keeps running in a group whose
-/// leader pid no longer exists. [`still_alive`] cannot see that — it matches
-/// on the leader's start time. A process group id is never reused while any
-/// member remains, so a vanished leader pid together with a group that still
-/// has members is exactly the old group, not a recycled pid.
-///
-/// Returns `false` for an old-format record (`start_time` 0), and whenever the
-/// leader pid exists again: that may be a recycled pid, so it is not touched.
-pub fn orphaned_group(ident: &ProcessIdentity) -> bool {
-    if ident.start_time == 0 {
+/// Whether a group recorded since boot has outlived its leader (`bazel run` leaves its
+/// workload behind). A record from before boot may name any leaderless group, so it never does.
+pub fn orphaned_group(ident: &ProcessIdentity, recorded_at: SystemTime) -> bool {
+    if ident.start_time == 0
+        || ident.pgid <= 1
+        || ident.pgid == nix::unistd::getpgrp().as_raw()
+        || !boot_time().is_ok_and(|boot| recorded_at >= boot)
+    {
         return false;
     }
     matches!(read_start_time(ident.pgid), Ok(None))
         && nix::sys::signal::killpg(nix::unistd::Pid::from_raw(ident.pgid), None).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn boot_time() -> io::Result<SystemTime> {
+    std::fs::read_to_string("/proc/stat")?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no btime in /proc/stat"))
+}
+
+#[cfg(target_os = "macos")]
+fn boot_time() -> io::Result<SystemTime> {
+    let mut boot = std::mem::MaybeUninit::<libc::timeval>::zeroed();
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            boot.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let boot = unsafe { boot.assume_init() };
+    Ok(UNIX_EPOCH
+        + Duration::from_secs(boot.tv_sec as u64)
+        + Duration::from_micros(boot.tv_usec as u64))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn boot_time() -> io::Result<SystemTime> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 // --- Platform-specific start_time readers ---
@@ -261,5 +295,16 @@ mod tests {
             start_time: 99999,
         };
         assert!(!still_alive(&fake));
+    }
+
+    #[test]
+    fn orphaned_group_never_names_pgid_0_or_1_or_our_own_group() {
+        for pgid in [0, 1, nix::unistd::getpgrp().as_raw()] {
+            let ident = ProcessIdentity {
+                pgid,
+                start_time: 1,
+            };
+            assert!(!orphaned_group(&ident, SystemTime::now()), "pgid {pgid}");
+        }
     }
 }

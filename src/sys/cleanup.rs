@@ -123,7 +123,10 @@ async fn cleanup_pid_file(path: &Path, report: &mut CleanupReport) {
         }
     };
 
-    if identity::still_alive(&ident) || identity::orphaned_group(&ident) {
+    let recorded_at = std::fs::metadata(path).and_then(|meta| meta.modified());
+    if identity::still_alive(&ident)
+        || recorded_at.is_ok_and(|at| identity::orphaned_group(&ident, at))
+    {
         // Confirmed orphan — same PGID + same start_time, or a group whose
         // leader is gone but whose members remain. Kill it.
         let _ = killpg(Pid::from_raw(ident.pgid), Signal::SIGKILL);

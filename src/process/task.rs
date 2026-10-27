@@ -470,11 +470,8 @@ mod tests {
     }
 
     /// The `bazel run` shape: the recorded leader is gone but its child, the
-    /// real workload, is still running in the group. Cleanup must find it.
-    #[tokio::test]
-    async fn cleanup_sweeps_a_group_whose_leader_has_exited() {
-        let dir = crate::sys::test_util::TempDir::new("task-orphaned-group");
-        let base = dir.path();
+    /// real workload, is still running in the group.
+    async fn leaderless_task_group(base: &Path) -> (TaskSpawn, i32) {
         let grandchild_pid = base.join("grandchild.pid");
         let task = task_from(&format!(
             "[tasks.t]\ncmd = \"sh\"\nargs = [\"-c\", \"trap '' HUP; sleep 300 & echo $! > {}\"]\n",
@@ -499,12 +496,37 @@ mod tests {
             .parse()
             .unwrap();
         assert!(!process_is_gone(grandchild));
+        (spawn, grandchild)
+    }
 
-        let report = crate::sys::cleanup::run_cleanup(base, &[]).await;
+    #[tokio::test]
+    async fn cleanup_sweeps_a_group_whose_leader_has_exited() {
+        let dir = crate::sys::test_util::TempDir::new("task-orphaned-group");
+        let (_spawn, grandchild) = leaderless_task_group(dir.path()).await;
+
+        let report = crate::sys::cleanup::run_cleanup(dir.path(), &[]).await;
         assert_eq!(report.pids_killed, 1);
         assert!(
             wait_gone(grandchild).await,
             "orphaned group survived cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_leaves_a_leaderless_group_named_by_a_pid_file_from_before_boot() {
+        let dir = crate::sys::test_util::TempDir::new("task-stale-group");
+        let (spawn, grandchild) = leaderless_task_group(dir.path()).await;
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(".don").join("pids").join("t"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        let report = crate::sys::cleanup::run_cleanup(dir.path(), &[]).await;
+        let survived = !process_is_gone(grandchild);
+        crate::sys::kill_group(spawn.handle.pgid());
+        assert_eq!(report.pids_killed, 0);
+        assert!(survived, "cleanup killed a group named by a stale pid file");
     }
 }
