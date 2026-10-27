@@ -335,7 +335,7 @@ impl ProcessControl {
         let wait = wait || wait_timeout.is_some();
         let timeout = match wait_timeout {
             Some(spelling) => match crate::duration::parse_duration(&spelling) {
-                Ok(duration) => Some((duration, spelling)),
+                Ok(duration) => Some((tokio::time::Instant::now() + duration, spelling)),
                 Err(e) => {
                     return Ok(Err(CommandError::InvalidParams {
                         name: name.to_string(),

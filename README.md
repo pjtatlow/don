@@ -220,6 +220,8 @@ depends_on = ["migrate"]
 ```
 
 Run deferred tasks with `don run <name>`, or from the TUI's task view (`t`).
+A run whose dependencies are still starting or running waits for them to
+succeed; under `--wait`, one that fails ends the wait with an error.
 
 Set `auto_run = "once"` to run a task automatically on startup until it has
 one successful run, then require manual triggers forever after:

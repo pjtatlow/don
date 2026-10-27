@@ -148,6 +148,8 @@ pub(crate) enum TaskRunIntent {
     /// A file change or a dependency's re-run asked for this run. Like a
     /// scheduled run, it waits for its dependencies.
     Rerun,
+    /// Someone asked for this run by name. Settled dependencies do not hold
+    /// it back; one still in progress makes it wait for them to succeed.
     Background,
 }
 

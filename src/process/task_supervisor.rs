@@ -44,8 +44,9 @@ pub(crate) struct RunRequest {
 /// A caller waiting to hear how a run request went, and when they expect the
 /// answer.
 pub(crate) enum RunReply {
-    /// Answered the moment the run is admitted — `don run`. The run's own
-    /// outcome travels separately, as lifecycle output.
+    /// Answered the moment the run is admitted or held for its dependencies
+    /// — `don run`. The run's own outcome travels separately, as lifecycle
+    /// output.
     OnStart(tokio::sync::oneshot::Sender<crate::command::CommandResult>),
     /// Answered when the run finishes — `don run --wait`.
     OnExit(RunWait),
@@ -80,8 +81,8 @@ fn settle_run(reply: Option<RunReply>, result: crate::command::CommandResult) {
 /// both the timer and the run needs no such thing.
 pub(crate) struct RunWait {
     pub(crate) reply: tokio::sync::oneshot::Sender<crate::command::CommandResult>,
-    /// Parsed `--wait` deadline; `None` waits indefinitely.
-    pub(crate) timeout: Option<(std::time::Duration, String)>,
+    /// `--wait` deadline, counted from the request; `None` waits indefinitely.
+    pub(crate) timeout: Option<(tokio::time::Instant, String)>,
 }
 
 /// What a task's supervisor can be asked to do.
@@ -712,6 +713,8 @@ async fn supervise(
     // A run held back until its build lands. Distinct from `pending`, which is
     // "run this next": this one may not run yet.
     let mut awaiting_build: Option<RunRequest> = None;
+    // A run asked for by name, waiting for its dependencies.
+    let mut held: Option<RunRequest> = None;
     // Whether the run now in hand has already had its build. Set when a build
     // releases a held run and cleared as that run is taken, so the run after
     // it builds again rather than inheriting the answer.
@@ -792,27 +795,50 @@ async fn supervise(
                 }
                 // The startup decision and build are already complete;
                 // dependencies still gate execution.
+                let level = current_level(stack_released, &world, &task_cfg.depends_on);
+                if level == crate::gate::Gate::Degraded
+                    && let Some(reply) = held.as_mut().and_then(|held| held.reply.take())
+                {
+                    let snapshot = world.snapshot();
+                    let roots = crate::gate::failed_roots(&task_cfg.depends_on, &snapshot);
+                    let message = if roots.is_empty() {
+                        let waiting: Vec<&str> = task_cfg
+                            .depends_on
+                            .iter()
+                            .filter(|dep| dep.blocking && !snapshot.satisfied(&dep.name))
+                            .map(|dep| dep.name.as_str())
+                            .collect();
+                        format!("waiting for dependency '{}'", waiting.join("', '"))
+                    } else {
+                        format!("dependency '{}' failed", roots.join("', '"))
+                    };
+                    reply.settle(Err(crate::command::CommandError::Failed {
+                        name: name.clone(),
+                        message,
+                    }));
+                }
+                let held_deadline = match held.as_ref().and_then(|held| held.reply.as_ref()) {
+                    Some(RunReply::OnExit(RunWait {
+                        timeout: Some((deadline, _)),
+                        ..
+                    })) => Some(*deadline),
+                    _ => None,
+                };
                 let permitted = startup
                     .as_ref()
                     .filter(|_| !awaiting_artifact)
-                    .filter(|startup| {
-                        demand.permitted_by(current_level(
-                            stack_released,
-                            &world,
-                            &startup.task_cfg.depends_on,
-                        ))
-                    })
+                    .filter(|_| demand.permitted_by(level))
                     .map(|_| {
                         // One-shot, like the service side: a run is spent
                         // here, and only a fresh demand re-arms it.
                         demand = super::Demand::None;
-                        RunRequest {
+                        held.take().unwrap_or(RunRequest {
                             reply: None,
                             params: std::collections::HashMap::new(),
                             mode: super::task_worker::TaskRunMode::Startup,
                             intent: super::TaskRunIntent::Scheduled,
                             start_message: None,
-                        }
+                        })
                     });
                 match permitted {
                     Some(request) => {
@@ -972,6 +998,20 @@ async fn supervise(
                                     released.is_err() || *released_rx.borrow();
                                 continue;
                             }
+                            () = wait_until(&held_deadline), if held_deadline.is_some() => {
+                                if let Some(RunReply::OnExit(wait)) =
+                                    held.as_mut().and_then(|held| held.reply.take())
+                                    && let Some((_, timeout)) = wait.timeout
+                                {
+                                    let _ = wait.reply.send(Err(
+                                        crate::command::CommandError::TimedOut {
+                                            name: name.clone(),
+                                            timeout,
+                                        },
+                                    ));
+                                }
+                                continue;
+                            }
                             // A re-query this supervisor asked for. The new
                             // patterns are already registered; a graph that
                             // moved means the task should run against it.
@@ -1081,18 +1121,44 @@ async fn supervise(
         // A run in hand supersedes a skip still waiting on dependencies.
         startup_skip = None;
 
-        if !matches!(request.intent, super::TaskRunIntent::Background)
-            && !super::Demand::Scheduled.permitted_by(current_level(
-                stack_released,
-                &world,
-                &task_cfg.depends_on,
-            ))
-        {
+        // A held run absorbs any other run while it waits, so the task runs
+        // once; a newer run by name replaces it.
+        let by_name = matches!(request.intent, super::TaskRunIntent::Background);
+        let request = match held.take() {
+            Some(waiting) if !by_name => waiting,
+            Some(waiting) => {
+                settle_run(
+                    waiting.reply,
+                    Err(crate::command::CommandError::Failed {
+                        name: name.clone(),
+                        message: "task run was superseded".to_string(),
+                    }),
+                );
+                request
+            }
+            None => request,
+        };
+        let wanted = if by_name {
+            super::Demand::Requested
+        } else {
+            super::Demand::Scheduled
+        };
+        if !wanted.permitted_by(current_level(stack_released, &world, &task_cfg.depends_on)) {
             ctx.emitter
                 .service_event(&name, "waiting for dependencies before running");
             demand = super::Demand::Scheduled;
             owner.set_needs_run_now(true);
             owner.set(crate::process::TaskState::Pending);
+            if matches!(request.intent, super::TaskRunIntent::Background) {
+                let reply = match request.reply {
+                    Some(RunReply::OnStart(reply)) => {
+                        let _ = reply.send(Ok(()));
+                        None
+                    }
+                    reply => reply,
+                };
+                held = Some(RunRequest { reply, ..request });
+            }
             continue;
         }
 
@@ -1405,9 +1471,7 @@ async fn supervise(
         let mut force_rx = crate::signals::force_watch();
         let wait = super::task::wait_for_task(&mut handle, timeout.as_deref());
         tokio::pin!(wait);
-        let deadline = wait_deadline
-            .as_ref()
-            .map(|(duration, _)| tokio::time::Instant::now() + *duration);
+        let deadline = wait_deadline.as_ref().map(|(deadline, _)| *deadline);
         let result = loop {
             tokio::select! {
                 result = &mut wait => break result,
@@ -2901,7 +2965,11 @@ mod tests {
                         "db".into(),
                         crate::facts::ProcessFacts::for_service(
                             "db",
-                            super::super::ServiceState::Pending,
+                            if case.builds {
+                                super::super::ServiceState::Pending
+                            } else {
+                                super::super::ServiceState::Ready
+                            },
                             None,
                             Vec::new(),
                         ),
