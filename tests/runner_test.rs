@@ -2101,6 +2101,40 @@ fn integration_task_watch_run_on_change() {
 }
 
 #[test]
+fn integration_task_with_hash_but_no_success_marker_runs_for_its_dependents() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("task-hash-no-success");
+        let watch = format!("{}/schema.sql", dir.path().display());
+        std::fs::write(&watch, "CREATE TABLE test;").unwrap();
+        let state_dir = dir.path().join(".don").join("task-state");
+        TaskStateStore::new(state_dir.clone())
+            .record_success("migrate", std::slice::from_ref(&watch), &[], None)
+            .await
+            .unwrap();
+        std::fs::remove_file(state_dir.join("migrate.success")).unwrap();
+
+        let toml = ConfigBuilder::new()
+            .add_task("migrate", "echo", &["running migration"])
+            .watch(&[&watch])
+            .done()
+            .add_task("seed", "echo", &["seeding"])
+            .depends_on(&["migrate"])
+            .done()
+            .build();
+
+        let (runner, _shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
+        let finished = tokio::time::timeout(Duration::from_secs(10), runner.run()).await;
+
+        let output = read_buf(&buf);
+        assert!(finished.is_ok(), "startup never settled: {output}");
+        assert!(
+            output.contains("migrate: complete") && output.contains("seed: complete"),
+            "migrate should run again and release seed: {output}"
+        );
+    });
+}
+
+#[test]
 fn integration_dependent_task_reruns_after_its_dependency_reruns() {
     run_with_timeout(Duration::from_secs(30), async {
         let dir = TempDir::new("dependent-task-rerun");

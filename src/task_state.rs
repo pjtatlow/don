@@ -118,7 +118,7 @@ impl TaskStateStore {
     ///
     /// Returns `true` if:
     /// - The task has no watch patterns (always runs)
-    /// - There is no stored hash (never succeeded before)
+    /// - There is no stored hash or success marker (never succeeded before)
     /// - The current file hash differs from the stored hash
     ///
     /// `base_dir` is prepended to glob patterns so they resolve relative to the
@@ -371,7 +371,11 @@ impl TaskStateStore {
             HashOutcome::Hash(hash) => hash,
             HashOutcome::TooLarge { files } => return Ok(WatchedInputs::Unverifiable { files }),
         };
-        // No recorded hash means no successful run to compare against.
+        // No hash, or a hash whose run died before writing its success
+        // marker, means no successful run to compare against.
+        if !self.has_success_sync(task_name)? {
+            return Ok(WatchedInputs::Changed);
+        }
         match self.read_stored_hash(task_name)? {
             Some(stored) if stored == current_hash => Ok(WatchedInputs::Unchanged),
             _ => Ok(WatchedInputs::Changed),
