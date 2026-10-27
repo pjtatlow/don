@@ -728,7 +728,10 @@ async fn supervise(
         _ = shutdown_rx.changed() => return,
     };
     let mut demand = super::Demand::None;
-    let skipped = match decision {
+    // A skip vouches for this task's dependents, so it settles only once the
+    // dependencies a run would have waited for are up.
+    let mut startup_skip = None;
+    let parked = match decision {
         super::task_worker::StartupTaskDecision::Run => {
             owner.set_needs_run_now(true);
             demand = super::Demand::Scheduled;
@@ -741,13 +744,14 @@ async fn supervise(
         }
         super::task_worker::StartupTaskDecision::Skip { message } => {
             ran_against = Some(checked_against);
-            Some(NoSpawnOutcome::skipped(message.to_string()))
+            startup_skip = Some(NoSpawnOutcome::skipped(message.to_string()));
+            None
         }
         super::task_worker::StartupTaskDecision::PendingRun { message } => {
             Some(NoSpawnOutcome::pending_run(message))
         }
     };
-    if let Some(outcome) = skipped {
+    if let Some(outcome) = parked {
         outcome.emit(&ctx.emitter, &name);
         if let Some(needs_run_now) = outcome.needs_run_now() {
             owner.set_needs_run_now(needs_run_now);
@@ -771,6 +775,21 @@ async fn supervise(
             None => {
                 // Idle only here: everywhere else there is work in hand.
                 busy.store(false, Ordering::Relaxed);
+                if let Some(outcome) = startup_skip.take_if(|_| {
+                    match current_level(stack_released, &world, &task_cfg.depends_on) {
+                        crate::gate::Gate::Open => true,
+                        crate::gate::Gate::Degraded => {
+                            crate::gate::failed_roots(&task_cfg.depends_on, &world.snapshot())
+                                .is_empty()
+                        }
+                        crate::gate::Gate::Blocked => false,
+                    }
+                }) {
+                    outcome.emit(&ctx.emitter, &name);
+                    owner.set_needs_run_now(false);
+                    owner.settle_without_run(outcome.state, None);
+                    continue;
+                }
                 // The startup decision and build are already complete;
                 // dependencies still gate execution.
                 let permitted = startup
@@ -867,6 +886,7 @@ async fn supervise(
                                             continue;
                                         }
                                         Ask::Park(message) => {
+                                            startup_skip = None;
                                             // Waiting for a human, not for a
                                             // dependency. Say so, then publish
                                             // — in that order, so the line
@@ -1058,6 +1078,8 @@ async fn supervise(
                 }
             }
         };
+        // A run in hand supersedes a skip still waiting on dependencies.
+        startup_skip = None;
 
         if !matches!(request.intent, super::TaskRunIntent::Background)
             && !super::Demand::Scheduled.permitted_by(current_level(
