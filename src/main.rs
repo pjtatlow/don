@@ -2,6 +2,7 @@
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
 
+mod startup;
 mod wisdom;
 
 use clap::{Parser, Subcommand};
@@ -1520,72 +1521,25 @@ async fn run_start_attached(
         Err(e) => return Err(format!("failed to check for a running don: {e}")),
     }
 
+    // Capture the append position before spawning so startup never replays a
+    // previous run's log (or misses this child's first progress message).
+    let log_offset = std::fs::metadata(base.join(".don/logs/runner.log"))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
     let (mut child, log_path) =
         spawn_runner_child(config_path, profile, verbose, no_daemon, with_ui)?;
-    let child_pid = child.id();
-
-    // Wait for the API socket to answer. Generous only about the socket —
-    // binding happens before the runner's main loop, so a healthy child
-    // answers almost immediately.
-    let client = Client::new(&base);
-    let start = tokio::time::Instant::now();
-    let socket_timeout = std::time::Duration::from_secs(10);
-    loop {
-        if client.ready().await.is_ok() {
-            break;
+    let forwarder = startup::SignalForwarder::new(child.id());
+    let _forwarder = match forwarder {
+        Ok(forwarder) => forwarder,
+        Err(error) => {
+            startup::stop_failed_start(&mut child).await;
+            return Err(format!("failed to forward terminal signals: {error}"));
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("failed to check the runner process: {e}"))?
-        {
-            let status_text = match status.code() {
-                Some(code) => format!("exit code {code}"),
-                None => "terminated by signal".to_string(),
-            };
-            let tail = read_log_tail(&log_path, 20);
-            let mut msg = format!(
-                "the runner exited before its API came up ({status_text}); log: {}",
-                log_path.display()
-            );
-            if !tail.is_empty() {
-                msg.push_str("\n\n");
-                msg.push_str(&tail);
-            }
-            return Err(msg);
-        }
-        if start.elapsed() >= socket_timeout {
-            return Err(format!(
-                "the runner did not answer within {socket_timeout:?} (pid {child_pid}); log: {}",
-                log_path.display()
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    };
+    if let Err(error) = startup::wait_for_runner(&mut child, &base, &log_path, log_offset).await {
+        startup::stop_failed_start(&mut child).await;
+        return Err(error);
     }
-
-    // Forward terminal signals to the runner child. The TUI's raw mode
-    // means Ctrl+C arrives as a key (handled over the API), so this exists
-    // for signals sent from *outside* — `kill -INT`, a closing terminal
-    // emulator — and it preserves the two-press force-kill escalation,
-    // because the child's own signal counter sees each forwarded SIGINT.
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
-            return;
-        };
-        let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
-            return;
-        };
-        loop {
-            tokio::select! {
-                received = sigint.recv() => { if received.is_none() { return; } }
-                received = sigterm.recv() => { if received.is_none() { return; } }
-            }
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(child_pid as i32),
-                nix::sys::signal::Signal::SIGINT,
-            );
-        }
-    });
 
     let log_filter_set: Option<std::collections::HashSet<String>> = if log_filter.is_empty() {
         None
