@@ -60,8 +60,11 @@ mod panes;
 mod render;
 mod search;
 mod selection;
+mod startup;
 mod status_table;
 mod view_index;
+
+pub use startup::run_startup_tui;
 
 use ansi_to_tui::IntoText;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};

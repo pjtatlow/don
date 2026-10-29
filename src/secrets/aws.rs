@@ -3,11 +3,14 @@
 use super::error::SecretError;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_ssm::Client;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 
 /// SSM `GetParameters` accepts at most 10 names per call.
 const SSM_BATCH_SIZE: usize = 10;
+// Bound pressure on SSM while avoiding a round trip per batch in series.
+const SSM_CONCURRENCY: usize = 4;
 
 pub struct AwsSsm {
     pub region: Option<String>,
@@ -119,8 +122,14 @@ async fn fetch_with<C: SsmGetParameters>(
     }
 
     let mut by_path: HashMap<String, String> = HashMap::new();
-    for chunk in paths.chunks(SSM_BATCH_SIZE) {
-        let output = client.get_parameters(chunk).await?;
+    let requests = paths
+        .chunks(SSM_BATCH_SIZE)
+        .map(|chunk| client.get_parameters(chunk))
+        .collect::<Vec<_>>();
+    let mut batches = stream::iter(requests).buffer_unordered(SSM_CONCURRENCY);
+    // These futures are owned here: an error or shutdown drops every in-flight
+    // request, with no detached work left fetching secrets after cancellation.
+    while let Some(output) = batches.try_next().await? {
         if !output.invalid_parameters.is_empty() {
             return Err(SecretError::msg(format!(
                 "AWS SSM parameters not found: {}",
@@ -175,6 +184,8 @@ fn format_aws_failure(error: &str, profile: Option<&str>) -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct MockSsm {
         values: HashMap<String, String>,
@@ -207,6 +218,133 @@ mod tests {
                 parameters,
                 invalid_parameters,
             })
+        }
+    }
+
+    struct DelayedSsm {
+        mock: MockSsm,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    struct InFlight<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl SsmGetParameters for DelayedSsm {
+        async fn get_parameters(
+            &self,
+            names: &[String],
+        ) -> Result<GetParametersResult, SecretError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _flight = InFlight(&self.active);
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            // Uneven completion times also exercise out-of-order responses.
+            tokio::time::sleep(Duration::from_millis(10 + names.len() as u64)).await;
+            self.mock.get_parameters(names).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_batches_are_bounded_and_cancelled_on_exit() {
+        struct Case {
+            count: usize,
+            error: bool,
+            invalid: bool,
+            cancel: bool,
+        }
+        let cases = vec![
+            Case {
+                count: 1,
+                error: false,
+                invalid: false,
+                cancel: false,
+            },
+            Case {
+                count: 11,
+                error: false,
+                invalid: false,
+                cancel: false,
+            },
+            Case {
+                count: 99,
+                error: false,
+                invalid: false,
+                cancel: false,
+            },
+            Case {
+                count: 101,
+                error: false,
+                invalid: false,
+                cancel: false,
+            },
+            Case {
+                count: 99,
+                error: true,
+                invalid: false,
+                cancel: false,
+            },
+            Case {
+                count: 99,
+                error: false,
+                invalid: true,
+                cancel: false,
+            },
+            Case {
+                count: 99,
+                error: false,
+                invalid: false,
+                cancel: true,
+            },
+        ];
+        for case in cases {
+            let vars: HashMap<String, String> = (0..case.count)
+                .map(|i| (format!("K{i}"), format!("/app/P{i}")))
+                .collect();
+            let expected: HashMap<String, String> = (0..case.count)
+                .map(|i| (format!("K{i}"), format!("v{i}")))
+                .collect();
+            let client = DelayedSsm {
+                mock: MockSsm {
+                    values: (0..case.count)
+                        .map(|i| (format!("/app/P{i}"), format!("v{i}")))
+                        .collect(),
+                    invalid: if case.invalid {
+                        vars.values().cloned().collect()
+                    } else {
+                        Vec::new()
+                    },
+                    error: case.error.then(|| "access denied".into()),
+                    batches: Mutex::new(Vec::new()),
+                },
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            };
+            let names = vars.keys().cloned().collect::<Vec<_>>();
+            let start = tokio::time::Instant::now();
+            let timeout = Duration::from_millis(if case.cancel { 5 } else { 1000 });
+            let result = tokio::time::timeout(timeout, fetch_with(&client, &vars, &names)).await;
+            if case.cancel {
+                assert!(result.is_err());
+            } else if case.error || case.invalid {
+                assert!(result.unwrap().is_err());
+            } else {
+                assert_eq!(result.unwrap().unwrap(), expected);
+                let waves = case
+                    .count
+                    .div_ceil(SSM_BATCH_SIZE)
+                    .div_ceil(SSM_CONCURRENCY);
+                assert!(start.elapsed() <= Duration::from_millis(20 * waves as u64));
+            }
+            assert_eq!(client.active.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                client.peak.load(Ordering::SeqCst),
+                case.count.div_ceil(SSM_BATCH_SIZE).min(SSM_CONCURRENCY)
+            );
         }
     }
 

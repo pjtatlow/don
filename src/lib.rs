@@ -40,4 +40,4 @@ pub use output::{LifecycleEmitter, OutputError, OutputManager, ServiceWriter};
 pub use runner::{Runner, RunnerError, VerboseInfo, WatchDir, WatchReport, WatchReportItem};
 pub use session_summary::SessionSummary;
 pub use task_state::{TaskRunInfo, TaskStateError, TaskStateStore};
-pub use tui::{TuiError, TuiMode, run_tui};
+pub use tui::{TuiError, TuiMode, run_startup_tui, run_tui};

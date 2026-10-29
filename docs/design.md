@@ -82,6 +82,16 @@ Secrets are first-class in Don. Values never live in config, and Don never
 writes them to disk. `src/secrets/` is shaped to extract later as the `key`
 crate; Don does not shell out to a Key binary.
 
+SSM parameters are fetched in batches of ten, with at most four requests in
+flight per source. Sources are still processed in order so later sources win
+when they supply the same name. Errors and shutdown cancel in-flight requests.
+
+Interactive startup opens a progress view before waiting for the runner's API.
+It displays only the current invocation's runner log, including secret-fetch
+progress, and forwards Ctrl+C while initialization is pending. Once the API is
+ready, the normal attached TUI takes over. Services still wait for secrets and
+redaction to be initialized before they start.
+
 Each `[[secrets]]` entry is one source. The provider is named by its key, the
 way a service names its kind, so settings only that provider understands sit
 inside it rather than at the top level. A source that names no provider is a
