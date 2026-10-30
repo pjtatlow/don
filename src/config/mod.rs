@@ -27,8 +27,9 @@ pub use self::service::{
 };
 pub use self::task::{Task, TaskAutoRun, TaskHeadless};
 pub use self::types::{
-    BazelConfig, BazelDefaults, Command, LogConfig, LogFilterConfig, LogFilters, OnFailure,
-    ProxyEntry, ProxyMode, ReadyCheck, ShutdownConfig, StartOn, TemporalQueue, TemporalServer,
+    BazelConfig, BazelDefaults, Command, KafkaGroup, KafkaServer, LogConfig, LogFilterConfig,
+    LogFilters, OnFailure, ProxyEntry, ProxyMode, ReadyCheck, ShutdownConfig, StartOn,
+    TemporalQueue, TemporalServer,
 };
 pub use crate::secrets::{Group as SecretGroup, SecretsConfig};
 pub use profile::resolve_profile_processes;
@@ -109,6 +110,9 @@ pub struct Config {
     /// own `auto_filter_on_failure` setting. Defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_filter_on_failure: bool,
+    /// Kafka brokers that `start_on` triggers can refer to, by name.
+    #[serde(default)]
+    pub kafka: HashMap<String, KafkaServer>,
     /// Temporal servers that `start_on` triggers can refer to, by name.
     #[serde(default)]
     pub temporal: HashMap<String, TemporalServer>,
@@ -791,6 +795,18 @@ impl Config {
             }
         }
 
+        for (name, server) in &self.kafka {
+            let bootstrap = &server.bootstrap;
+            if !bootstrap
+                .rsplit_once(':')
+                .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+            {
+                errors.push(format!(
+                    "kafka server '{name}': bootstrap '{bootstrap}' must be host:port, \
+                     like '127.0.0.1:9092'"
+                ));
+            }
+        }
         for (name, server) in &self.temporal {
             let url = &server.url;
             if !reqwest::Url::parse(url)
@@ -826,6 +842,23 @@ impl Config {
                 errors.push(format!(
                     "service '{name}': 'start_on' has no effect without 'lazy = true'"
                 ));
+            }
+            for group in &resolved.start_on.kafka {
+                let server = &group.server;
+                if !self.kafka.contains_key(server) {
+                    let names: std::collections::HashSet<&str> =
+                        self.kafka.keys().map(|s| s.as_str()).collect();
+                    let suggestion = suggest_typo(server, &names);
+                    errors.push(format!(
+                        "service '{name}': start_on references unknown kafka server '{server}'{suggestion}"
+                    ));
+                }
+                if group.topics.is_empty() {
+                    errors.push(format!(
+                        "service '{name}': start_on consumer group '{}' has no topics",
+                        group.consumer_group
+                    ));
+                }
             }
             for queue in &resolved.start_on.temporal {
                 let server = &queue.server;

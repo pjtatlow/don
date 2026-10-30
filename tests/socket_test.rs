@@ -1896,6 +1896,56 @@ fn integration_start_trigger_starts_on_existing_backlog() {
     });
 }
 
+/// Asking a server that isn't up yet would only fail.
+#[test]
+fn integration_start_trigger_waits_for_dependencies() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("start-trigger-deps");
+        let backlog = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let http = fake_temporal(backlog).await;
+        let gate = dir.path().join("dep-ready");
+        let worker = trigger_config(&http, "echo worker-launched && sleep 60").replacen(
+            "lazy = true\n",
+            "lazy = true\ndepends_on = [\"dep\"]\n",
+            1,
+        );
+        let toml = format!(
+            r#"{worker}
+
+[services.dep]
+run.cmd = "bash"
+run.args = ["-c", "sleep 60"]
+ready.exec.cmd = "test"
+ready.exec.args = ["-e", "{}"]
+ready.interval = "100ms"
+ready.retries = 300
+"#,
+            gate.display()
+        );
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !read_buf(&buf).contains("start trigger:"),
+            "checked before its dependency was up. output: {}",
+            read_buf(&buf)
+        );
+
+        std::fs::write(&gate, "").unwrap();
+        assert!(
+            wait_for_output(&buf, "worker-launched", Duration::from_secs(10)).await,
+            "expected a start once the dependency was up. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
 /// A worker that crashes goes back to lazy, and work still on the queue has to
 /// start it again.
 #[test]

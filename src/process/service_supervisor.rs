@@ -213,7 +213,9 @@ pub(crate) struct StartEnv {
     /// hands the build manager.
     pub(crate) global_watch_ignore: Vec<String>,
     /// File watches shared by every start trigger in the stack.
-    pub(crate) file_watches: super::start_trigger::FileWatches,
+    pub(crate) file_watches: super::start_on::FileWatches,
+    /// The `[kafka.<name>]` servers start triggers refer to.
+    pub(crate) kafka: Arc<std::collections::HashMap<String, crate::config::KafkaServer>>,
     /// The `[temporal.<name>]` servers start triggers refer to.
     pub(crate) temporal: Arc<std::collections::HashMap<String, crate::config::TemporalServer>>,
     /// Workspace-wide `.bazelrc` configuration name, for a service that builds
@@ -540,14 +542,16 @@ async fn supervise(
             });
         }
         demand_rx = Some(merged_rx);
-        AbortOnDrop(tokio::spawn(super::start_trigger::run(
-            super::start_trigger::TriggerEnv {
+        AbortOnDrop(tokio::spawn(super::start_on::run(
+            super::start_on::TriggerEnv {
                 name: name.clone(),
                 base_dir: env.base_dir.clone(),
                 world: world.clone(),
                 emitter: env.emitter.clone(),
                 demand_tx,
+                depends_on: resolved.depends_on.clone(),
                 file_watches: env.file_watches.clone(),
+                kafka: env.kafka.clone(),
                 temporal: env.temporal.clone(),
             },
             resolved.start_on.clone(),
@@ -2700,6 +2704,7 @@ mod tests {
             shutdown: ShutdownConfig::default(),
             fallback_ports: false,
             file_watches: Default::default(),
+            kafka: Default::default(),
             temporal: Default::default(),
             global_watch_ignore: Vec::new(),
             shutdown_rx: shutdown_rx.clone(),

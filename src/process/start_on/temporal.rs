@@ -1,36 +1,17 @@
-//! Demand for a lazy service from something other than a connection: a queue
-//! with work on it. Armed only while the service is `Lazy`.
+//! Starts a service when a Temporal task queue has a backlog, prompted by the
+//! server's database changing.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
-use tokio::time::Instant;
+use tokio::sync::watch;
 
-use crate::config::{StartOn, TemporalQueue, TemporalServer};
-use crate::facts::{FactsReader, Phase};
-use crate::output::LifecycleEmitter;
-use crate::process::ServiceState;
+use super::{RECHECK, WorkSource};
+use crate::config::{TemporalQueue, TemporalServer};
 
-const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-const CHECK_THROTTLE: Duration = Duration::from_secs(1);
 const TASK_QUEUE_TYPES: [&str; 2] = ["TASK_QUEUE_TYPE_WORKFLOW", "TASK_QUEUE_TYPE_ACTIVITY"];
-
-/// Everything one service's triggers need. They end when `demand_tx`'s
-/// receiver is dropped, which happens when the supervisor exits.
-pub(crate) struct TriggerEnv {
-    pub(crate) name: String,
-    pub(crate) base_dir: PathBuf,
-    pub(crate) world: FactsReader,
-    pub(crate) emitter: LifecycleEmitter,
-    pub(crate) demand_tx: mpsc::Sender<String>,
-    pub(crate) file_watches: FileWatches,
-    pub(crate) temporal: Arc<HashMap<String, TemporalServer>>,
-}
 
 /// One watcher per file, however many triggers care about it.
 #[derive(Clone, Default)]
@@ -61,155 +42,45 @@ impl FileWatches {
     }
 }
 
-/// Run every trigger for a service until the supervisor goes away.
-pub(crate) async fn run(env: TriggerEnv, start_on: StartOn) {
-    let mut tasks = JoinSet::new();
-    let client = match reqwest::Client::builder().timeout(CHECK_TIMEOUT).build() {
-        Ok(client) => client,
-        Err(e) => {
-            env.emitter.service_error_event(
-                &env.name,
-                &format!("start trigger disabled, HTTP client failed: {e}"),
-            );
-            return;
-        }
-    };
-    for queue in start_on.temporal {
-        // Config validation rejected a name that isn't here.
-        let Some(server) = env.temporal.get(&queue.server).cloned() else {
-            continue;
-        };
-        let env = TriggerEnv {
-            name: env.name.clone(),
-            base_dir: env.base_dir.clone(),
-            world: env.world.clone(),
-            emitter: env.emitter.clone(),
-            demand_tx: env.demand_tx.clone(),
-            file_watches: env.file_watches.clone(),
-            temporal: Arc::clone(&env.temporal),
-        };
-        tasks.spawn(run_trigger(env, server, queue, client.clone()));
-    }
-    while tasks.join_next().await.is_some() {}
+pub(super) struct TemporalSource {
+    pub(super) base_dir: PathBuf,
+    pub(super) changed: Option<watch::Receiver<()>>,
+    pub(super) client: reqwest::Client,
+    pub(super) file_watches: FileWatches,
+    pub(super) queue: TemporalQueue,
+    pub(super) server: TemporalServer,
 }
 
-/// Check when armed, when the watched file changes (throttled), and when any
-/// service changes state, which covers a server that wasn't up yet.
-async fn run_trigger(
-    mut env: TriggerEnv,
-    server: TemporalServer,
-    queue: TemporalQueue,
-    client: reqwest::Client,
-) {
-    let mut changed: Option<watch::Receiver<()>> = None;
-    let mut last_check: Option<Instant> = None;
-    let mut last_error: Option<String> = None;
-    let mut warned_unwatched = false;
-
-    loop {
-        if !wait_until_lazy(&mut env).await {
-            return;
-        }
-        if let Some(last) = last_check {
-            tokio::select! {
-                _ = tokio::time::sleep_until(last + CHECK_THROTTLE) => {}
-                _ = env.demand_tx.closed() => return,
-            }
-        }
-        if changed.is_none() {
+impl WorkSource for TemporalSource {
+    async fn wait_for_work(&mut self) -> Result<Option<String>, String> {
+        if self.changed.is_none() {
             // Often absent until the server first runs, so retried on each check.
-            changed = env
-                .file_watches
-                .subscribe(&env.base_dir.join(&server.database));
+            let database = self.base_dir.join(&self.server.database);
+            self.changed = self.file_watches.subscribe(&database);
         }
-
-        last_check = Some(Instant::now());
-        match backlog(&client, &server, &queue).await {
-            Ok(0) => {
-                last_error = None;
-                // The server is up, so its database should be watchable by now.
-                if changed.is_none() && !warned_unwatched {
-                    warned_unwatched = true;
-                    env.emitter.service_event(
-                        &env.name,
-                        &format!(
-                            "start trigger: can't watch {}, check the server's database path",
-                            server.database.display()
-                        ),
-                    );
-                }
+        let tasks = backlog(&self.client, &self.server, &self.queue).await?;
+        if tasks > 0 {
+            return Ok(Some(format!(
+                "{tasks} task(s) on Temporal queue {}/{}",
+                self.queue.namespace, self.queue.task_queue
+            )));
+        }
+        match self.changed.as_mut() {
+            Some(changed) => {
+                changed.changed().await.map_err(|e| e.to_string())?;
             }
-            Ok(tasks) => {
-                env.emitter.service_event(
-                    &env.name,
-                    &format!(
-                        "start trigger: {tasks} task(s) on Temporal queue {}/{}",
-                        queue.namespace, queue.task_queue
-                    ),
-                );
-                if env.demand_tx.send(env.name.clone()).await.is_err() {
-                    return;
-                }
-                // Stay quiet until the supervisor has taken the demand.
-                if !wait_until_not_lazy(&mut env).await {
-                    return;
-                }
-                continue;
-            }
-            Err(e) => {
-                // Expected until the server is up, so say it once.
-                if last_error.as_ref() != Some(&e) {
-                    env.emitter
-                        .service_debug_event(&env.name, &format!("start trigger: {e}"));
-                    last_error = Some(e);
-                }
-            }
+            None => tokio::time::sleep(RECHECK).await,
         }
+        Ok(None)
+    }
 
-        tokio::select! {
-            _ = file_changed(&mut changed) => {}
-            _ = env.world.changed() => {}
-            _ = env.demand_tx.closed() => return,
+    async fn wait_to_retry(&mut self) {
+        if let Some(changed) = self.changed.as_mut() {
+            let _ = tokio::time::timeout(RECHECK, changed.changed()).await;
+        } else {
+            tokio::time::sleep(RECHECK).await;
         }
     }
-}
-
-fn is_lazy(env: &TriggerEnv) -> bool {
-    env.world
-        .snapshot()
-        .get(&env.name)
-        .is_some_and(|facts| facts.phase == Phase::Service(ServiceState::Lazy))
-}
-
-/// False once the supervisor is gone.
-async fn wait_until_lazy(env: &mut TriggerEnv) -> bool {
-    while !is_lazy(env) {
-        tokio::select! {
-            changed = env.world.changed() => if changed.is_none() { return false },
-            _ = env.demand_tx.closed() => return false,
-        }
-    }
-    !env.demand_tx.is_closed()
-}
-
-/// False once the supervisor is gone.
-async fn wait_until_not_lazy(env: &mut TriggerEnv) -> bool {
-    while is_lazy(env) {
-        tokio::select! {
-            changed = env.world.changed() => if changed.is_none() { return false },
-            _ = env.demand_tx.closed() => return false,
-        }
-    }
-    true
-}
-
-async fn file_changed(changed: &mut Option<watch::Receiver<()>>) {
-    if let Some(changed) = changed.as_mut()
-        && changed.changed().await.is_ok()
-    {
-        return;
-    }
-    std::future::pending().await
 }
 
 /// Watches the directory, because databases touch sidecars and replace files.
@@ -317,6 +188,7 @@ fn parse_count(count: &serde_json::Value) -> Result<u64, String> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parses_backlog_responses() {
@@ -364,66 +236,6 @@ mod tests {
                 "{}",
                 case.name
             );
-        }
-    }
-
-    #[test]
-    fn validates_start_on_config() {
-        struct Case {
-            name: &'static str,
-            config: String,
-            error: Option<&'static str>,
-        }
-        const SERVER: &str =
-            "[temporal.local]\ndatabase = \"x.db\"\nurl = \"http://127.0.0.1:7243\"\n";
-        const TRIGGER: &str = "[[services.w.start_on.temporal]]\nnamespace = \"default\"\nserver = \"local\"\ntask_queue = \"default\"\n";
-        let config = |server: &str, lazy: &str, trigger: &str| {
-            format!(
-                "min_version = \"0.0.0\"\n{server}[services.w]\nrun.cmd = \"true\"\n{lazy}\n{trigger}"
-            )
-        };
-        let cases = [
-            Case {
-                name: "lazy with a trigger and no proxy",
-                config: config(SERVER, "lazy = true", TRIGGER),
-                error: None,
-            },
-            Case {
-                name: "lazy with nothing to trigger it",
-                config: config(SERVER, "lazy = true", ""),
-                error: Some("requires a 'proxy' or 'start_on' entry"),
-            },
-            Case {
-                name: "trigger without lazy",
-                config: config(SERVER, "", TRIGGER),
-                error: Some("no effect without 'lazy = true'"),
-            },
-            Case {
-                name: "unknown server",
-                config: config("", "lazy = true", TRIGGER),
-                error: Some("unknown temporal server 'local'"),
-            },
-            Case {
-                name: "gRPC address instead of an HTTP URL",
-                config: config(
-                    "[temporal.local]\ndatabase = \"x.db\"\nurl = \"127.0.0.1:7233\"\n",
-                    "lazy = true",
-                    TRIGGER,
-                ),
-                error: Some("must be an http(s) URL"),
-            },
-        ];
-        for case in cases {
-            let config: crate::config::Config = case.config.parse().unwrap();
-            let result = config.validate(crate::config::Platform::LinuxX86_64);
-            match case.error {
-                None => assert!(result.is_ok(), "{}: {:?}", case.name, result.err()),
-                Some(error) => assert!(
-                    format!("{result:?}").contains(error),
-                    "{}: expected {error}, got {result:?}",
-                    case.name
-                ),
-            }
         }
     }
 
