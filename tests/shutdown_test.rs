@@ -201,6 +201,7 @@ fn shutdown_lifecycle_events_survive_service_spam() {
             &script_path,
             "#!/bin/sh\n\
              trap 'i=1; while [ $i -le 5000 ]; do echo spam line $i; i=$((i+1)); done; exit 0' TERM\n\
+             echo trap armed\n\
              while true; do sleep 1; done\n",
         )
         .unwrap();
@@ -216,6 +217,8 @@ fn shutdown_lifecycle_events_survive_service_spam() {
 
         let (shutdown_tx, handle, buf) = spawn_runner(&toml, dir.path()).await;
         assert!(wait_for_output(&buf, "all services running", Duration::from_secs(5)).await);
+        // A SIGTERM before the trap kills the script with nothing to say.
+        assert!(wait_for_output(&buf, "trap armed", Duration::from_secs(5)).await);
 
         let _ = shutdown_tx.send(()).await;
         handle.await.unwrap();

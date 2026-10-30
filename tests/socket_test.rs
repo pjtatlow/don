@@ -920,17 +920,14 @@ fn integration_lazy_defers_start_until_dependency_satisfied() {
         // and the output actor to reach this buffer. Reading the buffer here
         // raced that journey and lost on macOS. Wait for the line itself; what
         // it *says* is what the test is actually about.
+        // The value, not `API_MARKER=`, which don's echoed spawn command contains.
         assert!(
-            wait_for_output(&buf, "API_MARKER=", Duration::from_secs(5)).await,
-            "expected api to report whether it saw the marker. output: {}",
+            wait_for_output(&buf, "API_MARKER=yes", Duration::from_secs(5)).await,
+            "api must have started after setup created its marker. output: {}",
             read_buf(&buf)
         );
 
         let output = read_buf(&buf);
-        assert!(
-            output.contains("API_MARKER=yes"),
-            "api must have started after setup created its marker. output: {output}"
-        );
         assert!(
             !output.contains("API_MARKER=no"),
             "api started before its dependency ran. output: {output}"
@@ -1412,8 +1409,11 @@ fn integration_lazy_service_dep_failure_after_startup_blocks_start() {
         );
         // The first startup run becomes ready. A later manual start remains in
         // Starting long enough for the lazy connection to defer, then fails its
-        // ready check.
-        let ready_cmd = format!("test $(cat {}) = 1", counter.display());
+        // ready check. Removing a file decides that, because a probe reading the
+        // run counter can beat the restarted service to writing it.
+        let healthy = dir.path().join("healthy");
+        std::fs::write(&healthy, "").unwrap();
+        let ready_cmd = format!("test -e {}", healthy.display());
         let toml = ConfigBuilder::new()
             .add_custom_service("dep", "bash", &["-c", &dep_cmd])
             .ready_exec_with("bash", &["-c", &ready_cmd], "100ms", 10)
@@ -1439,6 +1439,7 @@ fn integration_lazy_service_dep_failure_after_startup_blocks_start() {
         );
 
         assert!(control.stop("dep").await.unwrap().is_ok());
+        std::fs::remove_file(&healthy).unwrap();
 
         tokio::spawn({
             let control = control.clone();
