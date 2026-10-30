@@ -30,3 +30,9 @@ publish-jobs = ["homebrew", "./publish-crates-io"]
 # the fragment has no `on:` or `jobs:`. The path is relative to
 # .github/workflows/, hence the `..`.
 github-build-setup = "../build-setup.yml"
+
+# cargo-dist 0.31 defaults Apple Silicon builds to the retiring macOS 14 image.
+# Pin both macOS architectures to supported images instead of floating labels.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+x86_64-apple-darwin = "macos-15-intel"
