@@ -11,7 +11,7 @@ fn default_true() -> bool {
 use super::platform::Platform;
 use super::types::{
     BazelConfig, Command, LogConfig, LogFilterConfig, OnFailure, ProxyEntry, ReadyCheck,
-    ShutdownConfig, deserialize_proxy, deserialize_proxy_option,
+    ShutdownConfig, StartOn, deserialize_proxy, deserialize_proxy_option,
 };
 
 /// The kind of service — exactly one of these must be set.
@@ -59,8 +59,11 @@ pub struct Service {
     /// the listeners across restarts so traffic is never dropped.
     pub proxy: Vec<ProxyEntry>,
     /// If true, don't start the service until the first connection arrives on
-    /// a proxy address. Requires at least one proxy entry.
+    /// a proxy address or a `start_on` trigger fires. Requires at least one of
+    /// the two.
     pub lazy: bool,
+    /// What else can start a lazy service, for one that never gets connections.
+    pub start_on: StartOn,
     /// Optional binary download configuration for this service.
     pub download: Option<DownloadConfig>,
     /// Ready check — used to gate dependents until this service is accepting traffic.
@@ -128,6 +131,8 @@ struct RawService {
     proxy: Vec<ProxyEntry>,
     #[serde(default)]
     lazy: bool,
+    #[serde(default)]
+    start_on: StartOn,
     download: Option<DownloadConfig>,
     ready: Option<ReadyCheck>,
     shutdown: Option<ShutdownConfig>,
@@ -215,6 +220,7 @@ impl TryFrom<RawService> for Service {
             depends_on: raw.depends_on,
             proxy: raw.proxy,
             lazy: raw.lazy,
+            start_on: raw.start_on,
             download: raw.download,
             ready: raw.ready,
             shutdown: raw.shutdown,
@@ -257,6 +263,7 @@ pub struct ServiceOverride {
     pub depends_on: Option<Vec<Dependency>>,
     pub proxy: Option<Vec<ProxyEntry>>,
     pub lazy: Option<bool>,
+    pub start_on: Option<StartOn>,
     pub download: Option<DownloadConfig>,
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
@@ -288,6 +295,7 @@ struct RawServiceOverride {
     #[serde(default, deserialize_with = "deserialize_proxy_option")]
     proxy: Option<Vec<ProxyEntry>>,
     lazy: Option<bool>,
+    start_on: Option<StartOn>,
     download: Option<DownloadConfig>,
     ready: Option<ReadyCheck>,
     shutdown: Option<ShutdownConfig>,
@@ -324,6 +332,7 @@ impl TryFrom<RawServiceOverride> for ServiceOverride {
             depends_on: raw.depends_on,
             proxy: raw.proxy,
             lazy: raw.lazy,
+            start_on: raw.start_on,
             download: raw.download,
             ready: raw.ready,
             shutdown: raw.shutdown,
@@ -362,6 +371,7 @@ pub struct ResolvedService {
     pub depends_on: Vec<Dependency>,
     pub proxy: Vec<ProxyEntry>,
     pub lazy: bool,
+    pub start_on: StartOn,
     pub download: Option<DownloadConfig>,
     pub ready: Option<ReadyCheck>,
     pub shutdown: Option<ShutdownConfig>,
@@ -517,6 +527,7 @@ impl Service {
                 depends_on: self.depends_on.clone(),
                 proxy: self.proxy.clone(),
                 lazy: self.lazy,
+                start_on: self.start_on.clone(),
                 download: self.download.clone(),
                 ready: self.ready.clone(),
                 shutdown: self.shutdown.clone(),
@@ -555,6 +566,7 @@ impl Service {
                         .unwrap_or_else(|| self.depends_on.clone()),
                     proxy: ov.proxy.clone().unwrap_or_else(|| self.proxy.clone()),
                     lazy: ov.lazy.unwrap_or(self.lazy),
+                    start_on: ov.start_on.clone().unwrap_or_else(|| self.start_on.clone()),
                     download: ov.download.clone().or_else(|| self.download.clone()),
                     ready: ov.ready.clone().or_else(|| self.ready.clone()),
                     shutdown: ov.shutdown.clone().or_else(|| self.shutdown.clone()),

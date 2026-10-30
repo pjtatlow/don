@@ -16,6 +16,7 @@ pub(crate) mod registry;
 pub(crate) mod service;
 pub(crate) mod service_supervisor;
 pub(crate) mod service_worker;
+pub(crate) mod start_trigger;
 pub mod state;
 pub(crate) mod task;
 pub(crate) mod task_supervisor;
