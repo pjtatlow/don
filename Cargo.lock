@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "don"
-version = "0.8.6"
+version = "0.9.0"
 dependencies = [
  "aho-corasick",
  "ansi-to-tui",
