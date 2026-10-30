@@ -13,11 +13,13 @@ use tokio::time::Instant;
 
 use crate::config::{StartOn, TemporalQueue, TemporalServer};
 use crate::facts::{FactsReader, Phase};
+use crate::gate::Gate;
 use crate::output::LifecycleEmitter;
 use crate::process::ServiceState;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const CHECK_THROTTLE: Duration = Duration::from_secs(1);
+const TEMPORAL_RECHECK: Duration = Duration::from_secs(60);
 const TASK_QUEUE_TYPES: [&str; 2] = ["TASK_QUEUE_TYPE_WORKFLOW", "TASK_QUEUE_TYPE_ACTIVITY"];
 
 /// Everything one service's triggers need. They end when `demand_tx`'s
@@ -28,6 +30,7 @@ pub(crate) struct TriggerEnv {
     pub(crate) world: FactsReader,
     pub(crate) emitter: LifecycleEmitter,
     pub(crate) demand_tx: mpsc::Sender<String>,
+    pub(crate) depends_on: Vec<crate::config::Dependency>,
     pub(crate) file_watches: FileWatches,
     pub(crate) temporal: Arc<HashMap<String, TemporalServer>>,
 }
@@ -85,6 +88,7 @@ pub(crate) async fn run(env: TriggerEnv, start_on: StartOn) {
             world: env.world.clone(),
             emitter: env.emitter.clone(),
             demand_tx: env.demand_tx.clone(),
+            depends_on: env.depends_on.clone(),
             file_watches: env.file_watches.clone(),
             temporal: Arc::clone(&env.temporal),
         };
@@ -94,7 +98,8 @@ pub(crate) async fn run(env: TriggerEnv, start_on: StartOn) {
 }
 
 /// Check when armed, when the watched file changes (throttled), and when any
-/// service changes state, which covers a server that wasn't up yet.
+/// service changes state. Retry every minute after a failed check, or while the
+/// file can't be watched.
 async fn run_trigger(
     mut env: TriggerEnv,
     server: TemporalServer,
@@ -107,7 +112,7 @@ async fn run_trigger(
     let mut warned_unwatched = false;
 
     loop {
-        if !wait_until_lazy(&mut env).await {
+        if !wait_until_armed(&mut env).await {
             return;
         }
         if let Some(last) = last_check {
@@ -168,6 +173,7 @@ async fn run_trigger(
 
         tokio::select! {
             _ = file_changed(&mut changed) => {}
+            _ = tokio::time::sleep(TEMPORAL_RECHECK), if last_error.is_some() || changed.is_none() => {}
             _ = env.world.changed() => {}
             _ = env.demand_tx.closed() => return,
         }
@@ -181,9 +187,11 @@ fn is_lazy(env: &TriggerEnv) -> bool {
         .is_some_and(|facts| facts.phase == Phase::Service(ServiceState::Lazy))
 }
 
-/// False once the supervisor is gone.
-async fn wait_until_lazy(env: &mut TriggerEnv) -> bool {
-    while !is_lazy(env) {
+/// Lazy, with the service's dependencies up, so a server it depends on can be
+/// asked. False once the supervisor is gone.
+async fn wait_until_armed(env: &mut TriggerEnv) -> bool {
+    while !is_lazy(env) || crate::gate::level(&env.depends_on, &env.world.snapshot()) != Gate::Open
+    {
         tokio::select! {
             changed = env.world.changed() => if changed.is_none() { return false },
             _ = env.demand_tx.closed() => return false,

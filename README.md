@@ -681,9 +681,9 @@ server = "local"
 task_queue = "default"
 ```
 
-Don asks the server's HTTP API for the queue's backlog, counting workflow and activity tasks. It checks when the service becomes lazy, including after a crash re-arms it, then at most once a second when `database` changes or another service changes state. Don never reads `database`; a change only prompts the check. Tasks already queued from an earlier run start the service straight away.
+Don asks the server's HTTP API for the queue's backlog, counting workflow and activity tasks. Once the service's `depends_on` are up, it checks when the service becomes lazy, including after a crash re-arms it, then at most once a second when `database` changes or another service changes state. A failed check is retried every 60 seconds. Don never reads `database`; a change only prompts the check. Tasks already queued from an earlier run start the service straight away.
 
-List one entry per queue. Each namespace and queue the worker serves needs its own entry, because a queue with no entry won't start it. The service should `depends_on` the server so the database's directory exists.
+List one entry per queue. Each namespace and queue the worker serves needs its own entry, because a queue with no entry won't start it. The service should `depends_on` the server, so Don doesn't ask before it's up.
 
 #### Fallback Ports
 

@@ -547,6 +547,7 @@ async fn supervise(
                 world: world.clone(),
                 emitter: env.emitter.clone(),
                 demand_tx,
+                depends_on: resolved.depends_on.clone(),
                 file_watches: env.file_watches.clone(),
                 temporal: env.temporal.clone(),
             },
