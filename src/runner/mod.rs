@@ -544,6 +544,7 @@ impl Runner {
                 endpoints: endpoints_reader,
                 shutdown_rx: shutdown_flag_tx.subscribe(),
                 file_watches: Default::default(),
+                kafka: std::sync::Arc::new(config.kafka.clone()),
                 temporal: std::sync::Arc::new(config.temporal.clone()),
                 global_watch_ignore: global_watch_ignore.clone(),
                 bazel_config: config.bazel.config.clone(),

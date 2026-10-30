@@ -499,10 +499,32 @@ pub struct TemporalServer {
     pub url: String,
 }
 
+/// A Kafka broker that start triggers can refer to, from the top-level
+/// `[kafka.<name>]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaServer {
+    /// Address of the broker, as `host:port`. Don asks only this broker, so
+    /// this suits a single-broker dev cluster.
+    pub bootstrap: String,
+}
+
+/// A consumer group's topics on a broker from `[kafka.<name>]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaGroup {
+    pub consumer_group: String,
+    pub server: String,
+    pub topics: Vec<String>,
+}
+
 /// What wants a lazy service running, other than a connection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartOn {
+    /// Start the service when any of these consumer groups has unread messages.
+    #[serde(default)]
+    pub kafka: Vec<KafkaGroup>,
     /// Start the service when any of these Temporal task queues has a backlog.
     #[serde(default)]
     pub temporal: Vec<TemporalQueue>,
@@ -511,7 +533,7 @@ pub struct StartOn {
 impl StartOn {
     /// Whether nothing here can start the service.
     pub fn is_empty(&self) -> bool {
-        self.temporal.is_empty()
+        self.kafka.is_empty() && self.temporal.is_empty()
     }
 }
 

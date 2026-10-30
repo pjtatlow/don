@@ -14,6 +14,7 @@ pub(crate) mod facts;
 pub(crate) mod gate;
 pub(crate) mod globwalk;
 pub mod init;
+pub(crate) mod kafka;
 pub mod output;
 pub mod param_completions;
 pub mod ports;

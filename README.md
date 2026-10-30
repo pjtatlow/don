@@ -685,6 +685,24 @@ Don asks the server's HTTP API for the queue's backlog, counting workflow and ac
 
 List one entry per queue. Each namespace and queue the worker serves needs its own entry, because a queue with no entry won't start it. The service should `depends_on` the server, so Don doesn't ask before it's up.
 
+Kafka works the same way, for a service that reads topics directly:
+
+```toml
+[kafka.local]
+bootstrap = "127.0.0.1:9092"
+
+[services.relay]
+lazy = true
+depends_on = ["kafka"]
+
+[[services.relay.start_on.kafka]]
+consumer_group = "relay"
+server = "local"
+topics = ["orders", "returns"]
+```
+
+Once the service's `depends_on` are up, Don reads each group's committed offsets, then holds one long-polling fetch per broker across all the service's topics, starting from the lowest offset. Data coming back means a group has unread messages. The fetch commits nothing and has no group, so the service still sees every message. It's reissued every 60 seconds, which picks up new partitions, and a failed check is retried on the same interval. A partition a group has never committed to is unread from the start. Don asks only the `bootstrap` broker, so this suits a single-broker dev cluster.
+
 #### Fallback Ports
 
 Port fallback is opt-in. Keep the preferred ports in `don.toml` and set the
@@ -1099,6 +1117,8 @@ See [`examples/`](examples/) for complete working configs.
 | `proxy` | string or table | TCP listener: `"addr"` (listenfd) or `{ listen, env/listenfd/forward }` |
 | `lazy` | bool | Delay start until first proxy connection or `start_on` trigger |
 | `temporal.<name>` (top-level) | table | Temporal server for `start_on`: `{ database, url }` |
+| `kafka.<name>` (top-level) | table | Kafka broker for `start_on`: `{ bootstrap }` |
+| `start_on.kafka` | [table] | Consumer groups that start a lazy service: `{ consumer_group, server, topics }` |
 | `start_on.temporal` | [table] | Temporal queues that start a lazy service: `{ namespace, server, task_queue }` |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
 | `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
