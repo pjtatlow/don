@@ -543,6 +543,8 @@ impl Runner {
                 fallback_ports: config.fallback_ports,
                 endpoints: endpoints_reader,
                 shutdown_rx: shutdown_flag_tx.subscribe(),
+                file_watches: Default::default(),
+                temporal: std::sync::Arc::new(config.temporal.clone()),
                 global_watch_ignore: global_watch_ignore.clone(),
                 bazel_config: config.bazel.config.clone(),
                 facts: facts_reader.clone(),

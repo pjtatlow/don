@@ -28,7 +28,7 @@ pub use self::service::{
 pub use self::task::{Task, TaskAutoRun, TaskHeadless};
 pub use self::types::{
     BazelConfig, BazelDefaults, Command, LogConfig, LogFilterConfig, LogFilters, OnFailure,
-    ProxyEntry, ProxyMode, ReadyCheck, ShutdownConfig,
+    ProxyEntry, ProxyMode, ReadyCheck, ShutdownConfig, StartOn, TemporalQueue, TemporalServer,
 };
 pub use crate::secrets::{Group as SecretGroup, SecretsConfig};
 pub use profile::resolve_profile_processes;
@@ -109,6 +109,9 @@ pub struct Config {
     /// own `auto_filter_on_failure` setting. Defaults to `true`.
     #[serde(default = "default_true")]
     pub auto_filter_on_failure: bool,
+    /// Temporal servers that `start_on` triggers can refer to, by name.
+    #[serde(default)]
+    pub temporal: HashMap<String, TemporalServer>,
     /// Workspace-wide Bazel settings. Services and tasks that build with
     /// Bazel take their defaults from here.
     #[serde(default)]
@@ -788,6 +791,17 @@ impl Config {
             }
         }
 
+        for (name, server) in &self.temporal {
+            let url = &server.url;
+            if !reqwest::Url::parse(url)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+            {
+                errors.push(format!(
+                    "temporal server '{name}': url '{url}' must be an http(s) URL, \
+                     like 'http://127.0.0.1:7243'"
+                ));
+            }
+        }
         // Validate proxy and lazy across all services.
         let mut proxy_addrs: HashMap<&str, &str> = HashMap::new(); // addr -> service name
         for (name, svc) in &self.services {
@@ -802,11 +816,27 @@ impl Config {
                     config.trim()
                 ));
             }
-            // lazy needs at least one proxy entry to trigger on.
-            if resolved.lazy && resolved.proxy.is_empty() {
+            // lazy needs something to trigger on.
+            if resolved.lazy && resolved.proxy.is_empty() && resolved.start_on.is_empty() {
                 errors.push(format!(
-                    "service '{name}': 'lazy = true' requires at least one 'proxy' entry"
+                    "service '{name}': 'lazy = true' requires a 'proxy' or 'start_on' entry"
                 ));
+            }
+            if !resolved.lazy && !resolved.start_on.is_empty() {
+                errors.push(format!(
+                    "service '{name}': 'start_on' has no effect without 'lazy = true'"
+                ));
+            }
+            for queue in &resolved.start_on.temporal {
+                let server = &queue.server;
+                if !self.temporal.contains_key(server) {
+                    let names: std::collections::HashSet<&str> =
+                        self.temporal.keys().map(|s| s.as_str()).collect();
+                    let suggestion = suggest_typo(server, &names);
+                    errors.push(format!(
+                        "service '{name}': start_on references unknown temporal server '{server}'{suggestion}"
+                    ));
+                }
             }
             // Validate each proxy listen address parses as host:port.
             // The env/listenfd mutual-exclusion is enforced at deserialize

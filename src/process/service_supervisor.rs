@@ -212,6 +212,10 @@ pub(crate) struct StartEnv {
     /// Project-wide watch-ignore patterns, for the build spec this supervisor
     /// hands the build manager.
     pub(crate) global_watch_ignore: Vec<String>,
+    /// File watches shared by every start trigger in the stack.
+    pub(crate) file_watches: super::start_trigger::FileWatches,
+    /// The `[temporal.<name>]` servers start triggers refer to.
+    pub(crate) temporal: Arc<std::collections::HashMap<String, crate::config::TemporalServer>>,
     /// Workspace-wide `.bazelrc` configuration name, for a service that builds
     /// with Bazel and names none of its own.
     pub(crate) bazel_config: Option<String>,
@@ -520,6 +524,35 @@ async fn supervise(
         Some(assets) => (Some(assets.proxy), assets.demand_rx),
         None => (None, None),
     };
+    let lazily_triggered = resolved.lazy && (proxy.is_some() || !resolved.start_on.is_empty());
+    // Start triggers demand through the same channel as the proxy, so the
+    // supervisor has one way of being wanted. Dropped with this future.
+    let _start_triggers = (resolved.lazy && !resolved.start_on.is_empty()).then(|| {
+        let (demand_tx, merged_rx) = mpsc::channel(16);
+        if let Some(mut proxy_rx) = demand_rx.take() {
+            let demand_tx = demand_tx.clone();
+            tokio::spawn(async move {
+                while let Some(trigger) = proxy_rx.recv().await {
+                    if demand_tx.send(trigger).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        demand_rx = Some(merged_rx);
+        AbortOnDrop(tokio::spawn(super::start_trigger::run(
+            super::start_trigger::TriggerEnv {
+                name: name.clone(),
+                base_dir: env.base_dir.clone(),
+                world: world.clone(),
+                emitter: env.emitter.clone(),
+                demand_tx,
+                file_watches: env.file_watches.clone(),
+                temporal: env.temporal.clone(),
+            },
+            resolved.start_on.clone(),
+        )))
+    });
     // This service's phase is this supervisor's to answer for, because every
     // input it depends on is observed here. A lazy service with a bound proxy
     // starts life merely listening; everything else starts life wanted.
@@ -528,7 +561,7 @@ async fn supervise(
         deps: resolved.depends_on.clone(),
         world: world.clone(),
         facts,
-        phase: if resolved.lazy && proxy.is_some() {
+        phase: if lazily_triggered {
             super::ServiceState::Lazy
         } else {
             super::ServiceState::Pending
@@ -586,8 +619,7 @@ async fn supervise(
     // Restart policy. Every input it needs — a failed prepare, a failed ready
     // check, a health transition, how long this spawn lived — is something
     // this loop observed itself, which is what lets the whole of it live here.
-    let mut policy =
-        super::health::RestartPolicy::new(resolved.on_failure, resolved.lazy && proxy.is_some());
+    let mut policy = super::health::RestartPolicy::new(resolved.on_failure, lazily_triggered);
     // When the armed auto-restart is due, and which attempt it is.
     let mut backoff: Option<(tokio::time::Instant, u32)> = None;
     // Facts about the spawn currently held.
@@ -1074,7 +1106,11 @@ async fn supervise(
                                 {
                                     env.emitter.service_event(
                                         &name,
-                                        "first connection — building before start",
+                                        if proxy.is_some() {
+                                            "first connection — building before start"
+                                        } else {
+                                            "start triggered — building before start"
+                                        },
                                     );
                                     awaiting_artifact = request_artifact(
                                         &name, &resolved, &env, &prepare_tx,
@@ -2203,6 +2239,15 @@ fn sync_connection_policy(
     }
 }
 
+/// Aborts a task when dropped, so it can't outlive the supervisor that spawned it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Await a lazy trigger without consuming the select slot on `None`.
 async fn wait_demand(demand_rx: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
     match demand_rx.as_mut() {
@@ -2654,6 +2699,8 @@ mod tests {
             emitter: output_manager.clone_lifecycle_emitter(),
             shutdown: ShutdownConfig::default(),
             fallback_ports: false,
+            file_watches: Default::default(),
+            temporal: Default::default(),
             global_watch_ignore: Vec::new(),
             shutdown_rx: shutdown_rx.clone(),
             endpoints: {

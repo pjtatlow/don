@@ -485,3 +485,41 @@ impl<'de> Deserialize<'de> for LogConfig {
         }
     }
 }
+
+/// A Temporal server that start triggers can refer to, from the top-level
+/// `[temporal.<name>]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalServer {
+    /// The server's SQLite file, relative to the project root. A change prompts
+    /// a backlog check. Don never reads it.
+    pub database: PathBuf,
+    /// Base URL of the HTTP API (`temporal server start-dev --http-port`), not
+    /// the gRPC port.
+    pub url: String,
+}
+
+/// What wants a lazy service running, other than a connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartOn {
+    /// Start the service when any of these Temporal task queues has a backlog.
+    #[serde(default)]
+    pub temporal: Vec<TemporalQueue>,
+}
+
+impl StartOn {
+    /// Whether nothing here can start the service.
+    pub fn is_empty(&self) -> bool {
+        self.temporal.is_empty()
+    }
+}
+
+/// A task queue on a server from `[temporal.<name>]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemporalQueue {
+    pub namespace: String,
+    pub server: String,
+    pub task_queue: String,
+}

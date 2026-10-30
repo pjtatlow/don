@@ -662,6 +662,29 @@ lazy = true
 
 A lazy service with `depends_on` moves from `lazy` to `pending` on its first connection and won't start until those dependencies are ready. While it waits, the browser tab shows nothing — the connection just sits queued. Don logs `waiting for dependencies before start` while deferred, and `don status` reports `pending`. If a blocking dependency has failed, the service goes to `dep failed` and the proxy closes the connection rather than holding it.
 
+#### Start Triggers
+
+A worker that polls a queue never receives a connection, so a proxy can't tell when it's wanted. `start_on` starts a lazy service when its queue has work instead, and no proxy is needed:
+
+```toml
+[temporal.local]
+database = "data/temporal/local.db" # temporal server start-dev --db-filename
+url = "http://127.0.0.1:7243"       # temporal server start-dev --http-port
+
+[services.temporal-worker]
+lazy = true
+depends_on = ["temporal-server"]
+
+[[services.temporal-worker.start_on.temporal]]
+namespace = "default"
+server = "local"
+task_queue = "default"
+```
+
+Don asks the server's HTTP API for the queue's backlog, counting workflow and activity tasks. It checks when the service becomes lazy, including after a crash re-arms it, then at most once a second when `database` changes or another service changes state. Don never reads `database`; a change only prompts the check. Tasks already queued from an earlier run start the service straight away.
+
+List one entry per queue. Each namespace and queue the worker serves needs its own entry, because a queue with no entry won't start it. The service should `depends_on` the server so the database's directory exists.
+
 #### Fallback Ports
 
 Port fallback is opt-in. Keep the preferred ports in `don.toml` and set the
@@ -1074,7 +1097,9 @@ See [`examples/`](examples/) for complete working configs.
 | `rust.binary` | string | Rust binary target name |
 | `go.package` | string | Go package path |
 | `proxy` | string or table | TCP listener: `"addr"` (listenfd) or `{ listen, env/listenfd/forward }` |
-| `lazy` | bool | Delay start until first proxy connection |
+| `lazy` | bool | Delay start until first proxy connection or `start_on` trigger |
+| `temporal.<name>` (top-level) | table | Temporal server for `start_on`: `{ database, url }` |
+| `start_on.temporal` | [table] | Temporal queues that start a lazy service: `{ namespace, server, task_queue }` |
 | `bazel.target` | string | Bazel target label (auto watch/build/run) |
 | `bazel.watch` | bool | Auto-resolve Bazel watch paths from the build graph (default: true); does not disable explicit service `watch` |
 | `bazel.config` | string | `.bazelrc` configuration to build this target under, as `--config=<name>` |

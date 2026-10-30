@@ -1787,3 +1787,187 @@ fn integration_ready_event_reports_the_probed_address_not_the_template() {
         handle.await.unwrap();
     });
 }
+
+/// Answers Temporal's task queue API with whatever backlog is currently set.
+async fn fake_temporal(backlog: Arc<std::sync::atomic::AtomicU64>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let backlog = Arc::clone(&backlog);
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).await;
+                let count = backlog.load(std::sync::atomic::Ordering::SeqCst);
+                let body = format!(
+                    r#"{{"versionsInfo":{{"":{{"typesInfo":{{"1":{{"stats":{{"approximateBacklogCount":"{count}"}}}}}}}}}}}}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn trigger_config(http: &str, script: &str) -> String {
+    format!(
+        r#"
+min_version = "0.0.0"
+
+[temporal.local]
+database = "local.db"
+url = "{http}"
+
+[services.worker]
+run.cmd = "bash"
+run.args = ["-c", "{script}"]
+lazy = true
+
+[[services.worker.start_on.temporal]]
+namespace = "default"
+server = "local"
+task_queue = "default"
+"#
+    )
+}
+
+/// Nothing but the file change prompts a check here.
+#[test]
+fn integration_start_trigger_starts_on_watched_file_change() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("start-trigger-watch");
+        let backlog = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let http = fake_temporal(Arc::clone(&backlog)).await;
+        let db = dir.path().join("local.db");
+        std::fs::write(&db, "a").unwrap();
+        let toml = trigger_config(&http, "echo worker-launched && sleep 60");
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !read_buf(&buf).contains("worker-launched"),
+            "started with an empty queue. output: {}",
+            read_buf(&buf)
+        );
+
+        backlog.store(1, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(&db, "b").unwrap();
+        assert!(
+            wait_for_output(&buf, "worker-launched", Duration::from_secs(10)).await,
+            "expected a start after the file changed. output: {}",
+            read_buf(&buf)
+        );
+        assert!(read_buf(&buf).contains("1 task(s) on Temporal queue default/default"));
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// A backlog left by an earlier run has no file change to announce it.
+#[test]
+fn integration_start_trigger_starts_on_existing_backlog() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("start-trigger-existing");
+        let backlog = Arc::new(std::sync::atomic::AtomicU64::new(2));
+        let http = fake_temporal(backlog).await;
+        let toml = trigger_config(&http, "echo worker-launched && sleep 60");
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "worker-launched", Duration::from_secs(10)).await,
+            "expected a start from the first check. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// A worker that crashes goes back to lazy, and work still on the queue has to
+/// start it again.
+#[test]
+fn integration_start_trigger_rearms_after_crash() {
+    run_with_timeout(Duration::from_secs(30), async {
+        let dir = TempDir::new("start-trigger-rearm");
+        let backlog = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let http = fake_temporal(backlog).await;
+        let launches = dir.path().join("launches");
+        let script = format!(
+            "echo x >> {path}; if [ $(wc -l < {path}) -ge 2 ]; then echo second-launch; sleep 60; fi; sleep 3; exit 1",
+            path = launches.display()
+        );
+        let toml = trigger_config(&http, &script);
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        assert!(
+            wait_for_output(&buf, "second-launch", Duration::from_secs(20)).await,
+            "expected the trigger to start it again. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
+
+/// The server usually comes up after don does.
+#[test]
+fn integration_start_trigger_survives_unreachable_server() {
+    run_with_timeout(Duration::from_secs(20), async {
+        let dir = TempDir::new("start-trigger-unreachable");
+        let port = free_port();
+        let toml = trigger_config(
+            &format!("http://127.0.0.1:{port}"),
+            "echo worker-launched && sleep 60",
+        );
+        let (runner, shutdown_tx, buf) = make_runner_verbose(&toml, dir.path()).await;
+        let handle = tokio::spawn(async move {
+            runner.run().await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!read_buf(&buf).contains("worker-launched"));
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).await;
+                let body = r#"{"versionsInfo":{"":{"typesInfo":{"1":{"stats":{"approximateBacklogCount":"1"}}}}}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        std::fs::write(dir.path().join("local.db"), "a").unwrap();
+        assert!(
+            wait_for_output(&buf, "worker-launched", Duration::from_secs(10)).await,
+            "expected a start once the server answered. output: {}",
+            read_buf(&buf)
+        );
+
+        let _ = shutdown_tx.send(()).await;
+        handle.await.unwrap();
+    });
+}
