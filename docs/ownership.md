@@ -371,9 +371,12 @@ One request is late by construction, and it is why nothing builds the instant
 reach the watcher before anything spawns — but the watcher does not exist
 until the runner has set it up. The build manager parks preparation requests
 until the runner says `WatchReady` and every task has finished its startup
-check. This keeps slow input hashing in the same initial batch. Later explicit
-task runs still request a fresh build. A supervisor then waits for its outcome
-before spawning, so the registrations are always in place first.
+check. This keeps slow input hashing in the same initial batch. Later task runs
+publish pending demand before building, so their automatic dependents prepare
+in the same batch. Each supervisor retains its run until its dependencies and
+artifact are ready. Observing completion after pending demand does not request
+a second run. A failed build or run keeps blocking dependents, even when an
+earlier invocation succeeded.
 
 ### Two rules that come with it
 
