@@ -503,9 +503,8 @@ log = "ignore"
 auto_run = false
 "#,
         );
-        let (runner, shutdown_tx, _buf) = make_runner(&toml, dir.path()).await;
+        let (runner, shutdown_tx, buf) = make_runner(&toml, dir.path()).await;
         let control = runner.process_control();
-        let mut events = runner.subscribe();
 
         let runner_handle = tokio::spawn(async move { runner.run().await });
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -518,10 +517,8 @@ auto_run = false
                 .is_err(),
             "a `sleep 60` cannot have finished already"
         );
-        assert!(
-            wait_for_task_state(&mut events, "long", TaskState::Running).await,
-            "task did not start"
-        );
+        let output = wait_for_buf(&buf, "long: spawn sleep 60").await;
+        assert!(output.contains("long: spawn sleep 60"), "{output}");
 
         let _ = shutdown_tx.send(()).await;
         let result = tokio::time::timeout(Duration::from_secs(2), waited)
