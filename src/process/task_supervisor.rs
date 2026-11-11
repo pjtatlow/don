@@ -731,8 +731,8 @@ async fn supervise(
         _ = shutdown_rx.changed() => return,
     };
     let mut demand = super::Demand::None;
-    // A skip vouches for this task's dependents, so it settles only once the
-    // dependencies a run would have waited for are up.
+    // A skip vouches for this task's dependents, so with any it settles only
+    // once the dependencies a run would have waited for are up.
     let mut startup_skip = None;
     let parked = match decision {
         super::task_worker::StartupTaskDecision::Run => {
@@ -747,8 +747,13 @@ async fn supervise(
         }
         super::task_worker::StartupTaskDecision::Skip { message } => {
             ran_against = Some(checked_against);
-            startup_skip = Some(NoSpawnOutcome::skipped(message.to_string()));
-            None
+            let outcome = NoSpawnOutcome::skipped(message.to_string());
+            if startup_cfg.has_dependents {
+                startup_skip = Some(outcome);
+                None
+            } else {
+                Some(outcome)
+            }
         }
         super::task_worker::StartupTaskDecision::PendingRun { message } => {
             Some(NoSpawnOutcome::pending_run(message))
@@ -3092,6 +3097,96 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("timed out: {}", case.config));
         }
+    }
+
+    #[tokio::test]
+    async fn a_startup_skip_with_no_dependents_settles_before_its_dependencies() {
+        let temp = tempfile::tempdir().unwrap();
+        let config: crate::config::Config =
+            "[tasks.t]\ncmd = 'true'\ndepends_on = ['db']\nauto_run = false"
+                .parse()
+                .unwrap();
+        let output = crate::output::OutputManager::new(
+            &[("t", &crate::config::LogConfig::Stdout)],
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap();
+        let (_endpoints, endpoints) = crate::endpoints::channel();
+        let ctx = super::super::task_worker::TaskWorkerContext {
+            base_dir: temp.path().to_path_buf(),
+            platform: crate::config::Platform::current().unwrap(),
+            emitter: output.clone_lifecycle_emitter(),
+            global_watch_ignore: Vec::new(),
+            bazel_config: None,
+            endpoints,
+            secrets: crate::secrets::SecretStore::empty(),
+        };
+        let (mut facts, mut publishers, world) = crate::facts::channel(
+            [
+                (
+                    "t".into(),
+                    crate::facts::ProcessFacts::for_task(
+                        "t",
+                        super::super::TaskState::Pending,
+                        false,
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                ),
+                (
+                    "db".into(),
+                    crate::facts::ProcessFacts::for_service(
+                        "db",
+                        super::super::ServiceState::Pending,
+                        None,
+                        Vec::new(),
+                    ),
+                ),
+            ]
+            .into_iter(),
+        );
+        let (_command_tx, command_rx) = mpsc::unbounded_channel();
+        let (report_tx, _report_rx) = mpsc::unbounded_channel();
+        let (batcher_tx, _batcher_rx) = mpsc::unbounded_channel();
+        let (_release_tx, release_rx) = tokio::sync::watch::channel(true);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(supervise(
+            "t".into(),
+            command_rx,
+            ctx,
+            output.process_output("t"),
+            report_tx,
+            Arc::new(AtomicBool::new(false)),
+            Some(StartupConfig {
+                task_cfg: Box::new(config.tasks.get("t").unwrap().clone()),
+                has_dependents: false,
+                has_success: false,
+                last_run: None,
+            }),
+            Vec::new(),
+            world,
+            publishers.remove("t"),
+            release_rx,
+            shutdown_rx,
+            batcher_tx,
+        ));
+        let skipped = async {
+            loop {
+                let (name, update) = facts.recv().await.unwrap();
+                if name == "t"
+                    && update.phase == crate::facts::Phase::Task(super::super::TaskState::Skipped)
+                {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), skipped)
+            .await
+            .expect("skip waited for a dependency that is not up");
+        supervisor.abort();
+        let _ = supervisor.await;
     }
 
     /// need synchronising and the lock-free `Arc<HashMap<_, _>>` would go.
