@@ -683,6 +683,7 @@ async fn supervise(
         phase: crate::process::TaskState::Pending,
         has_success: startup_cfg.has_success,
         needs_run_now: false,
+        run_pending: false,
         evaluated: false,
         pid: None,
         last_run: startup_cfg.last_run.clone(),
@@ -695,7 +696,7 @@ async fn supervise(
     // When the last run finished, for `is_self_write_suspect`. Only a run that
     // actually spawned sets it — nothing else of this task's wrote anything.
     let mut last_run_ended: Option<std::time::Instant> = None;
-    let mut ran_against: Option<Vec<Option<TaskRunInfo>>> = None;
+    let mut ran_against: Option<Vec<(Option<TaskRunInfo>, bool)>> = None;
     // The parameters the last run used, for a restart to reuse. Held here
     // because a restart is executed here; the scheduler kept a copy only to
     // hand it back on the way in.
@@ -723,7 +724,10 @@ async fn supervise(
     // across runs so a re-run that skips the build still knows what to spawn.
     // Per-process runtime state, so it lives here rather than on the config.
     let mut bazel_binary: Option<String> = None;
-    let checked_against = dependency_runs(&task_cfg.depends_on, &world.snapshot());
+    let checked_against = dependency_runs(&task_cfg.depends_on, &world.snapshot())
+        .into_iter()
+        .map(|(last_run, _)| (last_run, false))
+        .collect();
     let decision = tokio::select! {
         decision = super::task_worker::check_startup_task(
             &ctx, &name, &task_cfg, startup_cfg.has_dependents,
@@ -736,6 +740,7 @@ async fn supervise(
     let mut startup_skip = None;
     let parked = match decision {
         super::task_worker::StartupTaskDecision::Run => {
+            owner.run_pending = true;
             owner.set_needs_run_now(true);
             demand = super::Demand::Scheduled;
             if task_cfg.bazel.is_some() {
@@ -973,9 +978,16 @@ async fn supervise(
                                     None => {}
                                 }
                                 let runs = dependency_runs(&task_cfg.depends_on, &world.snapshot());
-                                if ran_against.as_ref().is_some_and(|seen| *seen != runs) {
+                                let dependency_requested_run = ran_against.as_ref().is_some_and(|seen| {
+                                    seen.iter().zip(&runs).any(|((last_run, pending), (next_run, next_pending))| {
+                                        !pending && (*next_pending || last_run != next_run)
+                                    })
+                                });
+                                if ran_against.is_some() {
                                     ran_against = Some(runs);
-                                    if let Ask::Run(request) = resolve_command(
+                                }
+                                if dependency_requested_run
+                                    && let Ask::Run(request) = resolve_command(
                                         TaskCommand::Rerun,
                                         &name,
                                         startup.as_ref(),
@@ -986,15 +998,14 @@ async fn supervise(
                                             spawned: false,
                                             self_write_suspect: false,
                                         },
-                                    ) {
-                                        demand = super::Demand::None;
-                                        pending = Some(RunRequest {
-                                            start_message: Some(
-                                                "re-running (dependency re-ran)".to_string(),
-                                            ),
-                                            ..request
-                                        });
-                                    }
+                                ) {
+                                    demand = super::Demand::None;
+                                    pending = Some(RunRequest {
+                                        start_message: Some(
+                                            "re-running (dependency re-ran)".to_string(),
+                                        ),
+                                        ..request
+                                    });
                                 }
                                 continue;
                             }
@@ -1148,25 +1159,8 @@ async fn supervise(
         } else {
             super::Demand::Scheduled
         };
-        if !wanted.permitted_by(current_level(stack_released, &world, &task_cfg.depends_on)) {
-            ctx.emitter
-                .service_event(&name, "waiting for dependencies before running");
-            demand = super::Demand::Scheduled;
-            owner.set_needs_run_now(true);
-            owner.set(crate::process::TaskState::Pending);
-            if matches!(request.intent, super::TaskRunIntent::Background) {
-                let reply = match request.reply {
-                    Some(RunReply::OnStart(reply)) => {
-                        let _ = reply.send(Ok(()));
-                        None
-                    }
-                    reply => reply,
-                };
-                held = Some(RunRequest { reply, ..request });
-            }
-            continue;
-        }
-
+        owner.run_pending = true;
+        owner.set_needs_run_now(true);
         // Build before running. `bazel run` did this on every invocation and
         // don has to as well, or a task spawns whatever was built the last
         // time anything asked. Bazel decides whether that is real work; when
@@ -1186,6 +1180,23 @@ async fn supervise(
             // run, so take it as it is rather than hanging on to it.
             owner.set(crate::process::TaskState::Pending);
         }
+
+        if !wanted.permitted_by(current_level(stack_released, &world, &task_cfg.depends_on)) {
+            ctx.emitter
+                .service_event(&name, "waiting for dependencies before running");
+            demand = super::Demand::Scheduled;
+            owner.set(crate::process::TaskState::Pending);
+            let reply = match request.reply {
+                Some(RunReply::OnStart(reply)) => {
+                    let _ = reply.send(Ok(()));
+                    None
+                }
+                reply => reply,
+            };
+            held = Some(RunRequest { reply, ..request });
+            continue;
+        }
+
         build_done_for_run = false;
         ran_against = Some(dependency_runs(&task_cfg.depends_on, &world.snapshot()));
 
@@ -1657,6 +1668,7 @@ struct TaskPhaseOwner {
     has_success: bool,
     /// Whether it needs another run to bring its watched inputs up to date.
     needs_run_now: bool,
+    run_pending: bool,
     /// Whether its startup dependency evaluation has happened at all. Until it
     /// has, a `Pending` task satisfies nobody — otherwise a dependent would
     /// start against a task that has not yet decided whether it must run.
@@ -1672,10 +1684,15 @@ impl TaskPhaseOwner {
         use crate::config::TaskAutoRun;
         use crate::process::TaskState;
 
-        if matches!(
-            self.phase,
-            TaskState::DependencyFailed | TaskState::Building | TaskState::Running
-        ) {
+        if self.run_pending
+            || matches!(
+                self.phase,
+                TaskState::Failed
+                    | TaskState::DependencyFailed
+                    | TaskState::Building
+                    | TaskState::Running
+            )
+        {
             return false;
         }
         if !self.evaluated && self.phase == TaskState::Pending {
@@ -1709,6 +1726,9 @@ impl TaskPhaseOwner {
             self.last_run.clone(),
             stranded,
         );
+        if let crate::facts::Detail::Task { run_pending, .. } = &mut facts.detail {
+            *run_pending = self.run_pending;
+        }
         facts.report_pending = self.report_pending;
         self.facts.publish(facts);
     }
@@ -1735,6 +1755,7 @@ impl TaskPhaseOwner {
             self.last_run = last_run;
         }
         self.phase = phase;
+        self.run_pending = false;
         self.publish();
     }
 
@@ -1762,6 +1783,7 @@ impl TaskPhaseOwner {
         self.last_run = last_run;
         self.pid = None;
         self.phase = crate::process::TaskState::Completed;
+        self.run_pending = false;
         self.publish();
     }
 
@@ -1772,6 +1794,7 @@ impl TaskPhaseOwner {
         self.last_run = last_run;
         self.pid = None;
         self.phase = crate::process::TaskState::Failed;
+        self.run_pending = false;
         self.publish();
     }
 
@@ -1822,13 +1845,19 @@ fn current_level(
 fn dependency_runs(
     depends_on: &[crate::config::Dependency],
     snapshot: &crate::facts::FactsSnapshot,
-) -> Vec<Option<TaskRunInfo>> {
+) -> Vec<(Option<TaskRunInfo>, bool)> {
     depends_on
         .iter()
-        .map(|dep| match &snapshot.get(&dep.name)?.detail {
-            crate::facts::Detail::Task { last_run, .. } => last_run.clone(),
-            _ => None,
-        })
+        .map(
+            |dep| match snapshot.get(&dep.name).map(|facts| &facts.detail) {
+                Some(crate::facts::Detail::Task {
+                    last_run,
+                    run_pending,
+                    ..
+                }) => (last_run.clone(), *run_pending),
+                _ => (None, false),
+            },
+        )
         .collect()
 }
 
@@ -2683,6 +2712,7 @@ mod tests {
             phase: crate::process::TaskState::Completed,
             has_success,
             needs_run_now: false,
+            run_pending: false,
             evaluated: true,
             pid: None,
             last_run: None,
@@ -3187,6 +3217,204 @@ mod tests {
             .expect("skip waited for a dependency that is not up");
         supervisor.abort();
         let _ = supervisor.await;
+    }
+
+    #[tokio::test]
+    async fn dependency_reruns_prepare_together_and_execute_in_order() {
+        use crate::build_tool::batch::PrepareOutcome;
+        use crate::build_tool::batcher::BatchRequest;
+        use crate::process::TaskState;
+        use std::collections::HashMap;
+
+        for failure in [None, Some("build"), Some("run")] {
+            let scenario = async {
+                let temp = tempfile::tempdir().unwrap();
+                std::fs::write(temp.path().join("input"), "unchanged").unwrap();
+                let mut config = String::new();
+                for (name, deps, policy) in [
+                    ("schema", "[]", "auto_run = 'once'"),
+                    ("feeds", "['schema']", ""),
+                    ("documents", "['schema']", ""),
+                    ("sync", "['feeds', 'documents']", ""),
+                    ("manual", "['schema']", "auto_run = false"),
+                    ("once", "['schema']", "auto_run = 'once'"),
+                    (
+                        "params",
+                        "['schema']",
+                        "params = [{ name = 'index', default = 'x' }]",
+                    ),
+                ] {
+                    let exit = if name == "schema" && failure == Some("run") {
+                        1
+                    } else {
+                        0
+                    };
+                    config.push_str(&format!(
+                        "[tasks.{name}]\nbazel.target = '//:{name}'\ncmd = 'sh'\nargs = ['-c', 'echo {name} >> runs; exit {exit}']\nwatch = ['input']\ndepends_on = {deps}\n{policy}\n"
+                    ));
+                }
+                let config: crate::config::Config = config.parse().unwrap();
+                let state = TaskStateStore::new(temp.path().join(".don/task-state"));
+                for (name, task) in &config.tasks {
+                    state
+                        .record_success(name, &task.watch, &[], Some(temp.path()))
+                        .await
+                        .unwrap();
+                }
+                let logs: Vec<_> = config
+                    .tasks
+                    .iter()
+                    .map(|(name, task)| (name.as_str(), &task.log))
+                    .collect();
+                let output = crate::output::OutputManager::new(&logs, tokio::io::sink())
+                    .await
+                    .unwrap();
+                let (_endpoints, endpoints) = crate::endpoints::channel();
+                let ctx = super::super::task_worker::TaskWorkerContext {
+                    base_dir: temp.path().to_path_buf(),
+                    platform: crate::config::Platform::current().unwrap(),
+                    emitter: output.clone_lifecycle_emitter(),
+                    global_watch_ignore: Vec::new(),
+                    bazel_config: None,
+                    endpoints,
+                    secrets: crate::secrets::SecretStore::empty(),
+                };
+                let (mut facts, mut publishers, world) =
+                    crate::facts::channel(config.tasks.keys().map(|name| {
+                        (
+                            name.clone(),
+                            crate::facts::ProcessFacts::for_task(
+                                name,
+                                TaskState::Completed,
+                                true,
+                                None,
+                                None,
+                                Vec::new(),
+                            ),
+                        )
+                    }));
+                let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+                let (batcher_tx, mut batcher_rx) = mpsc::unbounded_channel();
+                let (_release_tx, release_rx) = tokio::sync::watch::channel(true);
+                let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let mut workers = tokio::task::JoinSet::new();
+                let mut commands = HashMap::new();
+                for (name, task) in &config.tasks {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    commands.insert(name.clone(), tx);
+                    workers.spawn(supervise(
+                        name.clone(),
+                        rx,
+                        ctx.clone(),
+                        output.process_output(name),
+                        report_tx.clone(),
+                        Arc::new(AtomicBool::new(false)),
+                        Some(StartupConfig {
+                            task_cfg: Box::new(task.clone()),
+                            has_dependents: true,
+                            has_success: true,
+                            last_run: None,
+                        }),
+                        Vec::new(),
+                        world.clone(),
+                        publishers.remove(name),
+                        release_rx.clone(),
+                        shutdown_rx.clone(),
+                        batcher_tx.clone(),
+                    ));
+                }
+                workers.spawn(async move {
+                    while let Some((name, update)) = facts.recv().await {
+                        facts.apply(name, update);
+                    }
+                });
+                for _ in &config.tasks {
+                    assert!(matches!(
+                        batcher_rx.recv().await.unwrap(),
+                        BatchRequest::StartupTaskChecked { .. }
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                for round in 0..if failure.is_none() { 2 } else { 1 } {
+                    commands
+                        .get("schema")
+                        .unwrap()
+                        .send(run(Vec::new())(None))
+                        .unwrap();
+                    let mut builds = HashMap::new();
+                    while builds.len() < 4 {
+                        let BatchRequest::QueuePrepare { item, outcome } =
+                            batcher_rx.recv().await.unwrap()
+                        else {
+                            panic!("expected preparation");
+                        };
+                        assert!(builds.insert(item.name, outcome).is_none());
+                    }
+                    let mut names: Vec<_> = builds.keys().map(String::as_str).collect();
+                    names.sort();
+                    assert_eq!(names, ["documents", "feeds", "schema", "sync"]);
+                    assert_eq!(
+                        std::fs::read_to_string(temp.path().join("runs"))
+                            .unwrap_or_default()
+                            .lines()
+                            .count(),
+                        round * 4
+                    );
+                    for (name, outcome) in builds {
+                        outcome
+                            .send(if failure == Some("build") && name == "schema" {
+                                PrepareOutcome::Failed("test build failure".into())
+                            } else {
+                                PrepareOutcome::Ready { binary_path: None }
+                            })
+                            .unwrap();
+                    }
+                    if failure != Some("build") {
+                        let count = if failure.is_none() { 4 } else { 1 };
+                        let mut completed = 0;
+                        while completed < count {
+                            if let super::super::ProcessReport::TaskExited(exit) =
+                                report_rx.recv().await.unwrap()
+                            {
+                                assert_eq!(
+                                    exit.success,
+                                    failure.is_none(),
+                                    "{}: {:?}",
+                                    exit.name,
+                                    exit.message
+                                );
+                                completed += 1;
+                            }
+                        }
+                    }
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(150), batcher_rx.recv())
+                            .await
+                            .is_err(),
+                        "one build per task per rerun"
+                    );
+                    let runs =
+                        std::fs::read_to_string(temp.path().join("runs")).unwrap_or_default();
+                    let lines: Vec<_> = runs.lines().collect();
+                    match failure {
+                        Some("build") => assert!(lines.is_empty()),
+                        Some("run") => assert_eq!(lines, ["schema"]),
+                        _ => {
+                            assert_eq!(lines.len(), (round + 1) * 4);
+                            for wave in lines.chunks(4) {
+                                assert_eq!(wave.first(), Some(&"schema"));
+                                assert_eq!(wave.last(), Some(&"sync"));
+                            }
+                        }
+                    }
+                }
+                workers.abort_all();
+                while workers.join_next().await.is_some() {}
+            };
+            tokio::time::timeout(Duration::from_secs(5), scenario)
+                .await
+                .unwrap_or_else(|_| panic!("timed out: {failure:?}"));
+        }
     }
 
     /// need synchronising and the lock-free `Arc<HashMap<_, _>>` would go.

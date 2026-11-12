@@ -72,6 +72,7 @@ pub(crate) enum Detail {
     Task {
         pid: Option<i32>,
         last_run: Option<TaskRunInfo>,
+        run_pending: bool,
     },
 }
 
@@ -191,7 +192,11 @@ impl ProcessFacts {
                 TaskState::DependencyFailed => stranded_behind,
                 _ => Vec::new(),
             },
-            detail: Detail::Task { pid, last_run },
+            detail: Detail::Task {
+                pid,
+                last_run,
+                run_pending: false,
+            },
             restart_pending: false,
             report_pending: false,
         }
