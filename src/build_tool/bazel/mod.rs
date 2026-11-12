@@ -71,6 +71,19 @@ fn build_args(targets: &[String], config: Option<&str>) -> Vec<String> {
     args
 }
 
+fn spawn_error(source: std::io::Error, working_dir: &Path) -> BuildToolError {
+    if source.kind() == std::io::ErrorKind::NotFound && working_dir.is_dir() {
+        BuildToolError::NotInstalled {
+            tool: "bazel".to_string(),
+        }
+    } else {
+        BuildToolError::Io {
+            tool: "bazel".to_string(),
+            source,
+        }
+    }
+}
+
 impl BazelResolver {
     /// Create a new resolver.
     ///
@@ -91,30 +104,6 @@ impl BazelResolver {
         self
     }
 
-    /// Check that the `bazel` binary is available on PATH.
-    async fn check_installed(&self) -> Result<(), BuildToolError> {
-        let result = tokio::process::Command::new("bazel")
-            .arg("version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-
-        match result {
-            Ok(status) if status.success() => Ok(()),
-            Ok(_) => Ok(()), // bazel version may return non-zero in some setups, but binary exists
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(BuildToolError::NotInstalled {
-                    tool: "bazel".to_string(),
-                })
-            }
-            Err(e) => Err(BuildToolError::Io {
-                tool: "bazel".to_string(),
-                source: e,
-            }),
-        }
-    }
-
     /// Run a bazel query and return stdout as a string.
     async fn run_query(
         &self,
@@ -129,10 +118,7 @@ impl BazelResolver {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| BuildToolError::Io {
-                tool: "bazel".to_string(),
-                source: e,
-            })?;
+            .map_err(|e| spawn_error(e, working_dir))?;
 
         // Keep query progress quiet. The only live signal worth surfacing
         // here is Bazel waiting behind another command; failures still
@@ -197,8 +183,6 @@ impl BazelResolver {
             });
         }
 
-        self.check_installed().await?;
-
         // Built once and used for both the spawn and the debug line, so the
         // two cannot describe different commands.
         let args = build_args(targets, config);
@@ -216,10 +200,7 @@ impl BazelResolver {
             em.debug_spawn("bazel", "bazel", &args);
         }
 
-        let mut child = cmd.spawn().map_err(|e| BuildToolError::Io {
-            tool: "bazel".to_string(),
-            source: e,
-        })?;
+        let mut child = cmd.spawn().map_err(|e| spawn_error(e, working_dir))?;
 
         // Stream stderr (Bazel writes build progress to stderr).
         // Wrap the spawn handle in an AbortOnDrop guard so cancellation of
@@ -369,10 +350,7 @@ impl BazelResolver {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| BuildToolError::Io {
-            tool: "bazel".to_string(),
-            source: e,
-        })?;
+        let mut child = cmd.spawn().map_err(|e| spawn_error(e, working_dir))?;
 
         let stderr_handle = spawn_stderr_stream(child.stderr.take(), self.emitter.clone(), true);
 
@@ -408,8 +386,6 @@ impl BazelResolver {
         if targets.is_empty() {
             return Ok(out);
         }
-
-        self.check_installed().await?;
 
         // `+` is bazel's set-union operator. Targets are parenthesised so
         // operator precedence of `//` / `:` / flags can't bite us.
@@ -485,10 +461,7 @@ impl BazelResolver {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| BuildToolError::Io {
-                tool: "bazel".to_string(),
-                source: e,
-            })?;
+            .map_err(|e| spawn_error(e, working_dir))?;
 
         // `cquery` is a metadata lookup, not user-interesting build output.
         // Surface only lock-wait notices live; keep the rest for errors.
@@ -594,6 +567,91 @@ fn is_lock_wait_notice(line: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bazel_runs_only_requested_commands() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_DIR: &str = "DON_TEST_BAZEL_COMMANDS_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let dir = PathBuf::from(dir);
+            let resolver = BazelResolver::new();
+            let targets = vec!["//app:bin".to_string()];
+            let build = resolver
+                .build_targets(&targets, &dir, None, |_| {}, None)
+                .await
+                .unwrap();
+            assert_eq!(build.succeeded, targets);
+            resolver.resolve_per_target(&targets, &dir).await.unwrap();
+            let paths = resolver.resolve_binary_paths(&targets, &dir).await.unwrap();
+            assert_eq!(paths["//app:bin"], "bazel-out/app/bin");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("calls")).unwrap(),
+                "build\nquery\ncquery\n"
+            );
+
+            std::fs::remove_file(dir.join("bazel")).unwrap();
+            assert!(matches!(
+                resolver
+                    .build_targets(&targets, &dir, None, |_| {}, None)
+                    .await,
+                Err(BuildToolError::NotInstalled { .. })
+            ));
+            assert!(matches!(
+                resolver.resolve_per_target(&targets, &dir).await,
+                Err(BuildToolError::NotInstalled { .. })
+            ));
+            assert!(matches!(
+                resolver.resolve_binary_paths(&targets, &dir).await,
+                Err(BuildToolError::NotInstalled { .. })
+            ));
+            assert!(matches!(
+                resolver
+                    .build_targets(&targets, &dir.join("missing"), None, |_| {}, None)
+                    .await,
+                Err(BuildToolError::Io { .. })
+            ));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bazel = dir.path().join("bazel");
+        std::fs::write(
+            &bazel,
+            r#"#!/bin/sh
+printf '%s\n' "$1" >> calls
+case "$1" in
+  query) printf '%s\n' '<query><rule class="sh_binary" name="//app:bin"/></query>' ;;
+  cquery) printf '//app:bin\tbazel-out/app/bin\n' ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bazel, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "build_tool::bazel::tests::bazel_runs_only_requested_commands",
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, dir.path())
+                .env("PATH", dir.path())
+                .current_dir(dir.path())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     /// The whole command line, in order. `--config` has to come after don's
     /// own flags — that ordering is what lets a workspace override them from
