@@ -107,10 +107,11 @@ pub(crate) enum PrepareOutcome {
     /// it was running — the artifact is already out of date, so ask again
     /// before starting. This is the *only* cover for that window: the watcher
     /// is not yet watching those paths, because this build is what resolves
-    /// them.
+    /// them. A build that *failed* while its inputs changed is reported the
+    /// same way: it failed on sources that are no longer there.
     Stale,
-    /// The build tool refused. Never retried — recompiling unchanged sources
-    /// cannot change the answer.
+    /// The build tool refused, and nothing it read changed while it ran.
+    /// Never retried — recompiling unchanged sources cannot change the answer.
     Failed(String),
 }
 
@@ -751,9 +752,40 @@ pub(crate) async fn run_batch_build_chain(
     if built_count > 0 {
         emitter.lifecycle_event("checking for files changed during build...");
     }
+    // A `git checkout` or rebase while Bazel runs fails the build on missing
+    // or modified inputs, and one `bazel build` covers the whole batch — so a
+    // single changed file fails every target in it, watch-disabled ones
+    // included, and nothing would ever build those again. A failure like that
+    // says nothing about the sources there are now. Asked once, of every input
+    // the chain resolved, only when something failed.
+    let inputs_changed = if failed.is_empty() {
+        false
+    } else {
+        match inputs_changed_since(
+            &items,
+            &resolved_info_by_item,
+            &base_dir,
+            scan_since,
+            std::mem::take(&mut scan),
+        )
+        .await
+        {
+            Ok((returned_scan, changed)) => {
+                scan = returned_scan;
+                changed
+            }
+            // The check never finished; the failure stands as reported.
+            Err(_) => false,
+        }
+    };
     for item in &items {
         let decided = if let Some(message) = failed.get(&item.name) {
-            PrepareOutcome::Failed(message.clone())
+            if inputs_changed {
+                emitter.service_event(&item.name, failed_build_retry_reason(item.kind));
+                PrepareOutcome::Stale
+            } else {
+                PrepareOutcome::Failed(message.clone())
+            }
         } else if succeeded.contains(&item.name) {
             let check_started = Instant::now();
             let checked = stale_since(
@@ -834,6 +866,47 @@ async fn stale_since(
         (scan, reason)
     })
     .await
+}
+
+/// Whether any input this chain resolved changed while it ran. Where
+/// [`stale_since`] asks about one item's own inputs, this answers for every
+/// item at once: they shared one `bazel build`, so any target's inputs could
+/// have failed them all. Watch-disabled items resolve no inputs and add
+/// nothing to the scan, but the answer still covers them.
+async fn inputs_changed_since(
+    items: &[BatchBuildItem],
+    resolved_info_by_item: &HashMap<String, crate::build_tool::ResolvedBuildInfo>,
+    base_dir: &Path,
+    scan_since: SystemTime,
+    mut scan: FileChangeScan,
+) -> Result<(FileChangeScan, bool), tokio::task::JoinError> {
+    let inputs: Vec<(Vec<String>, crate::build_tool::ResolvedBuildInfo)> = items
+        .iter()
+        .filter_map(|item| {
+            resolved_info_by_item
+                .get(&item.name)
+                .map(|info| (item.ignore.clone(), info.clone()))
+        })
+        .collect();
+    if inputs.is_empty() {
+        return Ok((scan, false));
+    }
+    let base_dir = base_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let changed = inputs.iter().any(|(ignore, info)| {
+            scan.any_changed_since(&base_dir, &info.watch_paths, ignore, scan_since)
+                || scan.any_changed_since(&base_dir, &info.graph_definition_globs, &[], scan_since)
+        });
+        (scan, changed)
+    })
+    .await
+}
+
+fn failed_build_retry_reason(kind: ProcessKind) -> &'static str {
+    match kind {
+        ProcessKind::Service => "build failed while files changed — rebuilding before start",
+        ProcessKind::Task => "build failed while files changed — re-running build before start",
+    }
 }
 
 fn check_stale_since(
@@ -1091,6 +1164,99 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(reason, want, "{name}");
+        }
+    }
+
+    /// A failed build is retried when anything the chain resolved changed
+    /// while it ran — whichever item's inputs those were, because one
+    /// `bazel build` fails every target in it.
+    #[tokio::test]
+    async fn failed_build_retries_when_any_batch_input_changed() {
+        struct Case {
+            name: &'static str,
+            changed: &'static [&'static str],
+            /// Whether `api`, the only watched item, ignores `src/**`.
+            api_ignores_source: bool,
+            /// Whether `api` is in the batch at all; `kafka` always is.
+            with_api: bool,
+            want: bool,
+        }
+        let cases = [
+            Case {
+                name: "nothing changed: the failure is real",
+                changed: &[],
+                api_ignores_source: false,
+                with_api: true,
+                want: false,
+            },
+            Case {
+                name: "another item's source changed",
+                changed: &["src/app.rs"],
+                api_ignores_source: false,
+                with_api: true,
+                want: true,
+            },
+            Case {
+                name: "the build graph changed",
+                changed: &["BUILD.bazel"],
+                api_ignores_source: false,
+                with_api: true,
+                want: true,
+            },
+            Case {
+                name: "only an ignored source changed",
+                changed: &["src/app.rs"],
+                api_ignores_source: true,
+                with_api: true,
+                want: false,
+            },
+            Case {
+                name: "a watch-disabled batch resolves nothing to check",
+                changed: &["src/app.rs", "BUILD.bazel"],
+                api_ignores_source: false,
+                with_api: false,
+                want: false,
+            },
+        ];
+        for case in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path();
+            std::fs::create_dir(repo.join("src")).unwrap();
+            std::fs::write(repo.join("src/app.rs"), "").unwrap();
+            std::fs::write(repo.join("BUILD.bazel"), "").unwrap();
+            let since = SystemTime::now() + std::time::Duration::from_secs(60);
+            for changed in case.changed {
+                std::fs::File::options()
+                    .write(true)
+                    .open(repo.join(changed))
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(since + std::time::Duration::from_secs(60)),
+                    )
+                    .unwrap();
+            }
+            let mut items = vec![bazel_item("kafka", false)];
+            let mut resolved = HashMap::new();
+            if case.with_api {
+                let mut api = bazel_item("api", true);
+                if case.api_ignores_source {
+                    api.ignore.push("src/**".into());
+                }
+                items.push(api);
+                resolved.insert(
+                    "api".to_string(),
+                    crate::build_tool::ResolvedBuildInfo {
+                        watch_paths: vec!["src/**".into()],
+                        graph_definition_globs: vec!["BUILD.bazel".into()],
+                    },
+                );
+            }
+            let (_, changed) =
+                inputs_changed_since(&items, &resolved, repo, since, FileChangeScan::default())
+                    .await
+                    .unwrap();
+            assert_eq!(changed, case.want, "{}", case.name);
         }
     }
 
