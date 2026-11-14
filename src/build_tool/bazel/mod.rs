@@ -112,7 +112,12 @@ impl BazelResolver {
         working_dir: &Path,
     ) -> Result<String, BuildToolError> {
         let mut child = tokio::process::Command::new("bazel")
-            .args(["query", query, &format!("--output={output_format}")])
+            .args([
+                "query",
+                query,
+                &format!("--output={output_format}"),
+                "--order_output=no",
+            ])
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -394,7 +399,7 @@ impl BazelResolver {
             .map(|t| format!("({t})"))
             .collect::<Vec<_>>()
             .join(" + ");
-        let query = format!("deps({union_expr})");
+        let query = format!(r#"filter("^//", deps({union_expr}))"#);
         let xml = self.run_query(&query, "xml", working_dir).await?;
 
         let graph = graph::BazelDepGraph::parse_xml(xml.as_bytes())?;
