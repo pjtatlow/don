@@ -77,7 +77,7 @@ pub enum WatchError {
     Notify(#[from] notify::Error),
     #[error("invalid debounce duration: {0}")]
     Duration(#[from] crate::duration::DurationError),
-    #[error("failed to create watch directory {}: {}", .0.display(), .1)]
+    #[error("watch directory {}: {}", .0.display(), .1)]
     Io(PathBuf, std::io::Error),
 }
 
@@ -1048,6 +1048,26 @@ impl WatchManager {
             paths.first().map(|path| path.display().to_string())
         ));
 
+        // inotify descriptors die with the inode. FSEvents subscriptions stay
+        // attached to paths and must survive deletion/recreation of a watched root.
+        if !cfg!(target_os = "macos") {
+            match event.kind {
+                EventKind::Remove(kind) if kind != notify::event::RemoveKind::File => {
+                    for path in &paths {
+                        self.forget_directory(path);
+                    }
+                }
+                EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::From | notify::event::RenameMode::Both,
+                )) => {
+                    if let Some(path) = paths.first() {
+                        self.forget_directory(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Backstop for the recursion we deliberately gave up by using only
         // non-recursive watches: when a new directory appears, notify won't
         // auto-watch it, so register it here (skipping ignored dirs) and replay
@@ -1055,7 +1075,13 @@ impl WatchManager {
         // (e.g. `git checkout` of a branch that adds a whole tree). An ignored
         // directory created at runtime — a fresh `node_modules` — is skipped
         // here and never watched.
-        if matches!(event.kind, EventKind::Create(_)) {
+        if matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To | notify::event::RenameMode::Both
+                ))
+        ) {
             for path in &paths {
                 self.register_new_directory(path);
             }
@@ -1159,6 +1185,21 @@ impl WatchManager {
         }
     }
 
+    fn forget_directory(&mut self, path: &Path) {
+        let removed: Vec<_> = self
+            .registered_dirs
+            .keys()
+            .filter(|dir| dir.starts_with(path))
+            .cloned()
+            .collect();
+        for dir in removed {
+            self.registered_dirs.remove(&dir);
+            if let Some(watcher) = self.watcher.as_mut() {
+                let _ = watcher.unwatch(&dir);
+            }
+        }
+    }
+
     /// Register a directory that appeared at runtime, then replay files already
     /// inside it.
     ///
@@ -1196,10 +1237,7 @@ impl WatchManager {
             &self.overrides,
             &mut self.registered_dirs,
         ) {
-            self.emitter.debug_event(&format!(
-                "watch: failed to register new directory {:?}: {e}",
-                path
-            ));
+            self.record_notify_error(&format!("failed to register new directory {:?}: {e}", path));
             return;
         }
         self.emitter
@@ -1542,9 +1580,40 @@ fn register_dirs_ignoring(
     overrides: &Override,
     registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
 ) -> Result<(), WatchError> {
-    let desired = desired_watches(root, overrides);
-    let actions = reconcile_watches(&desired, registered_dirs);
-    apply_watch_actions(watcher, notify_tx, actions, registered_dirs)
+    register_dirs_with_visited(
+        watcher,
+        notify_tx,
+        root,
+        overrides,
+        registered_dirs,
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+fn register_dirs_with_visited(
+    watcher: &mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    root: &Path,
+    overrides: &Override,
+    registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), WatchError> {
+    if cfg!(target_os = "macos") {
+        let desired = desired_watches(root, overrides);
+        let actions = reconcile_watches(&desired, registered_dirs);
+        return apply_watch_actions(watcher, notify_tx, actions, registered_dirs);
+    }
+    // Watching before enumeration ensures children created too late for this
+    // walk still queue an event for the runtime directory backstop.
+    visit_watch_dirs(root, overrides, visited, &mut |dir| {
+        register_single_dir(
+            watcher,
+            notify_tx,
+            dir,
+            RecursiveMode::NonRecursive,
+            registered_dirs,
+        )
+    })
 }
 
 /// Register a single directory under `mode`, reconciling against existing
@@ -1597,30 +1666,53 @@ fn desired_watches(root: &Path, overrides: &Override) -> Vec<(PathBuf, Recursive
 /// symlinked directories are skipped, mirroring the notify backend's
 /// `follow_symlinks(false)`.
 fn collect_watch_dirs(dir: &Path, overrides: &Override, out: &mut Vec<(PathBuf, RecursiveMode)>) {
-    out.push((dir.to_path_buf(), RecursiveMode::NonRecursive));
+    let _ = visit_watch_dirs(
+        dir,
+        overrides,
+        &mut std::collections::HashSet::new(),
+        &mut |path| {
+            out.push((path.to_path_buf(), RecursiveMode::NonRecursive));
+            Ok(())
+        },
+    );
+}
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut child_dirs: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        // `file_type()` on a `DirEntry` does not traverse symlinks, so a
-        // symlinked directory reports `is_symlink()` and is skipped here.
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        if overrides.matched(&path, true).is_ignore() {
-            continue;
-        }
-        child_dirs.push(path);
+fn visit_watch_dirs(
+    dir: &Path,
+    overrides: &Override,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    visit: &mut impl FnMut(&Path) -> Result<(), WatchError>,
+) -> Result<(), WatchError> {
+    if visited.contains(dir) {
+        return Ok(());
     }
-    // Deterministic order for stable debug output and tests.
-    child_dirs.sort();
-    for child in &child_dirs {
-        collect_watch_dirs(child, overrides, out);
+    visit(dir)?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| WatchError::Io(dir.to_path_buf(), error))?;
+    let mut children = Vec::new();
+    let mut first_error = None;
+    for entry in entries {
+        match entry.and_then(|entry| Ok((entry.path(), entry.file_type()?))) {
+            Ok((path, kind)) if kind.is_dir() && !overrides.matched(&path, true).is_ignore() => {
+                children.push(path)
+            }
+            Ok(_) => {}
+            Err(error) => {
+                first_error.get_or_insert(WatchError::Io(dir.to_path_buf(), error));
+            }
+        }
     }
+    children.sort();
+    for child in children {
+        if let Err(error) = visit_watch_dirs(&child, overrides, visited, visit) {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    visited.insert(dir.to_path_buf());
+    Ok(())
 }
 
 /// Reconcile a desired watch set against what is already registered, producing
@@ -2317,6 +2409,101 @@ mod tests {
             registered,
             HashMap::from([(root, RecursiveMode::Recursive)])
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_native_capture_covers_late_created_moved_and_recreated_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let anchor = root.join("anchor");
+        let late = root.join("late/nested");
+        std::fs::create_dir(&anchor).unwrap();
+        let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+        let pattern = format!("{}/**", root.display());
+        let items = HashMap::from([(
+            "owner".to_string(),
+            watched(WatchItemKind::Service, Duration::ZERO, &[&pattern]),
+        )]);
+        let mut manager = test_manager(items, dispatch).await;
+        visit_watch_dirs(
+            &root,
+            &manager.overrides,
+            &mut std::collections::HashSet::new(),
+            &mut |dir| {
+                register_single_dir(
+                    &mut manager.watcher,
+                    &manager.notify_tx,
+                    dir,
+                    RecursiveMode::NonRecursive,
+                    &mut manager.registered_dirs,
+                )?;
+                if dir == anchor {
+                    // Root's children have already been enumerated. This new sibling
+                    // cannot be found by the initial walk; its native event is essential.
+                    std::fs::create_dir_all(&late).unwrap();
+                    std::fs::write(late.join("file.rs"), "created during walk").unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!manager.registered_dirs.contains_key(&late));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.registered_dirs.contains_key(&late) {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(manager.items.get("owner").unwrap().window.matched > 0);
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("nested")).unwrap();
+        std::fs::write(outside.path().join("nested/file.rs"), "moved in").unwrap();
+        let moved = root.join("moved");
+        std::fs::rename(outside.path(), &moved).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.registered_dirs.contains_key(&moved.join("nested")) {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.registered_dirs.contains_key(&moved) {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::create_dir_all(moved.join("nested")).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.registered_dirs.contains_key(&moved.join("nested")) {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        let final_file = moved.join("nested/after.rs");
+        std::fs::write(&final_file, "after recreation").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                let captured = event.paths.contains(&final_file);
+                manager.handle_notify_event(&event).await;
+                if captured {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
