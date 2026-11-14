@@ -897,50 +897,85 @@ impl WatchManager {
             std::fs::canonicalize(&update.base_dir).unwrap_or_else(|_| update.base_dir.clone());
 
         let mut compiled_patterns = Vec::new();
+        let mut desired = Vec::new();
         for pattern_str in &update.patterns {
             let full_pattern = resolve_pattern(&base_dir, pattern_str);
             if let Ok(pat) = Pattern::new(&full_pattern.to_string_lossy()) {
                 compiled_patterns.push(pat);
-
-                // Always register the watch directory for build-tool-resolved
-                // patterns. A parent recursive watch may not reliably cover
-                // all subdirectories (e.g. when bazel symlinks cause inotify
-                // to miss directories during the initial recursive walk).
                 let watch_dir = glob_base_dir(&full_pattern);
                 if watch_dir.exists() {
-                    let result = match update.kind {
-                        // Tier-1 BuildGraph updates land on specific filename
-                        // patterns (`<pkg>/BUILD`, `<pkg>/package.json`) — a
-                        // non-recursive watch on the package directory is
-                        // exactly right, no subtree walk.
-                        WatchItemKind::BuildGraph => register_single_dir(
-                            &mut self.watcher,
-                            &self.notify_tx,
-                            &watch_dir,
-                            RecursiveMode::NonRecursive,
-                            &mut self.registered_dirs,
-                        ),
-                        // Tier-2 Service/Task updates are directory-level globs
-                        // (`<pkg>/**`) that need recursive coverage — routed
-                        // through the same `watch_ignore`-aware registration as
-                        // startup so ignored subtrees stay pruned on reload.
-                        WatchItemKind::Service | WatchItemKind::Task => register_dirs_ignoring(
-                            &mut self.watcher,
-                            &self.notify_tx,
-                            &watch_dir,
-                            &self.overrides,
-                            &mut self.registered_dirs,
-                        ),
-                    };
-                    if let Err(e) = result {
-                        self.record_item_error(
-                            &update.name,
-                            format!(
-                                "watch: failed to register watch for {}: {e}",
-                                watch_dir.display()
+                    if !cfg!(target_os = "macos") {
+                        // Linux has no native batch API. Preserve per-root installation
+                        // so batching does not widen its discovery-to-watch window.
+                        let result = match update.kind {
+                            WatchItemKind::BuildGraph => register_single_dir(
+                                &mut self.watcher,
+                                &self.notify_tx,
+                                &watch_dir,
+                                RecursiveMode::NonRecursive,
+                                &mut self.registered_dirs,
                             ),
-                        );
+                            WatchItemKind::Service | WatchItemKind::Task => register_dirs_ignoring(
+                                &mut self.watcher,
+                                &self.notify_tx,
+                                &watch_dir,
+                                &self.overrides,
+                                &mut self.registered_dirs,
+                            ),
+                        };
+                        if let Err(error) = result {
+                            self.record_item_error(
+                                &update.name,
+                                format!(
+                                    "watch: failed to register watch for {}: {error}",
+                                    watch_dir.display()
+                                ),
+                            );
+                        }
+                        continue;
                     }
+                    match update.kind {
+                        WatchItemKind::BuildGraph => {
+                            desired.push((watch_dir, RecursiveMode::NonRecursive));
+                        }
+                        WatchItemKind::Service | WatchItemKind::Task => {
+                            desired.extend(desired_watches(&watch_dir, &self.overrides));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Commit the whole item together: FSEvents rebuilds its shared stream
+        // on every commit, and ancestors can cover later descendant requests.
+        let actions = reconcile_watches(&desired, &self.registered_dirs);
+        if let Err(error) = apply_watch_actions(
+            &mut self.watcher,
+            &self.notify_tx,
+            actions,
+            &mut self.registered_dirs,
+        ) {
+            self.record_item_error(
+                &update.name,
+                format!("watch: failed to register watch batch: {error}"),
+            );
+            // A directory can disappear after discovery. Preserve best-effort
+            // coverage for the remaining paths even when a batch partly fails.
+            for (dir, mode) in desired {
+                if let Err(error) = register_single_dir(
+                    &mut self.watcher,
+                    &self.notify_tx,
+                    &dir,
+                    mode,
+                    &mut self.registered_dirs,
+                ) {
+                    self.record_item_error(
+                        &update.name,
+                        format!(
+                            "watch: failed to register watch for {}: {error}",
+                            dir.display()
+                        ),
+                    );
                 }
             }
         }
@@ -2317,6 +2352,67 @@ mod tests {
             registered,
             HashMap::from([(root, RecursiveMode::Recursive)])
         );
+    }
+
+    #[tokio::test]
+    async fn test_watch_update_batches_overlapping_native_paths() {
+        for (kind, patterns, changed) in [
+            (
+                WatchItemKind::Service,
+                vec!["src/nested/**", "src/**", "src/**"],
+                "src/nested/main.rs",
+            ),
+            (
+                WatchItemKind::BuildGraph,
+                vec!["src/BUILD", "src/BUILD.bazel", "src/BUILD"],
+                "src/BUILD.bazel",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            std::fs::create_dir_all(root.join("src/nested")).unwrap();
+            std::fs::create_dir_all(root.join("src/node_modules/ignored")).unwrap();
+            std::fs::write(root.join(changed), "before").unwrap();
+            let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+            let mut manager = test_manager(HashMap::new(), dispatch).await;
+            manager.overrides = build_watch_ignore_overrides(
+                &root,
+                &["**/node_modules/**".into()],
+                &mut Vec::new(),
+            );
+            let (applied_tx, mut applied_rx) = oneshot::channel();
+            manager.apply_watch_update(WatchUpdate {
+                name: "api".into(),
+                kind,
+                patterns: patterns.into_iter().map(String::from).collect(),
+                ignore_patterns: Vec::new(),
+                base_dir: root.clone(),
+                applied_tx: Some(applied_tx),
+            });
+            applied_rx.try_recv().unwrap();
+            let mut expected = HashMap::from([(
+                root.join("src"),
+                if cfg!(target_os = "macos") && kind == WatchItemKind::Service {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                },
+            )]);
+            if !cfg!(target_os = "macos") && kind == WatchItemKind::Service {
+                expected.insert(root.join("src/nested"), RecursiveMode::NonRecursive);
+            }
+            assert_eq!(manager.registered_dirs, expected);
+
+            std::fs::write(root.join(changed), "after").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while manager.items.get("api").unwrap().window.matched == 0 {
+                    let event = manager.event_rx.recv().await.unwrap().unwrap();
+                    manager.handle_notify_event(&event).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[test]
