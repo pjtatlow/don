@@ -1,7 +1,7 @@
 //! Bazel build tool integration.
 //!
 //! Queries Bazel for the source packages that feed into a given target,
-//! using `bazel query` with `--output=package` for directory-level granularity.
+//! retaining rule inputs from compact protobuf output for per-target attribution.
 //! External dependencies and generated files are filtered out.
 
 mod graph;
@@ -104,15 +104,17 @@ impl BazelResolver {
         self
     }
 
-    /// Run a bazel query and return stdout as a string.
-    async fn run_query(
-        &self,
-        query: &str,
-        output_format: &str,
-        working_dir: &Path,
-    ) -> Result<String, BuildToolError> {
+    /// Run a dependency query and return its protobuf output.
+    async fn run_query(&self, query: &str, working_dir: &Path) -> Result<Vec<u8>, BuildToolError> {
         let mut child = tokio::process::Command::new("bazel")
-            .args(["query", query, &format!("--output={output_format}")])
+            .args([
+                "query",
+                query,
+                "--output=streamed_proto",
+                "--proto:output_rule_attrs=",
+                "--proto:rule_inputs_and_outputs",
+                "--noproto:locations",
+            ])
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -153,10 +155,7 @@ impl BazelResolver {
             });
         }
 
-        String::from_utf8(output.stdout).map_err(|e| BuildToolError::ParseError {
-            tool: "bazel".to_string(),
-            message: format!("non-UTF-8 output: {e}"),
-        })
+        Ok(output.stdout)
     }
 
     /// Run `bazel build` for multiple targets in a single invocation.
@@ -368,7 +367,7 @@ impl BazelResolver {
 
     /// Resolve per-target source packages in ONE `bazel query` call.
     ///
-    /// Runs `deps(T1 + T2 + ... + Tn) --output=xml`, stream-parses the
+    /// Runs `deps(T1 + T2 + ... + Tn) --output=streamed_proto`, decodes the
     /// resulting graph, and DFS-walks from each input target to attribute
     /// its own set of first-party source packages. Returns a map keyed by
     /// input target label; every input appears in the map, even if its
@@ -395,9 +394,9 @@ impl BazelResolver {
             .collect::<Vec<_>>()
             .join(" + ");
         let query = format!("deps({union_expr})");
-        let xml = self.run_query(&query, "xml", working_dir).await?;
+        let bytes = self.run_query(&query, working_dir).await?;
 
-        let graph = graph::BazelDepGraph::parse_xml(xml.as_bytes())?;
+        let graph = graph::BazelDepGraph::parse_proto(&bytes)?;
 
         for target in targets {
             let packages = graph.packages_for(target);
@@ -621,7 +620,7 @@ mod tests {
             r#"#!/bin/sh
 printf '%s\n' "$1" >> calls
 case "$1" in
-  query) printf '%s\n' '<query><rule class="sh_binary" name="//app:bin"/></query>' ;;
+  query) : ;;
   cquery) printf '//app:bin\tbazel-out/app/bin\n' ;;
 esac
 "#,
