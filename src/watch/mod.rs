@@ -2641,6 +2641,7 @@ mod tests {
         }
         let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
         let mut manager = test_manager(HashMap::new(), dispatch).await;
+        manager.watcher = Some(create_native_watcher(&manager.notify_tx).unwrap());
         let updates = ["bad", "good"]
             .into_iter()
             .map(|name| WatchUpdate {
