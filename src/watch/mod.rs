@@ -2426,6 +2426,7 @@ mod tests {
             watched(WatchItemKind::Service, Duration::ZERO, &[&pattern]),
         )]);
         let mut manager = test_manager(items, dispatch).await;
+        manager.watcher = Some(create_native_watcher(&manager.notify_tx).unwrap());
         visit_watch_dirs(
             &root,
             &manager.overrides,
