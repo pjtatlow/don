@@ -3360,35 +3360,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_change_during_the_first_build_asks_for_the_artifact_again() {
-        struct Case {
-            name: &'static str,
+    async fn a_file_change_during_a_build_asks_for_the_artifact_again() {
+        struct Round {
             changed: bool,
             failed: bool,
-            want_second_request: bool,
+        }
+        struct Case {
+            name: &'static str,
+            lazy: bool,
+            rounds: &'static [Round],
+            want_another_request: bool,
         }
         let cases = [
             Case {
                 name: "a build that failed on sources that moved is retried",
-                changed: true,
-                failed: true,
-                want_second_request: true,
+                lazy: false,
+                rounds: &[Round {
+                    changed: true,
+                    failed: true,
+                }],
+                want_another_request: true,
             },
             Case {
                 name: "an artifact built from sources that moved is rebuilt",
-                changed: true,
-                failed: false,
-                want_second_request: true,
+                lazy: false,
+                rounds: &[Round {
+                    changed: true,
+                    failed: false,
+                }],
+                want_another_request: true,
             },
             Case {
                 name: "a build that failed on unchanged sources is final",
-                changed: false,
-                failed: true,
-                want_second_request: false,
+                lazy: false,
+                rounds: &[Round {
+                    changed: false,
+                    failed: true,
+                }],
+                want_another_request: false,
+            },
+            Case {
+                name: "sources that keep moving keep the retry going",
+                lazy: false,
+                rounds: &[
+                    Round {
+                        changed: true,
+                        failed: true,
+                    },
+                    Round {
+                        changed: true,
+                        failed: true,
+                    },
+                ],
+                want_another_request: true,
+            },
+            Case {
+                name: "a retry that fails on unchanged sources is final",
+                lazy: false,
+                rounds: &[
+                    Round {
+                        changed: true,
+                        failed: true,
+                    },
+                    Round {
+                        changed: false,
+                        failed: true,
+                    },
+                ],
+                want_another_request: false,
+            },
+            Case {
+                name: "a lazy service's first-connection build is retried",
+                lazy: true,
+                rounds: &[Round {
+                    changed: true,
+                    failed: true,
+                }],
+                want_another_request: true,
             },
         ];
         for case in cases {
             let (env, mut batcher_rx) = released_env_with_batcher().await;
+            let (lazy_tx, demand_rx) = mpsc::channel(16);
+            let assets = if case.lazy {
+                Some(ProxyAssets {
+                    proxy: bind_env_proxy(Some(lazy_tx.clone())).await,
+                    demand_rx: Some(demand_rx),
+                })
+            } else {
+                None
+            };
             let (tx, rx) = mpsc::unbounded_channel();
             let (report_tx, mut report_rx) = mpsc::unbounded_channel();
             let handle = tokio::spawn(supervise(
@@ -3398,45 +3459,54 @@ mod tests {
                 None,
                 report_tx,
                 Arc::new(AtomicBool::new(false)),
-                None,
-                Some(bazel_resolved(false)),
+                assets,
+                Some(bazel_resolved(case.lazy)),
                 Vec::new(),
                 Some(test_publisher()),
             ));
-            let (_, outcome) = next_prepare(&mut batcher_rx).await.expect(case.name);
-            if case.changed {
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                tx.send(ServiceCommand::Rebuild(RebuildRequest {
-                    forced: false,
-                    source: RebuildSource::FileChange,
-                    reply: Some(reply_tx),
-                }))
-                .unwrap();
-                assert!(reply_rx.await.unwrap().is_ok(), "{}", case.name);
+            if case.lazy {
+                lazy_tx.send("svc".to_string()).await.unwrap();
             }
-            outcome
-                .send(if case.failed {
-                    PrepareOutcome::Failed("test build failure".into())
-                } else {
-                    PrepareOutcome::Ready { binary_path: None }
-                })
-                .unwrap();
-            let second = next_prepare(&mut batcher_rx).await;
-            assert_eq!(second.is_some(), case.want_second_request, "{}", case.name);
-            if let Some((_, outcome)) = second {
+            for round in case.rounds {
+                let (_, outcome) = next_prepare(&mut batcher_rx).await.expect(case.name);
+                if round.changed {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    tx.send(ServiceCommand::Rebuild(RebuildRequest {
+                        forced: false,
+                        source: RebuildSource::FileChange,
+                        reply: Some(reply_tx),
+                    }))
+                    .unwrap();
+                    assert!(reply_rx.await.unwrap().is_ok(), "{}", case.name);
+                }
+                outcome
+                    .send(if round.failed {
+                        PrepareOutcome::Failed("test build failure".into())
+                    } else {
+                        PrepareOutcome::Ready { binary_path: None }
+                    })
+                    .unwrap();
+            }
+            let another = next_prepare(&mut batcher_rx).await;
+            assert_eq!(
+                another.is_some(),
+                case.want_another_request,
+                "{}",
+                case.name
+            );
+            if let Some((_, outcome)) = another {
                 outcome
                     .send(PrepareOutcome::Ready { binary_path: None })
                     .unwrap();
-                assert!(
-                    matches!(
-                        tokio::time::timeout(Duration::from_secs(5), report_rx.recv()).await,
-                        Ok(Some(
-                            super::super::ProcessReport::ServiceStartPrepared { .. }
-                        ))
-                    ),
-                    "{}",
-                    case.name
-                );
+                let started = async {
+                    while !matches!(
+                        report_rx.recv().await,
+                        Some(super::super::ProcessReport::ServiceStartPrepared { .. })
+                    ) {}
+                };
+                tokio::time::timeout(Duration::from_secs(5), started)
+                    .await
+                    .unwrap_or_else(|_| panic!("never started: {}", case.name));
             }
             handle.abort();
         }
