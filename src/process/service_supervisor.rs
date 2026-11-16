@@ -585,6 +585,7 @@ async fn supervise(
         owner.set(super::ServiceState::Building);
         request_artifact(&name, &resolved, &env, &prepare_tx)
     };
+    let mut changed_while_building = false;
     // The process this supervisor currently owns, from wire to reap/stop.
     let mut held: Option<service::ServiceHandle> = None;
     // The output reader for the held process, and its end-of-stream signal.
@@ -904,6 +905,19 @@ async fn supervise(
                         use crate::build_tool::batch::PrepareOutcome;
                         let Some(outcome) = outcome else { continue };
                         busy.store(true, Ordering::Relaxed);
+                        let outcome = if std::mem::take(&mut changed_while_building) {
+                            env.emitter.service_event(
+                                &name,
+                                if matches!(outcome, PrepareOutcome::Failed(_)) {
+                                    "build failed while files changed — rebuilding before start"
+                                } else {
+                                    "files changed during build — rebuilding before start"
+                                },
+                            );
+                            PrepareOutcome::Stale
+                        } else {
+                            outcome
+                        };
                         match outcome {
                             PrepareOutcome::Ready { binary_path } => {
                                 awaiting_artifact = false;
@@ -1201,6 +1215,13 @@ async fn supervise(
                     && owner.phase == super::ServiceState::Lazy
                 {
                     batch_built = false;
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                    continue;
+                }
+                if request.source == RebuildSource::FileChange && awaiting_artifact {
+                    changed_while_building = true;
                     if let Some(reply) = request.reply {
                         let _ = reply.send(Ok(()));
                     }
@@ -3336,6 +3357,89 @@ mod tests {
             _ => panic!("the start should follow the artifact, in that order"),
         }
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_file_change_during_the_first_build_asks_for_the_artifact_again() {
+        struct Case {
+            name: &'static str,
+            changed: bool,
+            failed: bool,
+            want_second_request: bool,
+        }
+        let cases = [
+            Case {
+                name: "a build that failed on sources that moved is retried",
+                changed: true,
+                failed: true,
+                want_second_request: true,
+            },
+            Case {
+                name: "an artifact built from sources that moved is rebuilt",
+                changed: true,
+                failed: false,
+                want_second_request: true,
+            },
+            Case {
+                name: "a build that failed on unchanged sources is final",
+                changed: false,
+                failed: true,
+                want_second_request: false,
+            },
+        ];
+        for case in cases {
+            let (env, mut batcher_rx) = released_env_with_batcher().await;
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+            let handle = tokio::spawn(supervise(
+                "svc".to_string(),
+                rx,
+                env,
+                None,
+                report_tx,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                Some(bazel_resolved(false)),
+                Vec::new(),
+                Some(test_publisher()),
+            ));
+            let (_, outcome) = next_prepare(&mut batcher_rx).await.expect(case.name);
+            if case.changed {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.send(ServiceCommand::Rebuild(RebuildRequest {
+                    forced: false,
+                    source: RebuildSource::FileChange,
+                    reply: Some(reply_tx),
+                }))
+                .unwrap();
+                assert!(reply_rx.await.unwrap().is_ok(), "{}", case.name);
+            }
+            outcome
+                .send(if case.failed {
+                    PrepareOutcome::Failed("test build failure".into())
+                } else {
+                    PrepareOutcome::Ready { binary_path: None }
+                })
+                .unwrap();
+            let second = next_prepare(&mut batcher_rx).await;
+            assert_eq!(second.is_some(), case.want_second_request, "{}", case.name);
+            if let Some((_, outcome)) = second {
+                outcome
+                    .send(PrepareOutcome::Ready { binary_path: None })
+                    .unwrap();
+                assert!(
+                    matches!(
+                        tokio::time::timeout(Duration::from_secs(5), report_rx.recv()).await,
+                        Ok(Some(
+                            super::super::ProcessReport::ServiceStartPrepared { .. }
+                        ))
+                    ),
+                    "{}",
+                    case.name
+                );
+            }
+            handle.abort();
+        }
     }
 
     /// The rebuild cycle's decision table, which is the whole of the

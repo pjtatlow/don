@@ -711,6 +711,7 @@ async fn supervise(
     let (requery_tx, mut requery_rx) =
         mpsc::unbounded_channel::<crate::build_tool::batch::RequeryOutcome>();
     let mut awaiting_artifact = false;
+    let mut changed_while_building = false;
     // A run held back until its build lands. Distinct from `pending`, which is
     // "run this next": this one may not run yet.
     let mut awaiting_build: Option<RunRequest> = None;
@@ -859,6 +860,9 @@ async fn supervise(
                         tokio::select! {
                             received = rx.recv() => match received {
                                 Some(command) => {
+                                    if awaiting_artifact && matches!(command, TaskCommand::Rerun) {
+                                        changed_while_building = true;
+                                    }
                                     // Nothing is in hand, so a cancel has
                                     // nothing to kill — only its follow-up
                                     // run, if it has one, survives.
@@ -1069,6 +1073,19 @@ async fn supervise(
                             outcome = prepare_rx.recv() => {
                                 use crate::build_tool::batch::PrepareOutcome;
                                 let Some(outcome) = outcome else { continue };
+                                let outcome = if std::mem::take(&mut changed_while_building) {
+                                    ctx.emitter.service_event(
+                                        &name,
+                                        if matches!(outcome, PrepareOutcome::Failed(_)) {
+                                            "build failed while files changed — re-running build before start"
+                                        } else {
+                                            "files changed during build — re-running build before start"
+                                        },
+                                    );
+                                    PrepareOutcome::Stale
+                                } else {
+                                    outcome
+                                };
                                 match outcome {
                                     // A `bazel.target` task with no `cmd` of
                                     // its own runs this artifact directly; one
@@ -3127,6 +3144,109 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("timed out: {}", case.config));
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_is_retried_when_files_changed_while_it_ran() {
+        use crate::build_tool::batch::PrepareOutcome;
+        use crate::build_tool::batcher::BatchRequest;
+        let temp = tempfile::tempdir().unwrap();
+        let config: crate::config::Config =
+            "[tasks.t]\nbazel.target = '//a:t'\ncmd = 'sh'\nargs = ['-c', 'echo ran >> ran']"
+                .parse()
+                .unwrap();
+        let output = crate::output::OutputManager::new(
+            &[("t", &crate::config::LogConfig::Stdout)],
+            tokio::io::sink(),
+        )
+        .await
+        .unwrap();
+        let (_endpoints, endpoints) = crate::endpoints::channel();
+        let ctx = super::super::task_worker::TaskWorkerContext {
+            base_dir: temp.path().to_path_buf(),
+            platform: crate::config::Platform::current().unwrap(),
+            emitter: output.clone_lifecycle_emitter(),
+            global_watch_ignore: Vec::new(),
+            bazel_config: None,
+            endpoints,
+            secrets: crate::secrets::SecretStore::empty(),
+        };
+        let (_facts, mut publishers, world) = crate::facts::channel(
+            [(
+                "t".into(),
+                crate::facts::ProcessFacts::for_task(
+                    "t",
+                    super::super::TaskState::Pending,
+                    false,
+                    None,
+                    None,
+                    Vec::new(),
+                ),
+            )]
+            .into_iter(),
+        );
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+        let (batcher_tx, mut batcher_rx) = mpsc::unbounded_channel();
+        let (_release_tx, release_rx) = tokio::sync::watch::channel(true);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(supervise(
+            "t".into(),
+            command_rx,
+            ctx,
+            output.process_output("t"),
+            report_tx,
+            Arc::new(AtomicBool::new(false)),
+            Some(StartupConfig {
+                task_cfg: Box::new(config.tasks.get("t").unwrap().clone()),
+                has_dependents: true,
+                has_success: false,
+                last_run: None,
+            }),
+            Vec::new(),
+            world,
+            publishers.remove("t"),
+            release_rx,
+            shutdown_rx,
+            batcher_tx,
+        ));
+        let scenario = async {
+            let mut next_build = async || loop {
+                if let BatchRequest::QueuePrepare { outcome, .. } = batcher_rx.recv().await.unwrap()
+                {
+                    break outcome;
+                }
+            };
+            let first = next_build().await;
+            command_tx.send(TaskCommand::Rerun).unwrap();
+            // The change and the build outcome travel on separate channels;
+            // the change must be taken first.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            first
+                .send(PrepareOutcome::Failed("test build failure".into()))
+                .unwrap();
+            next_build()
+                .await
+                .send(PrepareOutcome::Ready { binary_path: None })
+                .unwrap();
+            loop {
+                if let super::super::ProcessReport::TaskExited(exit) =
+                    report_rx.recv().await.unwrap()
+                {
+                    assert!(exit.success, "{:?}", exit.message);
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), scenario)
+            .await
+            .expect("the failed build was not retried");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("ran")).unwrap(),
+            "ran\n"
+        );
+        supervisor.abort();
+        let _ = supervisor.await;
     }
 
     #[tokio::test]
