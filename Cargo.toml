@@ -48,7 +48,7 @@ notify = "8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 regex = "1"
 pty-process = { version = "0.5", features = ["async"] }
-quick-xml = "0.40"
+prost = "0.14"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 # Embeds web/dist into the binary for release builds; reads from disk in debug
 # builds so the frontend can be iterated on without a cargo rebuild.
