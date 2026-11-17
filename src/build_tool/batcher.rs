@@ -103,7 +103,7 @@ pub(crate) enum BatchRequest {
     /// preparation builds may start. Sent exactly once; see the module docs
     /// for why nothing may build before it.
     WatchReady {
-        updates: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+        updates: Option<mpsc::UnboundedSender<Vec<crate::watch::WatchUpdate>>>,
     },
     /// A task has decided whether to join the initial preparation batch.
     StartupTaskChecked { name: String },
@@ -187,7 +187,8 @@ async fn run(
         HashMap::new();
     // `None` until the runner says whether there is a watcher; see the module
     // docs. Preparation requests arriving before that are parked, not queued.
-    let mut watch_updates: Option<Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>> = None;
+    let mut watch_updates: Option<Option<mpsc::UnboundedSender<Vec<crate::watch::WatchUpdate>>>> =
+        None;
     let mut parked_prepares: Vec<String> = Vec::new();
     // Workers report here; the handles stored in the scheduler are wrappers
     // around these sends, so `abort_in_flight` still kills the real work.
@@ -364,7 +365,7 @@ fn deliver_prepares(
 fn flush_prepares(
     scheduler: &mut BuildBatcher,
     specs: &mut HashMap<String, BatchBuildItem>,
-    watch_updates: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+    watch_updates: Option<mpsc::UnboundedSender<Vec<crate::watch::WatchUpdate>>>,
     workspace: &WorkspaceContext,
     emitter: &LifecycleEmitter,
     worker_tx: &mpsc::UnboundedSender<WorkerDone>,
@@ -496,7 +497,7 @@ fn spawn_rebuild_batch(
 fn flush_requeries(
     scheduler: &mut BuildBatcher,
     specs: &mut HashMap<String, GraphRequeryRequestItem>,
-    watch_updates: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+    watch_updates: Option<mpsc::UnboundedSender<Vec<crate::watch::WatchUpdate>>>,
     workspace: &WorkspaceContext,
     emitter: &LifecycleEmitter,
     worker_tx: &mpsc::UnboundedSender<WorkerDone>,
