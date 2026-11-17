@@ -114,6 +114,7 @@ impl BazelResolver {
                 "--proto:output_rule_attrs=",
                 "--proto:rule_inputs_and_outputs",
                 "--noproto:locations",
+                "--order_output=no",
             ])
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
@@ -393,7 +394,7 @@ impl BazelResolver {
             .map(|t| format!("({t})"))
             .collect::<Vec<_>>()
             .join(" + ");
-        let query = format!("deps({union_expr})");
+        let query = format!(r#"filter("^//", deps({union_expr}))"#);
         let bytes = self.run_query(&query, working_dir).await?;
 
         let graph = graph::BazelDepGraph::parse_proto(&bytes)?;

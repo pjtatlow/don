@@ -248,26 +248,16 @@ fn watch_resolution_items(items: &[BatchBuildItem]) -> Vec<&BatchBuildItem> {
         .collect()
 }
 
-pub(crate) async fn send_watch_update(
-    tx: &mpsc::UnboundedSender<crate::watch::WatchUpdate>,
-    name: String,
-    kind: crate::watch::WatchItemKind,
-    patterns: Vec<String>,
-    ignore_patterns: Vec<String>,
-    base_dir: PathBuf,
+pub(crate) async fn send_watch_updates(
+    tx: &mpsc::UnboundedSender<Vec<crate::watch::WatchUpdate>>,
+    mut updates: Vec<crate::watch::WatchUpdate>,
 ) {
+    let Some(last) = updates.last_mut() else {
+        return;
+    };
     let (applied_tx, applied_rx) = oneshot::channel();
-    if tx
-        .send(crate::watch::WatchUpdate {
-            name,
-            kind,
-            patterns,
-            ignore_patterns,
-            base_dir,
-            applied_tx: Some(applied_tx),
-        })
-        .is_ok()
-    {
+    last.applied_tx = Some(applied_tx);
+    if tx.send(updates).is_ok() {
         let _ = applied_rx.await;
     }
 }
@@ -282,7 +272,7 @@ pub(crate) async fn send_watch_update(
 pub(crate) async fn run_graph_requery_worker(
     items: Vec<GraphRequeryRequestItem>,
     emitter: crate::output::LifecycleEmitter,
-    watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+    watch_update_tx: Option<mpsc::UnboundedSender<Vec<crate::watch::WatchUpdate>>>,
     base_dir: PathBuf,
 ) -> Vec<(String, RequeryOutcome)> {
     let mut outcomes: Vec<Option<GraphRequeryOutcomeItem>> =
@@ -359,6 +349,7 @@ pub(crate) async fn run_graph_requery_worker(
     }
 
     let mut delivered = Vec::new();
+    let mut updates = Vec::new();
     for outcome in outcomes.into_iter().flatten() {
         let info = match outcome.result {
             Ok(info) => info,
@@ -379,38 +370,37 @@ pub(crate) async fn run_graph_requery_worker(
                 if count == 1 { "" } else { "s" }
             ),
         );
-        if outcome.watch_enabled
-            && let Some(ref tx) = watch_update_tx
-        {
+        if outcome.watch_enabled && watch_update_tx.is_some() {
             let watch_kind = match outcome.kind {
                 ProcessKind::Service => crate::watch::WatchItemKind::Service,
                 ProcessKind::Task => crate::watch::WatchItemKind::Task,
             };
-            send_watch_update(
-                tx,
-                outcome.name.clone(),
-                watch_kind,
-                info.watch_paths,
-                outcome.ignore_patterns,
-                base_dir.clone(),
-            )
-            .await;
-            send_watch_update(
-                tx,
-                format!("{}__graph", outcome.name),
-                crate::watch::WatchItemKind::BuildGraph,
-                info.graph_definition_globs,
-                crate::process::paths::resolve_watch_ignore_patterns(
+            updates.push(crate::watch::WatchUpdate {
+                name: outcome.name.clone(),
+                kind: watch_kind,
+                patterns: info.watch_paths,
+                ignore_patterns: outcome.ignore_patterns,
+                base_dir: base_dir.clone(),
+                applied_tx: None,
+            });
+            updates.push(crate::watch::WatchUpdate {
+                name: format!("{}__graph", outcome.name),
+                kind: crate::watch::WatchItemKind::BuildGraph,
+                patterns: info.graph_definition_globs,
+                ignore_patterns: crate::process::paths::resolve_watch_ignore_patterns(
                     &base_dir,
                     &[],
                     &base_dir,
                     &outcome.global_watch_ignore,
                 ),
-                base_dir.clone(),
-            )
-            .await;
+                base_dir: base_dir.clone(),
+                applied_tx: None,
+            });
         }
         delivered.push((outcome.name, RequeryOutcome::Updated));
+    }
+    if let Some(tx) = watch_update_tx {
+        send_watch_updates(&tx, updates).await;
     }
     delivered
 }
@@ -420,14 +410,13 @@ pub(crate) async fn run_graph_requery_worker(
 /// edit made while the build ran. Pure off-task function that takes owned
 /// inputs and returns one [`PrepareOutcome`] per item.
 ///
-/// Sends [`crate::watch::WatchUpdate`]s directly to the watch manager as they
-/// resolve — before the builds complete, and therefore before any supervisor
-/// waiting on an outcome can spawn.
+/// Installs the resolved watch definitions in one acknowledged batch before
+/// starting builds, and therefore before any waiting supervisor can spawn.
 pub(crate) async fn run_batch_build_chain(
     items: Vec<BatchBuildItem>,
     base_dir: PathBuf,
     emitter: crate::output::LifecycleEmitter,
-    watch_update_tx: Option<mpsc::UnboundedSender<crate::watch::WatchUpdate>>,
+    watch_update_tx: Option<mpsc::UnboundedSender<Vec<crate::watch::WatchUpdate>>>,
     global_watch_ignore: Vec<String>,
     bazel_build_mutex: Arc<tokio::sync::Mutex<()>>,
 ) -> PrepareBatchOutcome {
@@ -517,47 +506,39 @@ pub(crate) async fn run_batch_build_chain(
         }
     }
 
-    // Attribute resolved watch paths to each item. Bazel items get their
-    // own per-target result (computed by DFS from the unified XML graph).
-    // Each item emits its own
-    // `WatchUpdate` so the watch manager keeps a per-service/task
-    // `WatchedItem` entry keyed by name. Directories in the watcher dedup
-    // via `registered_dirs`, so the actual inotify cost is paid once per
-    // directory regardless of how many items claim it.
+    // Keep ownership routes distinct while installing their native directory union once.
+    let mut updates = Vec::new();
     for item in &items {
-        let info = resolved_info_by_item.get(&item.name);
-        let Some(info) = info else {
-            continue; // query failed for this tool — warning already pushed
+        let Some(info) = resolved_info_by_item.get(&item.name) else {
+            continue;
         };
-
-        if item.watch_enabled
-            && let Some(ref tx) = watch_update_tx
-        {
+        if item.watch_enabled && watch_update_tx.is_some() {
             let watch_kind = match item.kind {
                 ProcessKind::Service => crate::watch::WatchItemKind::Service,
                 ProcessKind::Task => crate::watch::WatchItemKind::Task,
             };
-            send_watch_update(
-                tx,
-                item.name.clone(),
-                watch_kind,
-                info.watch_paths.clone(),
-                item.ignore.clone(),
-                base_dir.clone(),
-            )
-            .await;
+            updates.push(crate::watch::WatchUpdate {
+                name: item.name.clone(),
+                kind: watch_kind,
+                patterns: info.watch_paths.clone(),
+                ignore_patterns: item.ignore.clone(),
+                base_dir: base_dir.clone(),
+                applied_tx: None,
+            });
             if !info.graph_definition_globs.is_empty() {
-                send_watch_update(
-                    tx,
-                    format!("{}__graph", item.name),
-                    crate::watch::WatchItemKind::BuildGraph,
-                    info.graph_definition_globs.clone(),
-                    global_watch_ignore.clone(),
-                    base_dir.clone(),
-                )
-                .await;
+                updates.push(crate::watch::WatchUpdate {
+                    name: format!("{}__graph", item.name),
+                    kind: crate::watch::WatchItemKind::BuildGraph,
+                    patterns: info.graph_definition_globs.clone(),
+                    ignore_patterns: global_watch_ignore.clone(),
+                    base_dir: base_dir.clone(),
+                    applied_tx: None,
+                });
             }
         }
+    }
+    if let Some(tx) = watch_update_tx {
+        send_watch_updates(&tx, updates).await;
     }
 
     // Step 2: batch builds. Bazel groups run concurrently, but each group

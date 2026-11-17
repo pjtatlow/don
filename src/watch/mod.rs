@@ -77,7 +77,7 @@ pub enum WatchError {
     Notify(#[from] notify::Error),
     #[error("invalid debounce duration: {0}")]
     Duration(#[from] crate::duration::DurationError),
-    #[error("failed to create watch directory {}: {}", .0.display(), .1)]
+    #[error("watch directory {}: {}", .0.display(), .1)]
     Io(PathBuf, std::io::Error),
 }
 
@@ -99,21 +99,21 @@ const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 /// and the receiver takes it from there.
 pub(crate) struct WatchHandle {
     /// Revised watch patterns, pushed after a build-tool re-query.
-    updates: mpsc::UnboundedSender<WatchUpdate>,
+    updates: mpsc::UnboundedSender<Vec<WatchUpdate>>,
     /// Status queries for verbose output.
     queries: mpsc::Sender<WatchQuery>,
 }
 
 impl WatchHandle {
     pub(crate) fn new(
-        updates: mpsc::UnboundedSender<WatchUpdate>,
+        updates: mpsc::UnboundedSender<Vec<WatchUpdate>>,
         queries: mpsc::Sender<WatchQuery>,
     ) -> Self {
         Self { updates, queries }
     }
 
     /// A sender for pushing revised watch patterns.
-    pub(crate) fn updates(&self) -> mpsc::UnboundedSender<WatchUpdate> {
+    pub(crate) fn updates(&self) -> mpsc::UnboundedSender<Vec<WatchUpdate>> {
         self.updates.clone()
     }
 
@@ -248,6 +248,14 @@ pub(crate) struct WatchUpdate {
     pub applied_tx: Option<oneshot::Sender<()>>,
 }
 
+struct PreparedWatchUpdate {
+    update: WatchUpdate,
+    patterns: Vec<Pattern>,
+    ignore_patterns: Vec<Pattern>,
+    roots: Vec<PathBuf>,
+    errors: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WatchItemSnapshot {
     pub kind: &'static str,
@@ -296,7 +304,7 @@ pub(crate) struct WatchManager {
     /// Who is told when a debounce window closes.
     dispatch: Box<dyn WatchDispatch>,
     /// Receiver for watch pattern updates from the runner (build tool re-queries).
-    update_rx: mpsc::UnboundedReceiver<WatchUpdate>,
+    update_rx: mpsc::UnboundedReceiver<Vec<WatchUpdate>>,
     /// Receiver for debug/status queries from the runner.
     query_rx: mpsc::Receiver<WatchQuery>,
     /// Directories already registered with the watcher, keyed by path with
@@ -379,7 +387,7 @@ impl WatchManager {
         platform: Platform,
         base_dir: &Path,
         dispatch: Box<dyn WatchDispatch>,
-        update_rx: mpsc::UnboundedReceiver<WatchUpdate>,
+        update_rx: mpsc::UnboundedReceiver<Vec<WatchUpdate>>,
         query_rx: mpsc::Receiver<WatchQuery>,
         emitter: LifecycleEmitter,
     ) -> Result<(Self, Vec<String>), WatchError> {
@@ -873,7 +881,7 @@ impl WatchManager {
                     self.fire_debounce_timers().await;
                 }
                 Some(update) = self.update_rx.recv() => {
-                    self.apply_watch_update(update);
+                    self.apply_watch_updates(update).await;
                 }
                 Some(query) = self.query_rx.recv() => {
                     let _ = query.reply.send(self.snapshot());
@@ -882,77 +890,158 @@ impl WatchManager {
         }
     }
 
-    /// Apply a watch update from the runner (build tool re-query completed).
-    ///
-    /// Replaces the watch patterns for the named item and registers any
-    /// new watch directories with the notify watcher.
-    fn apply_watch_update(&mut self, mut update: WatchUpdate) {
-        // Canonicalize the base so the compiled globs are absolute and match
-        // the cwd-prefixed absolute paths that notify reports in events.
-        // Without this, a runner base_dir of `.` produces patterns like
-        // `./auth/jwt/**` that will never match `/abs/cwd/./auth/jwt/foo.ts`.
-        // The initial-setup path in `WatchManager::new` already canonicalizes;
-        // this keeps the build-tool-resolved update path in sync.
-        let base_dir =
-            std::fs::canonicalize(&update.base_dir).unwrap_or_else(|_| update.base_dir.clone());
-
-        let mut compiled_patterns = Vec::new();
-        for pattern_str in &update.patterns {
-            let full_pattern = resolve_pattern(&base_dir, pattern_str);
-            if let Ok(pat) = Pattern::new(&full_pattern.to_string_lossy()) {
-                compiled_patterns.push(pat);
-
-                // Always register the watch directory for build-tool-resolved
-                // patterns. A parent recursive watch may not reliably cover
-                // all subdirectories (e.g. when bazel symlinks cause inotify
-                // to miss directories during the initial recursive walk).
-                let watch_dir = glob_base_dir(&full_pattern);
-                if watch_dir.exists() {
-                    let result = match update.kind {
-                        // Tier-1 BuildGraph updates land on specific filename
-                        // patterns (`<pkg>/BUILD`, `<pkg>/package.json`) — a
-                        // non-recursive watch on the package directory is
-                        // exactly right, no subtree walk.
-                        WatchItemKind::BuildGraph => register_single_dir(
-                            &mut self.watcher,
-                            &self.notify_tx,
-                            &watch_dir,
-                            RecursiveMode::NonRecursive,
-                            &mut self.registered_dirs,
-                        ),
-                        // Tier-2 Service/Task updates are directory-level globs
-                        // (`<pkg>/**`) that need recursive coverage — routed
-                        // through the same `watch_ignore`-aware registration as
-                        // startup so ignored subtrees stay pruned on reload.
-                        WatchItemKind::Service | WatchItemKind::Task => register_dirs_ignoring(
-                            &mut self.watcher,
-                            &self.notify_tx,
-                            &watch_dir,
-                            &self.overrides,
-                            &mut self.registered_dirs,
-                        ),
+    /// Install the native union, then publish each owner's routing definition.
+    /// Acknowledgements follow all route updates, including error diagnostics.
+    async fn apply_watch_updates(&mut self, updates: Vec<WatchUpdate>) {
+        let mut prepared = Vec::with_capacity(updates.len());
+        let mut roots = HashMap::new();
+        for update in updates {
+            let base_dir =
+                std::fs::canonicalize(&update.base_dir).unwrap_or_else(|_| update.base_dir.clone());
+            let mut patterns = Vec::new();
+            let mut item_roots = Vec::new();
+            for pattern in &update.patterns {
+                let full = resolve_pattern(&base_dir, pattern);
+                if let Ok(pattern) = Pattern::new(&full.to_string_lossy()) {
+                    patterns.push(pattern);
+                    let root = glob_base_dir(&full);
+                    let mode = match update.kind {
+                        WatchItemKind::BuildGraph => RecursiveMode::NonRecursive,
+                        WatchItemKind::Service | WatchItemKind::Task => RecursiveMode::Recursive,
                     };
-                    if let Err(e) = result {
-                        self.record_item_error(
-                            &update.name,
-                            format!(
-                                "watch: failed to register watch for {}: {e}",
-                                watch_dir.display()
-                            ),
-                        );
-                    }
+                    roots
+                        .entry(root.clone())
+                        .and_modify(|existing| {
+                            if mode == RecursiveMode::Recursive {
+                                *existing = mode;
+                            }
+                        })
+                        .or_insert(mode);
+                    item_roots.push(root);
+                }
+            }
+            let ignore_patterns = update
+                .ignore_patterns
+                .iter()
+                .filter_map(|pattern| {
+                    Pattern::new(&resolve_pattern(&base_dir, pattern).to_string_lossy()).ok()
+                })
+                .collect();
+            prepared.push(PreparedWatchUpdate {
+                update,
+                patterns,
+                ignore_patterns,
+                roots: item_roots,
+                errors: Vec::new(),
+            });
+            // Large dependency sets must not monopolize the async executor.
+            tokio::task::yield_now().await;
+        }
+
+        let mut desired = Vec::new();
+        let mut registration_errors = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut roots: Vec<_> = roots.into_iter().collect();
+        roots.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (root, mode) in roots {
+            if !root.exists() {
+                continue;
+            }
+            tokio::task::yield_now().await;
+            if cfg!(target_os = "macos") {
+                if mode == RecursiveMode::NonRecursive {
+                    desired.push((root, mode));
+                } else {
+                    collect_desired_watches(&root, &self.overrides, &mut visited, &mut desired);
+                }
+            } else {
+                let result = if mode == RecursiveMode::NonRecursive {
+                    register_single_dir(
+                        &mut self.watcher,
+                        &self.notify_tx,
+                        &root,
+                        mode,
+                        &mut self.registered_dirs,
+                    )
+                } else {
+                    register_dirs_with_visited(
+                        &mut self.watcher,
+                        &self.notify_tx,
+                        &root,
+                        &self.overrides,
+                        &mut self.registered_dirs,
+                        &mut visited,
+                    )
+                };
+                if let Err(error) = result {
+                    let path = match &error {
+                        WatchError::Notify(error) => error.paths.first().unwrap_or(&root),
+                        WatchError::Io(path, _) => path,
+                        _ => &root,
+                    };
+                    registration_errors.push((path.clone(), error.to_string()));
                 }
             }
         }
-
-        let mut compiled_ignore = Vec::new();
-        for pattern_str in &update.ignore_patterns {
-            let full_pattern = resolve_pattern(&base_dir, pattern_str);
-            if let Ok(pat) = Pattern::new(&full_pattern.to_string_lossy()) {
-                compiled_ignore.push(pat);
+        let actions = reconcile_watches(&desired, &self.registered_dirs);
+        if let Err(error) = apply_watch_actions(
+            &mut self.watcher,
+            &self.notify_tx,
+            actions,
+            &mut self.registered_dirs,
+        ) {
+            self.emitter.debug_event(&format!(
+                "watch: native batch failed, retrying directories individually: {error}"
+            ));
+            for (dir, mode) in desired {
+                if let Err(error) = register_single_dir(
+                    &mut self.watcher,
+                    &self.notify_tx,
+                    &dir,
+                    mode,
+                    &mut self.registered_dirs,
+                ) {
+                    registration_errors.push((dir, error.to_string()));
+                }
+                tokio::task::yield_now().await;
             }
         }
 
+        for (dir, error) in registration_errors {
+            for item in &mut prepared {
+                if item.roots.iter().any(|root| match item.update.kind {
+                    WatchItemKind::BuildGraph => root == &dir,
+                    WatchItemKind::Service | WatchItemKind::Task => dir.starts_with(root),
+                }) {
+                    item.errors.push(format!(
+                        "watch: failed to register watch for {}: {error}",
+                        dir.display()
+                    ));
+                }
+            }
+        }
+        let mut acknowledgements = Vec::new();
+        for mut item in prepared {
+            if let Some(ack) = item.update.applied_tx.take() {
+                acknowledgements.push(ack);
+            }
+            self.publish_watch_update(&item.update, item.patterns, item.ignore_patterns);
+            // Publishing resets the item's old diagnostics; report new failures afterward.
+            for error in item.errors {
+                self.record_item_error(&item.update.name, error);
+            }
+        }
+        for ack in acknowledgements {
+            let _ = ack.send(());
+        }
+    }
+
+    fn publish_watch_update(
+        &mut self,
+        update: &WatchUpdate,
+        compiled_patterns: Vec<Pattern>,
+        compiled_ignore: Vec<Pattern>,
+    ) {
         if let Some(item) = self.items.get_mut(&update.name) {
             refresh_item_definition(item, update.kind, compiled_patterns, compiled_ignore);
             let pats: Vec<&str> = item.patterns.iter().map(Pattern::as_str).collect();
@@ -989,10 +1078,6 @@ impl WatchManager {
                     last_error: None,
                 },
             );
-        }
-
-        if let Some(applied_tx) = update.applied_tx.take() {
-            let _ = applied_tx.send(());
         }
     }
 
@@ -1048,6 +1133,26 @@ impl WatchManager {
             paths.first().map(|path| path.display().to_string())
         ));
 
+        // inotify descriptors die with the inode. FSEvents subscriptions stay
+        // attached to paths and must survive deletion/recreation of a watched root.
+        if !cfg!(target_os = "macos") {
+            match event.kind {
+                EventKind::Remove(kind) if kind != notify::event::RemoveKind::File => {
+                    for path in &paths {
+                        self.forget_directory(path);
+                    }
+                }
+                EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::From | notify::event::RenameMode::Both,
+                )) => {
+                    if let Some(path) = paths.first() {
+                        self.forget_directory(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Backstop for the recursion we deliberately gave up by using only
         // non-recursive watches: when a new directory appears, notify won't
         // auto-watch it, so register it here (skipping ignored dirs) and replay
@@ -1055,7 +1160,13 @@ impl WatchManager {
         // (e.g. `git checkout` of a branch that adds a whole tree). An ignored
         // directory created at runtime — a fresh `node_modules` — is skipped
         // here and never watched.
-        if matches!(event.kind, EventKind::Create(_)) {
+        if matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To | notify::event::RenameMode::Both
+                ))
+        ) {
             for path in &paths {
                 self.register_new_directory(path);
             }
@@ -1159,6 +1270,21 @@ impl WatchManager {
         }
     }
 
+    fn forget_directory(&mut self, path: &Path) {
+        let removed: Vec<_> = self
+            .registered_dirs
+            .keys()
+            .filter(|dir| dir.starts_with(path))
+            .cloned()
+            .collect();
+        for dir in removed {
+            self.registered_dirs.remove(&dir);
+            if let Some(watcher) = self.watcher.as_mut() {
+                let _ = watcher.unwatch(&dir);
+            }
+        }
+    }
+
     /// Register a directory that appeared at runtime, then replay files already
     /// inside it.
     ///
@@ -1196,10 +1322,7 @@ impl WatchManager {
             &self.overrides,
             &mut self.registered_dirs,
         ) {
-            self.emitter.debug_event(&format!(
-                "watch: failed to register new directory {:?}: {e}",
-                path
-            ));
+            self.record_notify_error(&format!("failed to register new directory {:?}: {e}", path));
             return;
         }
         self.emitter
@@ -1542,9 +1665,40 @@ fn register_dirs_ignoring(
     overrides: &Override,
     registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
 ) -> Result<(), WatchError> {
-    let desired = desired_watches(root, overrides);
-    let actions = reconcile_watches(&desired, registered_dirs);
-    apply_watch_actions(watcher, notify_tx, actions, registered_dirs)
+    register_dirs_with_visited(
+        watcher,
+        notify_tx,
+        root,
+        overrides,
+        registered_dirs,
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+fn register_dirs_with_visited(
+    watcher: &mut Option<NotifyBackend>,
+    notify_tx: &mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    root: &Path,
+    overrides: &Override,
+    registered_dirs: &mut HashMap<PathBuf, RecursiveMode>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), WatchError> {
+    if cfg!(target_os = "macos") {
+        let desired = desired_watches(root, overrides);
+        let actions = reconcile_watches(&desired, registered_dirs);
+        return apply_watch_actions(watcher, notify_tx, actions, registered_dirs);
+    }
+    // Watching before enumeration ensures children created too late for this
+    // walk still queue an event for the runtime directory backstop.
+    visit_watch_dirs(root, overrides, visited, &mut |dir| {
+        register_single_dir(
+            watcher,
+            notify_tx,
+            dir,
+            RecursiveMode::NonRecursive,
+            registered_dirs,
+        )
+    })
 }
 
 /// Register a single directory under `mode`, reconciling against existing
@@ -1581,46 +1735,83 @@ fn register_single_dir(
 /// [`WatchManager::handle_notify_event`]); FSEvents allocates no per-directory
 /// descriptors, so there is nothing to leak by not pruning here.
 fn desired_watches(root: &Path, overrides: &Override) -> Vec<(PathBuf, RecursiveMode)> {
-    // `cfg!` (not `#[cfg]`) so `collect_watch_dirs` stays compiled and
-    // referenced on every platform — no dead-code warnings, and the walk logic
-    // remains testable on Linux CI.
-    if cfg!(target_os = "macos") {
-        return vec![(root.to_path_buf(), RecursiveMode::Recursive)];
-    }
     let mut out = Vec::new();
-    collect_watch_dirs(root, overrides, &mut out);
+    collect_desired_watches(
+        root,
+        overrides,
+        &mut std::collections::HashSet::new(),
+        &mut out,
+    );
     out
+}
+
+fn collect_desired_watches(
+    root: &Path,
+    overrides: &Override,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<(PathBuf, RecursiveMode)>,
+) {
+    if cfg!(target_os = "macos") {
+        if visited.insert(root.to_path_buf()) {
+            out.push((root.to_path_buf(), RecursiveMode::Recursive));
+        }
+    } else {
+        collect_watch_dirs(root, overrides, visited, out);
+    }
 }
 
 /// Recursively emit a `NonRecursive` watch for `dir` and every non-ignored
 /// directory beneath it. Ignored directories are pruned (not descended into);
 /// symlinked directories are skipped, mirroring the notify backend's
 /// `follow_symlinks(false)`.
-fn collect_watch_dirs(dir: &Path, overrides: &Override, out: &mut Vec<(PathBuf, RecursiveMode)>) {
-    out.push((dir.to_path_buf(), RecursiveMode::NonRecursive));
+fn collect_watch_dirs(
+    dir: &Path,
+    overrides: &Override,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<(PathBuf, RecursiveMode)>,
+) {
+    let _ = visit_watch_dirs(dir, overrides, visited, &mut |path| {
+        out.push((path.to_path_buf(), RecursiveMode::NonRecursive));
+        Ok(())
+    });
+}
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut child_dirs: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        // `file_type()` on a `DirEntry` does not traverse symlinks, so a
-        // symlinked directory reports `is_symlink()` and is skipped here.
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        if overrides.matched(&path, true).is_ignore() {
-            continue;
-        }
-        child_dirs.push(path);
+fn visit_watch_dirs(
+    dir: &Path,
+    overrides: &Override,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    visit: &mut impl FnMut(&Path) -> Result<(), WatchError>,
+) -> Result<(), WatchError> {
+    if visited.contains(dir) {
+        return Ok(());
     }
-    // Deterministic order for stable debug output and tests.
-    child_dirs.sort();
-    for child in &child_dirs {
-        collect_watch_dirs(child, overrides, out);
+    visit(dir)?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| WatchError::Io(dir.to_path_buf(), error))?;
+    let mut children = Vec::new();
+    let mut first_error = None;
+    for entry in entries {
+        match entry.and_then(|entry| Ok((entry.path(), entry.file_type()?))) {
+            Ok((path, kind)) if kind.is_dir() && !overrides.matched(&path, true).is_ignore() => {
+                children.push(path)
+            }
+            Ok(_) => {}
+            Err(error) => {
+                first_error.get_or_insert(WatchError::Io(dir.to_path_buf(), error));
+            }
+        }
     }
+    children.sort();
+    for child in children {
+        if let Err(error) = visit_watch_dirs(&child, overrides, visited, visit) {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    visited.insert(dir.to_path_buf());
+    Ok(())
 }
 
 /// Reconcile a desired watch set against what is already registered, producing
@@ -2317,6 +2508,329 @@ mod tests {
             registered,
             HashMap::from([(root, RecursiveMode::Recursive)])
         );
+    }
+
+    #[tokio::test]
+    async fn test_watch_update_batches_overlapping_native_paths() {
+        for (kind, patterns, changed) in [
+            (
+                WatchItemKind::Service,
+                vec!["src/nested/**", "src/**", "src/**"],
+                "src/nested/main.rs",
+            ),
+            (
+                WatchItemKind::BuildGraph,
+                vec!["src/BUILD", "src/BUILD.bazel", "src/BUILD"],
+                "src/BUILD.bazel",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            std::fs::create_dir_all(root.join("src/nested")).unwrap();
+            std::fs::create_dir_all(root.join("src/node_modules/ignored")).unwrap();
+            std::fs::write(root.join(changed), "before").unwrap();
+            let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+            let mut manager = test_manager(HashMap::new(), dispatch).await;
+            manager.overrides = build_watch_ignore_overrides(
+                &root,
+                &["**/node_modules/**".into()],
+                &mut Vec::new(),
+            );
+            let (applied_tx, mut applied_rx) = oneshot::channel();
+            manager
+                .apply_watch_updates(vec![WatchUpdate {
+                    name: "api".into(),
+                    kind,
+                    patterns: patterns.into_iter().map(String::from).collect(),
+                    ignore_patterns: Vec::new(),
+                    base_dir: root.clone(),
+                    applied_tx: Some(applied_tx),
+                }])
+                .await;
+            applied_rx.try_recv().unwrap();
+            let mut expected = HashMap::from([(
+                root.join("src"),
+                if cfg!(target_os = "macos") && kind == WatchItemKind::Service {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                },
+            )]);
+            if !cfg!(target_os = "macos") && kind == WatchItemKind::Service {
+                expected.insert(root.join("src/nested"), RecursiveMode::NonRecursive);
+            }
+            assert_eq!(manager.registered_dirs, expected);
+
+            std::fs::write(root.join(changed), "after").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while manager.items.get("api").unwrap().window.matched == 0 {
+                    let event = manager.event_rx.recv().await.unwrap().unwrap();
+                    manager.handle_notify_event(&event).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_all_owner_batch_keeps_routes_and_acknowledges_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir_all(root.join("shared/nested")).unwrap();
+        let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+        let mut manager = test_manager(HashMap::new(), dispatch).await;
+        let (ack, mut acknowledged) = oneshot::channel();
+        manager
+            .apply_watch_updates(vec![
+                WatchUpdate {
+                    name: "service".into(),
+                    kind: WatchItemKind::Service,
+                    patterns: vec!["shared/**".into()],
+                    ignore_patterns: vec!["shared/ignored.rs".into()],
+                    base_dir: root.clone(),
+                    applied_tx: Some(ack),
+                },
+                WatchUpdate {
+                    name: "task".into(),
+                    kind: WatchItemKind::Task,
+                    patterns: vec!["shared/nested/**".into()],
+                    ignore_patterns: Vec::new(),
+                    base_dir: root.clone(),
+                    applied_tx: None,
+                },
+                WatchUpdate {
+                    name: "service__graph".into(),
+                    kind: WatchItemKind::BuildGraph,
+                    patterns: vec!["shared/BUILD".into()],
+                    ignore_patterns: Vec::new(),
+                    base_dir: root.clone(),
+                    applied_tx: None,
+                },
+            ])
+            .await;
+        acknowledged.try_recv().unwrap();
+        assert_eq!(manager.items.len(), 3);
+        manager.process_changed_paths(&[root.join("shared/ignored.rs")]);
+        assert_eq!(manager.items.get("service").unwrap().window.matched, 0);
+        std::fs::write(root.join("shared/nested/file.rs"), "changed").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.items.get("service").unwrap().window.matched == 0
+                || manager.items.get("task").unwrap().window.matched == 0
+            {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            manager.items.get("service__graph").unwrap().window.matched,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_partial_failure_keeps_good_watches_and_owner_error() {
+        use std::future::Future;
+        use std::task::Poll;
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        for dir in ["bad", "good"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+        }
+        let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+        let mut manager = test_manager(HashMap::new(), dispatch).await;
+        manager.watcher = Some(create_native_watcher(&manager.notify_tx).unwrap());
+        let updates = ["bad", "good"]
+            .into_iter()
+            .map(|name| WatchUpdate {
+                name: name.into(),
+                kind: WatchItemKind::Service,
+                patterns: vec![format!("{name}/**")],
+                ignore_patterns: Vec::new(),
+                base_dir: root.clone(),
+                applied_tx: None,
+            })
+            .collect();
+        let mut applying = Box::pin(manager.apply_watch_updates(updates));
+        // Pause after preparing both owners and checking the first root, before
+        // native registration, to reproduce a directory disappearing in that gap.
+        for _ in 0..3 {
+            std::future::poll_fn(|cx| {
+                assert!(applying.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        std::fs::remove_dir(root.join("bad")).unwrap();
+        applying.await;
+        assert!(manager.items.get("bad").unwrap().last_error.is_some());
+        assert!(manager.items.get("good").unwrap().last_error.is_none());
+        std::fs::write(root.join("good/file.rs"), "changed").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.items.get("good").unwrap().window.matched == 0 {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_aborting_owner_cancels_pending_batch_acknowledgement() {
+        let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+        let mut manager = test_manager(HashMap::new(), dispatch).await;
+        let (updates, receiver) = mpsc::unbounded_channel();
+        manager.update_rx = receiver;
+        let mut batch: Vec<_> = (0..1000)
+            .map(|index| WatchUpdate {
+                name: format!("owner{index}"),
+                kind: WatchItemKind::Service,
+                patterns: Vec::new(),
+                ignore_patterns: Vec::new(),
+                base_dir: PathBuf::from("."),
+                applied_tx: None,
+            })
+            .collect();
+        let (ack, applied) = oneshot::channel();
+        batch.last_mut().unwrap().applied_tx = Some(ack);
+        updates.send(batch).unwrap();
+        let handle = tokio::spawn(manager.run());
+        tokio::task::yield_now().await;
+        handle.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(applied.await.is_err());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_native_capture_covers_late_created_moved_and_recreated_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let anchor = root.join("anchor");
+        let late = root.join("late/nested");
+        std::fs::create_dir(&anchor).unwrap();
+        let dispatch = std::sync::Arc::new(signal::RecordingDispatch::default());
+        let pattern = format!("{}/**", root.display());
+        let items = HashMap::from([(
+            "owner".to_string(),
+            watched(WatchItemKind::Service, Duration::ZERO, &[&pattern]),
+        )]);
+        let mut manager = test_manager(items, dispatch).await;
+        manager.watcher = Some(create_native_watcher(&manager.notify_tx).unwrap());
+        visit_watch_dirs(
+            &root,
+            &manager.overrides,
+            &mut std::collections::HashSet::new(),
+            &mut |dir| {
+                register_single_dir(
+                    &mut manager.watcher,
+                    &manager.notify_tx,
+                    dir,
+                    RecursiveMode::NonRecursive,
+                    &mut manager.registered_dirs,
+                )?;
+                if dir == anchor {
+                    // Root's children have already been enumerated. This new sibling
+                    // cannot be found by the initial walk; its native event is essential.
+                    std::fs::create_dir_all(&late).unwrap();
+                    std::fs::write(late.join("file.rs"), "created during walk").unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!manager.registered_dirs.contains_key(&late));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.registered_dirs.contains_key(&late) {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(manager.items.get("owner").unwrap().window.matched > 0);
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("nested")).unwrap();
+        std::fs::write(outside.path().join("nested/file.rs"), "moved in").unwrap();
+        let moved = root.join("moved");
+        std::fs::rename(outside.path(), &moved).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.registered_dirs.contains_key(&moved.join("nested")) {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&moved).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.registered_dirs.contains_key(&moved) {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::create_dir_all(moved.join("nested")).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.registered_dirs.contains_key(&moved.join("nested")) {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                manager.handle_notify_event(&event).await;
+            }
+        })
+        .await
+        .unwrap();
+        let final_file = moved.join("nested/after.rs");
+        std::fs::write(&final_file, "after recreation").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = manager.event_rx.recv().await.unwrap().unwrap();
+                let captured = event.paths.contains(&final_file);
+                manager.handle_notify_event(&event).await;
+                if captured {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_shared_walk_preserves_explicit_ignored_and_symlink_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("nested")).unwrap();
+        std::fs::create_dir_all(root.join("ignored/explicit")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("alias")).unwrap();
+        let overrides = build_watch_ignore_overrides(root, &["ignored/**".into()], &mut Vec::new());
+        let mut visited = std::collections::HashSet::new();
+        let mut desired = Vec::new();
+        for path in [
+            root.to_path_buf(),
+            root.join("ignored/explicit"),
+            root.join("alias"),
+            root.join("alias/nested"),
+        ] {
+            collect_watch_dirs(&path, &overrides, &mut visited, &mut desired);
+        }
+        let paths: std::collections::HashSet<_> =
+            desired.iter().map(|(path, _)| path.clone()).collect();
+        assert!(paths.contains(&root.join("ignored/explicit")));
+        assert!(paths.contains(&root.join("alias/nested")));
+        assert_eq!(desired.len(), paths.len());
     }
 
     #[test]
